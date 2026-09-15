@@ -16,7 +16,7 @@ pub enum DetectedFramework {
     Nuxt,
     Angular,
     Tanstack,
-    PledgeStack,
+    Pledge,
     Vanilla,
 }
 
@@ -34,7 +34,7 @@ impl DetectedFramework {
             Self::Nuxt => "nuxt",
             Self::Angular => "angular",
             Self::Tanstack => "tanstack",
-            Self::PledgeStack => "pledgestack",
+            Self::Pledge => "pledge",
             Self::Vanilla => "vanilla",
         }
     }
@@ -44,7 +44,7 @@ impl DetectedFramework {
             Self::React => "react",
             Self::Next => "next",
             Self::Tanstack => "tanstack",
-            Self::PledgeStack => "pledgestack",
+            Self::Pledge => "pledge",
             Self::Vue | Self::Nuxt => "vue",
             Self::Svelte => "svelte",
             Self::Solid => "solid",
@@ -203,7 +203,7 @@ pub fn detect_project(root: &Path) -> ProjectDetection {
     } else if deps.contains_key("@tanstack/react-router") {
         DetectedFramework::Tanstack
     } else if deps.contains_key("pledgestack") || deps.contains_key("@pledgestack/core") {
-        DetectedFramework::PledgeStack
+        DetectedFramework::Pledge
     } else if deps.contains_key("solid-js") {
         DetectedFramework::Solid
     } else if deps.contains_key("svelte") {
@@ -319,7 +319,7 @@ fn detect_package_manager(root: &Path) -> PackageManager {
 
 fn detect_entry_file(root: &Path, framework: &DetectedFramework) -> String {
     let candidates = match framework {
-        DetectedFramework::Next | DetectedFramework::Remix | DetectedFramework::PledgeStack => {
+        DetectedFramework::Next | DetectedFramework::Remix | DetectedFramework::Pledge => {
             vec![
                 "src/app/root.tsx",
                 "src/app.tsx",

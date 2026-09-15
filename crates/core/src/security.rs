@@ -2,12 +2,57 @@
 // #83 dependency vulnerability scanning, #84 license compliance checking.
 
 use base64::{Engine, engine::general_purpose};
-use regex::Regex;
+use scraper::{Html, Selector};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 use tracing::{info, warn};
+
+/// Validates that a resolved path is within the given base directory.
+/// Returns the canonicalized path if safe, or None if path traversal is detected.
+fn safe_path_within(base: &Path, input: &str) -> Option<PathBuf> {
+    // Skip external URLs
+    if input.starts_with("http://") || input.starts_with("https://") || input.starts_with("//") {
+        return None;
+    }
+    let joined = base.join(input.trim_start_matches('/'));
+    // Lexically normalize to detect traversal
+    let mut normalized = PathBuf::new();
+    for component in joined.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    let mut base_normalized = PathBuf::new();
+    for component in base.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                base_normalized.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => base_normalized.push(other.as_os_str()),
+        }
+    }
+    if normalized.starts_with(&base_normalized) {
+        Some(normalized)
+    } else {
+        None
+    }
+}
+
+/// Generate a cryptographically random hex token — e.g. for the dev
+/// server's access token (PRODUCTION-READINESS-100.md goal 18). `byte_len`
+/// is the number of random bytes before hex-encoding, so the returned
+/// string is `byte_len * 2` hex characters.
+pub fn generate_random_token(byte_len: usize) -> String {
+    let mut bytes = vec![0u8; byte_len];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut bytes);
+    hex::encode(bytes)
+}
 
 // ── Feature 81: Subresource Integrity (SRI) hashes ────────────────────
 
@@ -21,43 +66,87 @@ pub fn generate_sri_hash(content: &[u8]) -> String {
 /// Generate SRI integrity attributes for all script and link tags in HTML.
 pub fn inject_sri_into_html(html: &str, out_dir: &Path) -> String {
     let mut result = html.to_string();
+    let document = Html::parse_fragment(html);
 
-    static SCRIPT_RE: OnceLock<Regex> = OnceLock::new();
-    let re = SCRIPT_RE.get_or_init(|| Regex::new(r#"<script\s+src="([^"]+)""#).unwrap());
-
-    for cap in re.captures_iter(html) {
-        let src = &cap[1];
-        let file_path = out_dir.join(src.trim_start_matches('/'));
-        if file_path.is_file()
-            && let Ok(content) = std::fs::read(&file_path)
-        {
-            let integrity = generate_sri_hash(&content);
-            let old = format!(r#"<script src="{}""#, src);
-            let new = format!(
-                r#"<script src="{}" integrity="{}" crossorigin="anonymous""#,
-                src, integrity
-            );
-            result = result.replace(&old, &new);
+    // Find all <script src="..."> tags. Selector parsing can only fail for a
+    // malformed selector string — since this one is a static literal, a
+    // failure here means the selector itself is broken, not that this HTML
+    // document is unusual, so skip this pass and log rather than panic the
+    // whole build over a CSS-selector-syntax detail unrelated to the user's
+    // code. See PRODUCTION-READINESS-100.md goal 20.
+    let Ok(script_sel) = Selector::parse("script[src]") else {
+        warn!("SRI: failed to parse internal selector 'script[src]', skipping script SRI injection");
+        return html.to_string();
+    };
+    for element in document.select(&script_sel) {
+        let Some(src) = element.value().attr("src") else {
+            continue;
+        };
+        // Skip external URLs — cannot compute SRI without local file access
+        if src.starts_with("http://") || src.starts_with("https://") || src.starts_with("//") {
+            continue;
+        }
+        match safe_path_within(out_dir, src) {
+            Some(file_path) => {
+                if file_path.is_file()
+                    && let Ok(content) = std::fs::read(&file_path)
+                {
+                    let integrity = generate_sri_hash(&content);
+                    let old = format!(r#"<script src="{}""#, src);
+                    let new = format!(
+                        r#"<script src="{}" integrity="{}" crossorigin="anonymous""#,
+                        src, integrity
+                    );
+                    result = result.replace(&old, &new);
+                }
+            }
+            None => {
+                warn!(
+                    "Skipping SRI for script src='{}': path traversal detected",
+                    src
+                );
+            }
         }
     }
 
-    static LINK_RE: OnceLock<Regex> = OnceLock::new();
-    let re = LINK_RE
-        .get_or_init(|| Regex::new(r#"<link\s+[^>]*rel="stylesheet"[^>]*href="([^"]+)""#).unwrap());
-
-    for cap in re.captures_iter(html) {
-        let href = &cap[1];
-        let file_path = out_dir.join(href.trim_start_matches('/'));
-        if file_path.is_file()
-            && let Ok(content) = std::fs::read(&file_path)
+    // Find all <link rel="stylesheet" href="..."> tags
+    let Ok(link_sel) = Selector::parse("link[rel='stylesheet'][href]") else {
+        warn!(
+            "SRI: failed to parse internal selector 'link[rel=stylesheet][href]', skipping stylesheet SRI injection"
+        );
+        return result;
+    };
+    for element in document.select(&link_sel) {
+        let Some(href) = element.value().attr("href") else {
+            continue;
+        };
+        // Skip external URLs — cannot compute SRI without local file access
+        if href.starts_with("http://")
+            || href.starts_with("https://")
+            || href.starts_with("//")
         {
-            let integrity = generate_sri_hash(&content);
-            let old = format!(r#"href="{}""#, href);
-            let new = format!(
-                r#"href="{}" integrity="{}" crossorigin="anonymous""#,
-                href, integrity
-            );
-            result = result.replace(&old, &new);
+            continue;
+        }
+        match safe_path_within(out_dir, href) {
+            Some(file_path) => {
+                if file_path.is_file()
+                    && let Ok(content) = std::fs::read(&file_path)
+                {
+                    let integrity = generate_sri_hash(&content);
+                    let old = format!(r#"href="{}""#, href);
+                    let new = format!(
+                        r#"href="{}" integrity="{}" crossorigin="anonymous""#,
+                        href, integrity
+                    );
+                    result = result.replace(&old, &new);
+                }
+            }
+            None => {
+                warn!(
+                    "Skipping SRI for stylesheet href='{}': path traversal detected",
+                    href
+                );
+            }
         }
     }
 
@@ -90,31 +179,40 @@ impl CspGenerator {
     }
 
     pub fn analyze_html(&mut self, html: &str) {
-        static INLINE_SCRIPT_RE: OnceLock<Regex> = OnceLock::new();
-        let re = INLINE_SCRIPT_RE
-            .get_or_init(|| Regex::new(r"<script[^>]*>([\s\S]*?)</script>").unwrap());
+        let document = Html::parse_fragment(html);
 
-        for cap in re.captures_iter(html) {
-            // Skip scripts with src= attribute (external scripts)
-            let full_match = cap.get(0).map(|m| m.as_str()).unwrap_or("");
-            if full_match.contains("src=") {
-                continue;
+        // Inline scripts: <script> tags without a src attribute. See the
+        // comment on the selectors in `inject_sri_into_html` above — these
+        // are static literals, so a parse failure means the selector itself
+        // is broken; skip that pass rather than panic (goal 20).
+        match Selector::parse("script") {
+            Ok(script_sel) => {
+                for element in document.select(&script_sel) {
+                    // Skip scripts with src= attribute (external scripts)
+                    if element.value().attr("src").is_some() {
+                        continue;
+                    }
+                    let inline_code: String = element.text().collect::<String>();
+                    let trimmed = inline_code.trim();
+                    if !trimmed.is_empty() {
+                        let hash = generate_sri_hash(trimmed.as_bytes());
+                        self.inline_script_hashes.push(format!("'{}'", hash));
+                    }
+                }
             }
-            let inline_code = cap[1].trim();
-            if !inline_code.is_empty() {
-                let hash = generate_sri_hash(inline_code.as_bytes());
-                self.inline_script_hashes.push(format!("'{}'", hash));
-            }
+            Err(_) => warn!("CSP: failed to parse internal selector 'script', skipping inline-script hashing"),
         }
 
-        static INLINE_STYLE_RE: OnceLock<Regex> = OnceLock::new();
-        let re =
-            INLINE_STYLE_RE.get_or_init(|| Regex::new(r"<style[^>]*>([\s\S]*?)</style>").unwrap());
-
-        for cap in re.captures_iter(html) {
-            let inline_css = cap[1].trim();
-            if !inline_css.is_empty() {
-                let hash = generate_sri_hash(inline_css.as_bytes());
+        // Inline styles: <style> tags
+        let Ok(style_sel) = Selector::parse("style") else {
+            warn!("CSP: failed to parse internal selector 'style', skipping inline-style hashing");
+            return;
+        };
+        for element in document.select(&style_sel) {
+            let inline_css: String = element.text().collect::<String>();
+            let trimmed = inline_css.trim();
+            if !trimmed.is_empty() {
+                let hash = generate_sri_hash(trimmed.as_bytes());
                 self.inline_style_hashes.push(format!("'{}'", hash));
             }
         }

@@ -14,9 +14,18 @@ use tracing::{info, warn};
 
 /// A file change event from the native watcher
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct FileEvent {
     pub path: PathBuf,
+    // PRODUCTION-READINESS-100.md goal 91: the struct-level `#[allow(dead_code)]`
+    // that used to be here was imprecise — `path` above is read all over
+    // `crates/dev-server/src/lib.rs`'s HMR handling, only `kind` is
+    // populated (every `FileEvent { path, kind }` construction site sets
+    // it) but never actually read by any consumer today. Reserved for
+    // distinguishing create/modify/remove for smarter HMR (e.g. skipping
+    // work on a delete) — moved the allow down to just this field instead
+    // of suppressing the whole struct, so a future genuinely-dead field
+    // added here wouldn't go unnoticed under the same broad allow.
+    #[allow(dead_code)]
     pub kind: EventKind,
 }
 
@@ -657,7 +666,9 @@ fn watch_macos(
 
 // ─── Fallback: notify-debouncer crate ──────────────────────────────────────────────────
 
-#[allow(dead_code)]
+// PRODUCTION-READINESS-100.md goal 91: this `#[allow(dead_code)]` was stale —
+// `watch_notify_fallback` has 4 real, unconditionally-reachable call sites,
+// one in each platform-specific `cfg` branch of `start_watcher()` below.
 fn watch_notify_fallback(root: &Path, config: &WatcherConfig, tx: &mpsc::Sender<FileEvent>) {
     use notify::RecursiveMode;
     use notify_debouncer_full::new_debouncer;

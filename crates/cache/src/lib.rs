@@ -1,12 +1,12 @@
-// Function-level incremental cache
-//
-// This is the "Turbo engine" equivalent — caches the result of
-// every function in the build pipeline. When a file changes,
-// only the affected functions are re-run.
-//
-// Two storage tiers:
-//   1. In-memory (dashmap) — fast, per-session
-//   2. Filesystem (bincode) — persistent across restarts
+//! Function-level incremental cache
+//!
+//! This is the "Turbo engine" equivalent — caches the result of
+//! every function in the build pipeline. When a file changes,
+//! only the affected functions are re-run.
+//!
+//! Two storage tiers:
+//!   1. In-memory (dashmap) — fast, per-session
+//!   2. Filesystem (bincode) — persistent across restarts
 
 use anyhow::Result;
 use dashmap::DashMap;
@@ -33,11 +33,24 @@ pub struct CacheKey {
 /// Cached result of a function call
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheEntry {
+    /// The transformed/emitted code produced by the function.
     pub code: String,
+    /// Optional source map accompanying `code`.
     pub source_map: Option<String>,
+    /// Dependencies recorded while producing this entry; used for
+    /// invalidation when any dependency changes.
     pub deps: Vec<String>,
+    /// Unix timestamp (seconds) when the entry was created.
     pub created_at: u64,
+    /// Schema version for forward compatibility. Entries with a mismatched
+    /// version are treated as cache misses. Defaults to 0 for entries written
+    /// by older versions (which lacked this field), so they are ignored.
+    #[serde(default)]
+    pub version: u32,
 }
+
+/// Current cache format version. Increment when the on-disk schema changes.
+pub const CACHE_FORMAT_VERSION: u32 = 1;
 
 /// The function-level cache
 pub struct FunctionCache {
@@ -50,9 +63,14 @@ pub struct FunctionCache {
 }
 
 impl FunctionCache {
+    /// Create a new cache. When `persist` is true, entries are also written
+    /// to `cache_dir` (created if missing) so they survive restarts;
+    /// otherwise only the in-memory tier is used.
     pub fn new(cache_dir: PathBuf, persist: bool) -> Self {
         if persist {
-            std::fs::create_dir_all(&cache_dir).ok();
+            if let Err(e) = std::fs::create_dir_all(&cache_dir) {
+                tracing::warn!("Failed to create cache directory {:?}: {}", cache_dir, e);
+            }
         }
 
         Self {
@@ -74,6 +92,15 @@ impl FunctionCache {
         if self.persist
             && let Ok(entry) = self.read_from_disk(key)
         {
+            // Validate schema version — treat mismatches as cache misses so
+            // stale entries from older formats are ignored rather than used.
+            if entry.version != CACHE_FORMAT_VERSION {
+                debug!(
+                    "Cache entry version mismatch ({} != {}), ignoring: {}",
+                    entry.version, CACHE_FORMAT_VERSION, key.function_id
+                );
+                return None;
+            }
             debug!("Cache hit (disk): {}", key.function_id);
             // Populate memory cache
             self.memory.insert(key.clone(), entry.clone());
@@ -107,7 +134,9 @@ impl FunctionCache {
             self.memory.remove(&key);
             if self.persist {
                 let path = self.cache_path(&key);
-                std::fs::remove_file(path).ok();
+                if let Err(e) = std::fs::remove_file(&path) {
+                    tracing::debug!("Failed to remove cache file {:?}: {}", path, e);
+                }
             }
         }
     }
@@ -116,8 +145,12 @@ impl FunctionCache {
     pub fn clear(&self) {
         self.memory.clear();
         if self.persist {
-            std::fs::remove_dir_all(&self.cache_dir).ok();
-            std::fs::create_dir_all(&self.cache_dir).ok();
+            if let Err(e) = std::fs::remove_dir_all(&self.cache_dir) {
+                tracing::debug!("Failed to remove cache dir {:?}: {}", self.cache_dir, e);
+            }
+            if let Err(e) = std::fs::create_dir_all(&self.cache_dir) {
+                tracing::warn!("Failed to recreate cache directory {:?}: {}", self.cache_dir, e);
+            }
         }
     }
 
@@ -129,11 +162,13 @@ impl FunctionCache {
     }
 
     fn cache_path(&self, key: &CacheKey) -> PathBuf {
-        let hash = blake3::hash(
-            bincode::serde::encode_to_vec(key, bincode::config::standard())
-                .unwrap_or_default()
-                .as_slice(),
-        );
+        let params_bytes = bincode::serde::encode_to_vec(key, bincode::config::standard())
+            .unwrap_or_else(|e| {
+                tracing::warn!("Failed to serialize cache key: {}", e);
+                // Use debug representation as fallback to avoid hash collision
+                format!("{:?}", key).into_bytes()
+            });
+        let hash = blake3::hash(&params_bytes);
         self.cache_dir.join(hash.to_hex().as_str())
     }
 
@@ -167,15 +202,22 @@ impl FunctionCache {
     }
 }
 
+/// Aggregate statistics about the cache, returned by
+/// [`FunctionCache::stats`].
 #[derive(Debug)]
 pub struct CacheStats {
+    /// Number of entries currently held in the in-memory tier.
     pub entries: u64,
 }
 
 /// Helper to compute a cache key
-pub fn make_key(content_hash: u64, function_id: &str, params: &impl serde::Serialize) -> CacheKey {
+pub fn make_key(content_hash: u64, function_id: &str, params: &(impl serde::Serialize + std::fmt::Debug)) -> CacheKey {
     let params_bytes =
-        bincode::serde::encode_to_vec(params, bincode::config::standard()).unwrap_or_default();
+        bincode::serde::encode_to_vec(params, bincode::config::standard()).unwrap_or_else(|e| {
+            tracing::warn!("Failed to serialize cache params: {}", e);
+            // Use debug representation as fallback to avoid hash collision
+            format!("{:?}", params).into_bytes()
+        });
     let params_hash = u64::from_be_bytes(
         blake3::hash(&params_bytes).as_bytes()[0..8]
             .try_into()
@@ -204,6 +246,7 @@ mod tests {
             source_map: None,
             deps: vec!["./foo".to_string()],
             created_at: 0,
+            version: CACHE_FORMAT_VERSION,
         };
 
         cache.set(key.clone(), entry.clone());

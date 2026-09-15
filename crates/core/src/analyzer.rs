@@ -106,7 +106,7 @@ pub fn analyze_build(engine: &BuildEngine) -> Result<BundleAnalysis> {
     let mut total_transformed = 0usize;
 
     for (id, module) in modules {
-        let rel_path = module.path.to_string_lossy().replace('\\', "/");
+        let rel_path = crate::normalize_path(&module.path);
         let original_size = module.source.len();
         let transformed_size = function_cache
             .get(&module.content_hash)
@@ -133,10 +133,13 @@ pub fn analyze_build(engine: &BuildEngine) -> Result<BundleAnalysis> {
             _ => "unknown",
         };
 
-        let deps = cached.map(|c| c.deps.clone()).unwrap_or_default();
+        let deps = cached
+            .as_ref()
+            .map(|c| c.deps.clone())
+            .unwrap_or_default();
 
-        let is_css = cached.map(|c| c.is_css).unwrap_or(false);
-        let is_worker = cached.map(|c| c.is_worker).unwrap_or(false);
+        let is_css = cached.as_ref().map(|c| c.is_css).unwrap_or(false);
+        let is_worker = cached.as_ref().map(|c| c.is_worker).unwrap_or(false);
 
         total_original += original_size;
         total_transformed += transformed_size;

@@ -1,17 +1,23 @@
 [advisories]
 # cargo-deny checks for known vulnerabilities in dependencies.
+# Each ignored advisory carries a `review-by` date. `scripts/check-stale-ignores.sh`
+# (run in CI's `audit` job) fails the build once that date passes, so an ignore
+# can't silently become permanent — see PRODUCTION-READINESS-100.md goal 6.
 version = 2
 ignore = [
     # rkyv 0.7 — OOB reads in archives with Rc/Arc. Transitive via parcel_sourcemap
     # (lightningcss). Cannot upgrade until parcel_sourcemap releases a new version.
     # Risk is low: only used for sourcemap encoding, not untrusted input.
+    # review-by: 2026-12-15
     "RUSTSEC-2026-0235",
     # bincode 2.0.1 — flagged as unmaintained. This is the latest major version
     # and is stable/feature-complete. No viable drop-in replacement with serde support.
     # Will revisit if a maintained fork emerges.
+    # review-by: 2026-12-15
     "RUSTSEC-2025-0141",
     # paste 1.0.15 — compile-time macro crate, no runtime code. Transitive via
     # oxc and lightningcss. Zero security risk.
+    # review-by: 2026-12-15
     "RUSTSEC-2024-0436",
 ]
 
@@ -38,12 +44,303 @@ allow = [
 exceptions = []
 
 [bans]
-# Warn on duplicate versions of the same crate
-multiple-versions = "warn"
-# Warn on wildcards in Cargo.toml
-wildcards = "warn"
+# Deny duplicate versions of the same crate
+multiple-versions = "deny"
+# Deny wildcards in Cargo.toml (i.e. a third-party dependency with no version
+# requirement at all — a real supply-chain risk). Internal workspace path/
+# `{ workspace = true }` dependencies between pledgepack-* crates are not that
+# risk (they're pinned to the exact local crate) but are flagged the same way
+# without this, so they're exempted explicitly rather than by disabling the
+# check workspace-wide.
+wildcards = "deny"
+allow-wildcard-paths = true
+#
+# Exceptions for known duplicates, as of 2026-09-15 (crates/PRODUCTION-READINESS-100.md
+# goals 4-5). Each entry below is a version this workspace does NOT treat as
+# canonical; a bare `cargo tree -d` still shows the duplicate, but it is
+# accounted for here so `cargo deny check bans` gives a real signal instead of
+# ~50 permanent false positives. Re-run `cargo tree --workspace --duplicates`
+# periodically (or when bumping wasmtime/oxc/lightningcss) and re-triage:
+# remove an entry once its duplicate naturally resolves, add one if a new
+# duplicate appears for a reason outside our control.
+#
+# Root causes, grouped:
+#
+# (A) wasmtime 28.0.1's own vendored toolchain (cranelift / wasm-tools /
+#     wasmtime-cache) pins an older sibling of a crate this workspace also
+#     uses directly at a newer version. Not fixable without a wasmtime
+#     upgrade; tracked as part of the wasm-plugin-host consolidation work.
+[[bans.skip]]
+name = "addr2line"
+version = "0.24.2"
+[[bans.skip]]
+name = "gimli"
+version = "0.31.1"
+[[bans.skip]]
+name = "object"
+version = "0.36.7"
+[[bans.skip]]
+name = "object"
+version = "0.37.3"
+[[bans.skip]]
+name = "wasm-encoder"
+version = "0.221.3"
+[[bans.skip]]
+name = "wast"
+version = "35.0.2"
+[[bans.skip]]
+name = "windows-sys"
+version = "0.52.0"
+[[bans.skip]]
+name = "windows-sys"
+version = "0.59.0"
+[[bans.skip]]
+name = "windows-sys"
+version = "0.60.2"
+[[bans.skip]]
+name = "windows-targets"
+version = "0.52.6"
+[[bans.skip]]
+name = "windows_x86_64_gnu"
+version = "0.52.6"
+# windows-targets 0.52.6 (vs. 0.53.5, see group E) pulls all of its per-arch/
+# per-toolchain sibling crates, not just the gnu ones above.
+[[bans.skip]]
+name = "windows_x86_64_gnullvm"
+version = "0.52.6"
+[[bans.skip]]
+name = "windows_x86_64_msvc"
+version = "0.52.6"
+[[bans.skip]]
+name = "windows_aarch64_gnullvm"
+version = "0.52.6"
+[[bans.skip]]
+name = "windows_aarch64_msvc"
+version = "0.52.6"
+[[bans.skip]]
+name = "windows_i686_gnu"
+version = "0.52.6"
+[[bans.skip]]
+name = "windows_i686_gnullvm"
+version = "0.52.6"
+[[bans.skip]]
+name = "windows_i686_msvc"
+version = "0.52.6"
+[[bans.skip]]
+name = "toml"
+version = "0.8.23"
+[[bans.skip]]
+name = "toml_datetime"
+version = "0.6.11"
+[[bans.skip]]
+name = "syn"
+version = "3.0.3"
+
+#
+# (B) lightningcss 1.0.0-alpha.72's own dependency tree (parcel_sourcemap,
+#     rkyv 0.7, lightningcss-derive) pins older majors than the rest of the
+#     workspace. Same root cause already tracked as a documented risk in
+#     [advisories] (RUSTSEC-2026-0235) — will resolve together when
+#     lightningcss leaves alpha (see goal 23).
+[[bans.skip]]
+name = "ahash"
+version = "0.7.8"
+[[bans.skip]]
+name = "hashbrown"
+version = "0.12.3"
+[[bans.skip]]
+name = "dashmap"
+version = "5.5.3"
+[[bans.skip]]
+name = "base64-simd"
+version = "0.7.0"
+[[bans.skip]]
+name = "syn"
+version = "1.0.109"
+
+#
+# (C) oxc 0.141.0's own fast-moving pre-1.0 dependency tree (its idna/url/rand
+#     chain) has not converged on the same rand/getrandom/itertools majors as
+#     the rest of the workspace. Outside our control until oxc updates;
+#     re-check on every oxc bump.
+[[bans.skip]]
+name = "rand"
+version = "0.8.7"
+[[bans.skip]]
+name = "rand"
+version = "0.9.5"
+[[bans.skip]]
+name = "rand_chacha"
+version = "0.3.1"
+[[bans.skip]]
+name = "rand_core"
+version = "0.6.4"
+[[bans.skip]]
+name = "rand_core"
+version = "0.9.5"
+[[bans.skip]]
+name = "getrandom"
+version = "0.2.17"
+[[bans.skip]]
+name = "getrandom"
+version = "0.3.4"
+[[bans.skip]]
+name = "itertools"
+version = "0.10.5"
+[[bans.skip]]
+name = "itertools"
+version = "0.12.1"
+[[bans.skip]]
+name = "itertools"
+version = "0.14.0"
+[[bans.skip]]
+name = "hashbrown"
+version = "0.14.5"
+[[bans.skip]]
+name = "hashbrown"
+version = "0.15.5"
+[[bans.skip]]
+name = "phf"
+version = "0.11.3"
+[[bans.skip]]
+name = "phf"
+version = "0.13.1"
+[[bans.skip]]
+name = "phf_generator"
+version = "0.11.3"
+[[bans.skip]]
+name = "phf_generator"
+version = "0.13.1"
+[[bans.skip]]
+name = "phf_macros"
+version = "0.11.3"
+[[bans.skip]]
+name = "phf_macros"
+version = "0.13.1"
+[[bans.skip]]
+name = "phf_shared"
+version = "0.11.3"
+[[bans.skip]]
+name = "phf_shared"
+version = "0.13.1"
+[[bans.skip]]
+name = "unicode-width"
+version = "0.1.14"
+[[bans.skip]]
+name = "winnow"
+version = "0.7.15"
+[[bans.skip]]
+name = "rustix"
+version = "0.38.44"
+# linux-raw-sys is rustix 0.38's own syscall-binding dependency; it duplicates
+# 1:1 with the rustix skip above.
+[[bans.skip]]
+name = "linux-raw-sys"
+version = "0.4.15"
+[[bans.skip]]
+name = "num-bigint"
+version = "0.4.8"
+[[bans.skip]]
+name = "outref"
+version = "0.1.0"
+[[bans.skip]]
+name = "miniz_oxide"
+version = "0.8.9"
+[[bans.skip]]
+name = "serde_spanned"
+version = "0.6.9"
+[[bans.skip]]
+name = "foldhash"
+version = "0.1.5"
+[[bans.skip]]
+name = "cssparser"
+version = "0.34.0"
+[[bans.skip]]
+name = "cssparser-macros"
+version = "0.6.1"
+
+#
+# (D) Assorted single-hop transitive deps (CLI UX crates, compression) whose
+#     own maintainers haven't converged versions with their peers.
+[[bans.skip]]
+name = "console"
+version = "0.15.11"
+[[bans.skip]]
+name = "convert_case"
+version = "0.6.0"
+[[bans.skip]]
+name = "cpufeatures"
+version = "0.2.17"
+[[bans.skip]]
+name = "derive_more"
+version = "0.99.20"
+[[bans.skip]]
+name = "dirs"
+version = "4.0.0"
+[[bans.skip]]
+name = "dirs-sys"
+version = "0.3.7"
+[[bans.skip]]
+name = "brotli-decompressor"
+version = "4.0.3"
+# Target-conditional (UEFI/Redox) transitive deps of getrandom/dirs-family
+# crates — always present in Cargo.lock regardless of host platform, version
+# owned entirely upstream, not reachable via `cargo tree` on this host.
+[[bans.skip]]
+name = "r-efi"
+version = "5.3.0"
+[[bans.skip]]
+name = "redox_users"
+version = "0.4.6"
+
+#
+# (E) WITHIN OUR CONTROL — workspace-internal version split, not a third-party
+#     transitive artifact. Tracked as a follow-up (needs a build-verified PR,
+#     not a blind version bump — see goal 5 in PRODUCTION-READINESS-100.md):
+#   - reqwest: crates/dev-server/Cargo.toml pins "0.13" directly (for the
+#     `rustls-no-provider` feature) instead of `{ workspace = true }`
+#     ("0.12", used by pledgepack-cache). Unify once verified buildable.
+[[bans.skip]]
+name = "reqwest"
+version = "0.13.4"
+#   - base64: pledgepack-core/pledgepack-dev-server pin the workspace's "0.23",
+#     but axum 0.8.9 / hyper-util / oxc_transformer each pin their own older
+#     base64 majors transitively — not directly fixable by us, but distinct
+#     from the reqwest case above (no direct pledgepack Cargo.toml conflict).
+[[bans.skip]]
+name = "base64"
+version = "0.21.7"
+[[bans.skip]]
+name = "base64"
+version = "0.22.1"
+#   - tokio-tungstenite / tungstenite: axum 0.8.9's own `ws` feature pulls
+#     0.29.x, independent of this workspace's direct "0.26" pin (used for the
+#     dev-server's own WebSocket HMR channel). Not directly fixable without
+#     an axum upgrade.
+[[bans.skip]]
+name = "tokio-tungstenite"
+version = "0.29.0"
+[[bans.skip]]
+name = "tungstenite"
+version = "0.29.0"
+#   - thiserror / thiserror-impl: several transitive deps (wasmtime family)
+#     have not migrated off thiserror 1.x yet; this workspace's own crates use
+#     the pinned "2".
+[[bans.skip]]
+name = "thiserror"
+version = "1.0.69"
+[[bans.skip]]
+name = "thiserror-impl"
+version = "1.0.69"
+#   - brotli / brotli-decompressor: pledgepack-core pins brotli "7" directly
+#     for its own compression path, while tower-http's async-compression
+#     feature (used by dev-server/cache) pulls brotli 8.x. Candidate for
+#     unifying to 8.x in the same follow-up PR as the reqwest split above.
+[[bans.skip]]
+name = "brotli"
+version = "7.0.0"
 
 [sources]
 # Only allow crates from crates.io
 unknown-registry = "deny"
-unknown-git = "allow"  # Allow git deps (e.g., relative-path if needed)
+unknown-git = "deny"  # No git dependencies — deny all git sources

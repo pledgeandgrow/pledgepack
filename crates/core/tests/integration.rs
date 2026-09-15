@@ -11,7 +11,7 @@ use tempfile::TempDir;
 #[test]
 fn test_oxc_transform_produces_valid_esm() {
     let config = PledgeConfig {
-        framework: Framework::PledgeStack,
+        framework: Framework::Pledge,
         mode: BuildMode::Development,
         ..Default::default()
     };
@@ -65,7 +65,7 @@ export default function Counter() {
 #[test]
 fn test_oxc_transform_type_stripping() {
     let config = PledgeConfig {
-        framework: Framework::PledgeStack,
+        framework: Framework::Pledge,
         ..Default::default()
     };
 
@@ -89,7 +89,7 @@ export function greet(user: User): string {
 #[test]
 fn test_oxc_transform_psx_as_tsx() {
     let config = PledgeConfig {
-        framework: Framework::PledgeStack,
+        framework: Framework::Pledge,
         ..Default::default()
     };
 
@@ -161,7 +161,7 @@ async fn test_build_engine_succeeds_with_explicit_entry() {
         root: tmp.path().to_path_buf(),
         entry: vec!["src/index.tsx".to_string()],
         mode: BuildMode::Production,
-        framework: Framework::PledgeStack,
+        framework: Framework::Pledge,
         ..Default::default()
     };
 
@@ -193,7 +193,7 @@ async fn test_build_engine_succeeds_with_app_dir() {
         entry: vec![],
         app_dir: Some("app".to_string()),
         mode: BuildMode::Production,
-        framework: Framework::PledgeStack,
+        framework: Framework::Pledge,
         ..Default::default()
     };
 

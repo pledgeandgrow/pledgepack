@@ -46,6 +46,15 @@ pub struct JsPlugin {
     pub has_build_end: bool,
     /// Hook: generateBundle()
     pub has_generate_bundle: bool,
+    /// Hook: renderChunk(code, filename, chunkType) → { code, map } | null.
+    /// Mirrors the WIT contract's `render-chunk` hook (added there in
+    /// v0.1.2) — previously WASM-only; see PRODUCTION-READINESS-100.md goal 44.
+    pub has_render_chunk: bool,
+    /// Hook: handleHotUpdate(file, timestamp) → { moduleIds } | null.
+    /// Mirrors the WIT contract's `handle-hot-update` hook (added there in
+    /// v0.1.3) — previously absent from both plugin hosts entirely; see
+    /// PRODUCTION-READINESS-100.md goal 43.
+    pub has_handle_hot_update: bool,
     /// Raw source of the plugin file (for evaluation)
     pub source: String,
     /// Path to the plugin file
@@ -73,6 +82,14 @@ pub struct TransformResult {
     pub map: Option<String>,
 }
 
+/// Result of a handleHotUpdate hook — see the WIT contract's
+/// `hot-update-output` (v0.1.3).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HotUpdateResult {
+    #[serde(rename = "moduleIds")]
+    pub module_ids: Vec<String>,
+}
+
 /// HTML tag injection for transformIndexHtml
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HtmlTag {
@@ -97,6 +114,11 @@ pub struct JsPluginHost {
     runtime: Runtime,
     /// QuickJS context for evaluating and executing plugin code
     context: Context,
+    /// Optional signature verifier (PRODUCTION-READINESS-100.md goal 12).
+    /// `None` (the default) preserves prior behavior exactly. See the
+    /// equivalent field on `pledgepack_wasm_plugin_host::WasmPluginHost` for
+    /// the full rationale — same sidecar-file mechanism, same opt-in default.
+    signing_verifier: Option<pledgepack_core::plugin_system::PluginSigningVerifier>,
 }
 
 impl JsPluginHost {
@@ -123,7 +145,67 @@ impl JsPluginHost {
             plugins: Vec::new(),
             runtime,
             context,
+            signing_verifier: None,
         }
+    }
+
+    /// Require every subsequently loaded plugin to carry a valid
+    /// `<path>.sig.json` signature sidecar (see [`load_plugins`](Self::load_plugins)).
+    pub fn with_signing_verifier(
+        mut self,
+        verifier: pledgepack_core::plugin_system::PluginSigningVerifier,
+    ) -> Self {
+        self.signing_verifier = Some(verifier);
+        self
+    }
+
+    /// Verify `path` against a `<path>.sig.json` sidecar when a signing
+    /// verifier is configured. No-op (matching prior behavior exactly) when
+    /// none is. See `pledgepack_wasm_plugin_host`'s identically-named check
+    /// for the full rationale.
+    fn check_plugin_signature(&self, path: &std::path::Path, source: &str) -> Result<()> {
+        let Some(ref verifier) = self.signing_verifier else {
+            return Ok(());
+        };
+
+        let sidecar_path = {
+            let mut s = path.as_os_str().to_os_string();
+            s.push(".sig.json");
+            PathBuf::from(s)
+        };
+        let sidecar_bytes = std::fs::read(&sidecar_path).map_err(|_| {
+            anyhow::anyhow!(
+                "Plugin {} has no signature sidecar ({}), but signing enforcement is enabled — refusing to load",
+                path.display(),
+                sidecar_path.display()
+            )
+        })?;
+        let sig: pledgepack_core::plugin_system::PluginSignature =
+            serde_json::from_slice(&sidecar_bytes).map_err(|e| {
+                anyhow::anyhow!(
+                    "Malformed signature sidecar {}: {e} — refusing to load {}",
+                    sidecar_path.display(),
+                    path.display()
+                )
+            })?;
+
+        let actual_hash = blake3::hash(source.as_bytes()).to_hex().to_string();
+        if actual_hash != sig.wasm_hash {
+            anyhow::bail!(
+                "Plugin {} content hash does not match its signature sidecar — refusing to load (expected {}, got {})",
+                path.display(),
+                sig.wasm_hash,
+                actual_hash
+            );
+        }
+        if !verifier.verify(&sig) {
+            anyhow::bail!(
+                "Signature verification FAILED for plugin {} — refusing to load",
+                path.display()
+            );
+        }
+        info!("Plugin {}: signature verified ({})", path.display(), sig.signer_identity);
+        Ok(())
     }
 
     /// Load plugins from the given paths (JS/TS files)
@@ -136,6 +218,7 @@ impl JsPluginHost {
             }
 
             let source = std::fs::read_to_string(&pathbuf)?;
+            self.check_plugin_signature(&pathbuf, &source)?;
             let plugin = Self::parse_plugin(&source, pathbuf)?;
             info!("Loaded JS plugin: {}", plugin.name);
 
@@ -148,7 +231,23 @@ impl JsPluginHost {
                 .context
                 .with(|ctx| ctx.eval::<(), _>(js_source.as_str()))
             {
-                warn!("Failed to evaluate plugin {}: {}", plugin.name, e);
+                // PRODUCTION-READINESS-100.md goal 49: this used to warn and
+                // then push the plugin into `self.plugins` anyway. Every
+                // subsequent hook call for it would then silently no-op
+                // forever — `globalThis['__pledge_plugin_N']` was never
+                // actually assigned, so the `if (__pluginModule && ...)`
+                // guard in every hook's generated JS snippet just quietly
+                // skips it, while `host.len()`/`host.plugins()` report the
+                // plugin as loaded. Skip it instead, loudly, so the plugin
+                // count is truthful and the failure is unmissable.
+                tracing::error!(
+                    "Plugin {} ({}) failed to evaluate and will NOT be loaded — its hooks would \
+                     otherwise silently never run: {}",
+                    plugin.name,
+                    plugin.path.display(),
+                    e
+                );
+                continue;
             }
 
             self.plugins.push(plugin);
@@ -200,6 +299,8 @@ impl JsPluginHost {
         let has_build_start = Self::has_hook(source, "buildStart");
         let has_build_end = Self::has_hook(source, "buildEnd");
         let has_generate_bundle = Self::has_hook(source, "generateBundle");
+        let has_render_chunk = Self::has_hook(source, "renderChunk");
+        let has_handle_hot_update = Self::has_hook(source, "handleHotUpdate");
 
         // Extract apply field if present
         let apply = Self::extract_string_field(source, "apply");
@@ -215,6 +316,8 @@ impl JsPluginHost {
             has_build_start,
             has_build_end,
             has_generate_bundle,
+            has_render_chunk,
+            has_handle_hot_update,
             source: source.to_string(),
             path,
         })
@@ -252,31 +355,55 @@ impl JsPluginHost {
         &self.plugins
     }
 
-    /// Run buildStart hooks for all plugins
+    /// Run a no-argument, no-return lifecycle hook (`buildStart`/`buildEnd`/
+    /// `generateBundle`) across all plugins that declare it, by name.
+    ///
+    /// Previously `build_start`/`build_end`/`generate_bundle` only logged
+    /// that a plugin *had* the hook without ever calling the plugin's JS
+    /// function — unlike `resolve_id`/`load`/`transform` above, which
+    /// genuinely `eval` into the plugin's QuickJS context. This shares that
+    /// same eval pattern instead of duplicating it three times. See
+    /// PRODUCTION-READINESS-100.md goal 42.
+    fn run_lifecycle_hook(&self, hook_name: &str, has_hook: impl Fn(&JsPlugin) -> bool) {
+        for (index, plugin) in self.plugins.iter().enumerate() {
+            if !has_hook(plugin) {
+                continue;
+            }
+            info!("[plugin:{}] {}", plugin.name, hook_name);
+            let global_name = format!("__pledge_plugin_{}", index);
+            let js_code = format!(
+                r#"
+                (function() {{
+                    try {{
+                        var __pluginModule = globalThis['{global_name}'];
+                        if (__pluginModule && typeof __pluginModule.{hook_name} === 'function') {{
+                            __pluginModule.{hook_name}();
+                        }}
+                    }} catch(e) {{
+                        console.log('Plugin {hook_name} error: ' + e.message);
+                    }}
+                }})()
+                "#,
+            );
+            if let Err(e) = self.context.with(|ctx| ctx.eval::<(), _>(js_code.as_str())) {
+                warn!("[plugin:{}] {} execution error: {}", plugin.name, hook_name, e);
+            }
+        }
+    }
+
+    /// Run buildStart hooks for all plugins.
     pub fn build_start(&self) {
-        for plugin in &self.plugins {
-            if plugin.has_build_start {
-                info!("[plugin:{}] buildStart", plugin.name);
-            }
-        }
+        self.run_lifecycle_hook("buildStart", |p| p.has_build_start);
     }
 
-    /// Run buildEnd hooks for all plugins
+    /// Run buildEnd hooks for all plugins.
     pub fn build_end(&self) {
-        for plugin in &self.plugins {
-            if plugin.has_build_end {
-                info!("[plugin:{}] buildEnd", plugin.name);
-            }
-        }
+        self.run_lifecycle_hook("buildEnd", |p| p.has_build_end);
     }
 
-    /// Run generateBundle hooks for all plugins
+    /// Run generateBundle hooks for all plugins.
     pub fn generate_bundle(&self) {
-        for plugin in &self.plugins {
-            if plugin.has_generate_bundle {
-                info!("[plugin:{}] generateBundle", plugin.name);
-            }
-        }
+        self.run_lifecycle_hook("generateBundle", |p| p.has_generate_bundle);
     }
 
     /// Check if any plugin handles resolveId for the given source
@@ -425,7 +552,7 @@ impl JsPluginHost {
                     "#,
                     global_name,
                     serde_json::to_string(code).unwrap_or_else(|_| "\"\"".to_string()),
-                    id.replace('\\', "/").replace('"', "\\\"")
+                    pledgepack_core::normalize_path_str(id).replace('"', "\\\"")
                 );
 
                 match self
@@ -454,6 +581,142 @@ impl JsPluginHost {
         } else {
             None
         }
+    }
+
+    /// Run `renderChunk` hooks for all plugins that declare one, in a
+    /// sequential chain (each plugin sees the previous plugin's output) —
+    /// mirrors `transform`'s chaining above and the WIT contract's
+    /// `render-chunk` hook, which `wasm-plugin-host` already implements.
+    /// Was WASM-only until now; see PRODUCTION-READINESS-100.md goal 44.
+    pub fn render_chunk(
+        &mut self,
+        code: &str,
+        filename: &str,
+        chunk_type: &str,
+    ) -> Option<TransformResult> {
+        let mut result_code = code.to_string();
+        let mut rendered = false;
+
+        for plugin in &self.plugins {
+            if !plugin.has_render_chunk {
+                continue;
+            }
+            info!("[plugin:{}] renderChunk: {}", plugin.name, filename);
+
+            let global_name = format!(
+                "__pledge_plugin_{}",
+                self.plugins
+                    .iter()
+                    .position(|p| p.name == plugin.name)
+                    .unwrap_or(0)
+            );
+            let js_code = format!(
+                r#"
+                (function() {{
+                    try {{
+                        var __pluginModule = globalThis['{}'];
+                        if (__pluginModule && typeof __pluginModule.renderChunk === 'function') {{
+                            var __result = __pluginModule.renderChunk({}, {}, {});
+                            if (__result && __result.code) {{
+                                return JSON.stringify(__result);
+                            }}
+                        }}
+                    }} catch(e) {{
+                        console.log('Plugin renderChunk error: ' + e.message);
+                    }}
+                    return null;
+                }})()
+                "#,
+                global_name,
+                serde_json::to_string(&result_code).unwrap_or_else(|_| "\"\"".to_string()),
+                serde_json::to_string(filename).unwrap_or_else(|_| "\"\"".to_string()),
+                serde_json::to_string(chunk_type).unwrap_or_else(|_| "\"\"".to_string()),
+            );
+
+            match self
+                .context
+                .with(|ctx| ctx.eval::<Option<String>, _>(js_code.as_str()))
+            {
+                Ok(Some(json_str)) => {
+                    if let Ok(result) = serde_json::from_str::<TransformResult>(&json_str) {
+                        result_code = result.code;
+                        rendered = true;
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    warn!("[plugin:{}] renderChunk execution error: {}", plugin.name, e);
+                }
+            }
+        }
+
+        if rendered {
+            Some(TransformResult {
+                code: result_code,
+                map: None,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Run `handleHotUpdate` hooks — first plugin to return non-null wins
+    /// (matching `resolve_id`/`load`'s "first wins" semantics, not
+    /// `transform`/`render_chunk`'s chaining — see the WIT contract's
+    /// ordering note on this hook). Previously absent from both plugin
+    /// hosts entirely; see PRODUCTION-READINESS-100.md goal 43.
+    pub fn handle_hot_update(&mut self, file: &str, timestamp: u64) -> Option<HotUpdateResult> {
+        for plugin in &self.plugins {
+            if !plugin.has_handle_hot_update {
+                continue;
+            }
+            info!("[plugin:{}] handleHotUpdate: {}", plugin.name, file);
+
+            let global_name = format!(
+                "__pledge_plugin_{}",
+                self.plugins
+                    .iter()
+                    .position(|p| p.name == plugin.name)
+                    .unwrap_or(0)
+            );
+            let js_code = format!(
+                r#"
+                (function() {{
+                    try {{
+                        var __pluginModule = globalThis['{}'];
+                        if (__pluginModule && typeof __pluginModule.handleHotUpdate === 'function') {{
+                            var __result = __pluginModule.handleHotUpdate({}, {});
+                            if (__result) {{
+                                return JSON.stringify(__result);
+                            }}
+                        }}
+                    }} catch(e) {{
+                        console.log('Plugin handleHotUpdate error: ' + e.message);
+                    }}
+                    return null;
+                }})()
+                "#,
+                global_name,
+                serde_json::to_string(file).unwrap_or_else(|_| "\"\"".to_string()),
+                timestamp,
+            );
+
+            match self
+                .context
+                .with(|ctx| ctx.eval::<Option<String>, _>(js_code.as_str()))
+            {
+                Ok(Some(json_str)) => {
+                    if let Ok(result) = serde_json::from_str::<HotUpdateResult>(&json_str) {
+                        return Some(result);
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    warn!("[plugin:{}] handleHotUpdate execution error: {}", plugin.name, e);
+                }
+            }
+        }
+        None
     }
 
     /// Run transformIndexHtml hooks for all plugins
@@ -735,9 +998,43 @@ fn strip_esm_and_assign(source: &str, global_name: &str) -> String {
         .join("\n")
 }
 
+/// Whether this host (the QuickJS-backed JS plugin host) genuinely executes
+/// a plugin's implementation of `hook_name` when present — not merely
+/// whether a *plugin* can declare the hook. See
+/// `pledgepack_core::plugin_system::PLUGIN_HOOK_NAMES` for the canonical
+/// hook-name list this should be checked against, and
+/// PRODUCTION-READINESS-100.md goals 45-46. Before those goals, `buildStart`/
+/// `buildEnd`/`generateBundle` were detected but silently never executed —
+/// exactly the failure mode this function (and goal 46's integration tests)
+/// exist to make impossible to reintroduce unnoticed.
+pub fn host_supports_hook(hook_name: &str) -> bool {
+    pledgepack_core::plugin_system::PLUGIN_HOOK_NAMES.contains(&hook_name)
+}
+
+/// The full capability matrix: every hook name paired with whether this
+/// host supports it. See `wasm-plugin-host`'s identically-named function.
+pub fn hook_support_matrix() -> Vec<(&'static str, bool)> {
+    pledgepack_core::plugin_system::PLUGIN_HOOK_NAMES
+        .iter()
+        .map(|&name| (name, host_supports_hook(name)))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hook_support_matrix_has_no_gaps() {
+        // Regression test for goals 42, 45-46 — this is the exact assertion
+        // that would have caught the buildStart/buildEnd/generateBundle bug
+        // before it shipped.
+        let matrix = hook_support_matrix();
+        assert_eq!(matrix.len(), pledgepack_core::plugin_system::PLUGIN_HOOK_NAMES.len());
+        for (hook, supported) in &matrix {
+            assert!(*supported, "js-plugin-host claims to support hook '{hook}' but host_supports_hook() says no");
+        }
+    }
 
     #[test]
     fn test_parse_plugin() {
@@ -760,6 +1057,65 @@ mod tests {
         assert!(plugin.has_transform);
         assert!(plugin.has_resolve_id);
         assert!(!plugin.has_load);
+    }
+
+    /// Regression tests for goal 12: with no verifier configured,
+    /// `check_plugin_signature` must be a no-op — covered implicitly by
+    /// `test_parse_plugin` above (and every other pre-existing test in this
+    /// file) still passing unmodified. These cover the newly-reachable
+    /// enabled path.
+    mod signing {
+        use super::*;
+        use pledgepack_core::plugin_system::{PluginSignature, PluginSigningVerifier};
+
+        #[test]
+        fn missing_sidecar_is_rejected_when_verifier_configured() {
+            let host = JsPluginHost::new().with_signing_verifier(PluginSigningVerifier::new());
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("plugin.js");
+            std::fs::write(&path, "export default { name: 'p' };").unwrap();
+
+            let err = host
+                .check_plugin_signature(&path, "export default { name: 'p' };")
+                .unwrap_err();
+            assert!(err.to_string().contains("no signature sidecar"));
+        }
+
+        #[test]
+        fn valid_signature_over_correct_hash_is_accepted() {
+            use ed25519_dalek::Signer;
+
+            let dir = tempfile::tempdir().unwrap();
+            let source = "export default { name: 'p' };";
+            let path = dir.path().join("plugin.js");
+            std::fs::write(&path, source).unwrap();
+            let wasm_hash = blake3::hash(source.as_bytes()).to_hex().to_string();
+
+            let signing_key = ed25519_dalek::SigningKey::from_bytes(&[11u8; 32]);
+            let verifying_key = signing_key.verifying_key();
+            let signature = signing_key.sign(wasm_hash.as_bytes());
+            let sig = PluginSignature {
+                plugin_name: "p".to_string(),
+                version: "1.0.0".to_string(),
+                wasm_hash,
+                signer_public_key: hex::encode(verifying_key.to_bytes()),
+                signature: hex::encode(signature.to_bytes()),
+                signer_identity: "@pledgelabs".to_string(),
+                timestamp: 0,
+                verified: false,
+            };
+            let sidecar_path = {
+                let mut s = path.as_os_str().to_os_string();
+                s.push(".sig.json");
+                std::path::PathBuf::from(s)
+            };
+            std::fs::write(sidecar_path, serde_json::to_string(&sig).unwrap()).unwrap();
+
+            let mut verifier = PluginSigningVerifier::new();
+            verifier.trust_key("@pledgelabs", &hex::encode(verifying_key.to_bytes()));
+            let host = JsPluginHost::new().with_signing_verifier(verifier);
+            host.check_plugin_signature(&path, source).unwrap();
+        }
     }
 
     #[test]

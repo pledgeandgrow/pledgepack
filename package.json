@@ -28,6 +28,7 @@
   "files": [
     "bin/pledge.js",
     "bin/postinstall.js",
+    "platforms.json",
     "README.md",
     "LICENSE"
   ],

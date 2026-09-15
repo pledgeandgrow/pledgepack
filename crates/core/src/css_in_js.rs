@@ -62,6 +62,82 @@ pub struct ExtractionResult {
     pub class_names: HashMap<String, String>,
 }
 
+/// Find the next occurrence of `needle` in `haystack` at byte offset >= `from`,
+/// skipping matches that appear inside string literals or comments.
+///
+/// Tracks `'`, `"`, and `` ` `` string literals (with `\` escapes), `//` line
+/// comments, and `/* */` block comments. The scan always starts at offset 0 so
+/// the lexer state is correct even though `from` may be mid-file.
+fn find_outside_strings(haystack: &str, needle: &str, from: usize) -> Option<usize> {
+    let bytes = haystack.as_bytes();
+    let needle_b = needle.as_bytes();
+    let n = bytes.len();
+    if needle_b.is_empty() || from >= n {
+        return None;
+    }
+
+    let mut i = 0;
+    let mut in_string: Option<u8> = None;
+    let mut in_line_comment = false;
+    let mut in_block_comment = false;
+
+    while i < n {
+        // Inside a line comment — ends at newline
+        if in_line_comment {
+            if bytes[i] == b'\n' {
+                in_line_comment = false;
+            }
+            i += 1;
+            continue;
+        }
+        // Inside a block comment — ends at `*/`
+        if in_block_comment {
+            if bytes[i] == b'*' && i + 1 < n && bytes[i + 1] == b'/' {
+                in_block_comment = false;
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        // Inside a string — handle escapes and the closing quote
+        if let Some(q) = in_string {
+            if bytes[i] == b'\\' {
+                i += 2;
+                continue;
+            }
+            if bytes[i] == q {
+                in_string = None;
+            }
+            i += 1;
+            continue;
+        }
+        // Not inside anything — detect comment and string starts
+        if bytes[i] == b'/' && i + 1 < n && bytes[i + 1] == b'/' {
+            in_line_comment = true;
+            i += 2;
+            continue;
+        }
+        if bytes[i] == b'/' && i + 1 < n && bytes[i + 1] == b'*' {
+            in_block_comment = true;
+            i += 2;
+            continue;
+        }
+        if bytes[i] == b'"' || bytes[i] == b'\'' || bytes[i] == b'`' {
+            in_string = Some(bytes[i]);
+            i += 1;
+            continue;
+        }
+        // Only match the needle outside strings/comments
+        if i >= from && bytes[i..].starts_with(needle_b) {
+            return Some(i);
+        }
+        i += 1;
+    }
+
+    None
+}
+
 /// Extract CSS from styled-components template literals
 /// `styled.div`color: red;`` → `.sc-{hash} { color: red; }` + `const X = "div"`
 pub fn extract_styled_components(source: &str, file_path: &str) -> ExtractionResult {
@@ -74,8 +150,7 @@ pub fn extract_styled_components(source: &str, file_path: &str) -> ExtractionRes
 
     for (prefix, mode) in &patterns {
         let mut search_pos = 0;
-        while let Some(pos) = code[search_pos..].find(prefix) {
-            let abs_pos = search_pos + pos;
+        while let Some(abs_pos) = find_outside_strings(&code, prefix, search_pos) {
             // Compute positions and extract data without borrowing code
             let after_len = code.len().saturating_sub(abs_pos + prefix.len());
             if after_len == 0 {
@@ -198,8 +273,7 @@ pub fn extract_vanilla_extract(source: &str, file_path: &str) -> ExtractionResul
 
     // Pattern: style({ color: 'red', ... })
     let mut search_pos = 0;
-    while let Some(pos) = code[search_pos..].find("style(") {
-        let abs_pos = search_pos + pos;
+    while let Some(abs_pos) = find_outside_strings(&code, "style(", search_pos) {
 
         let (obj_str, full_end, has_match) = {
             let after = &code[abs_pos + 6..];
@@ -242,8 +316,7 @@ pub fn extract_vanilla_extract(source: &str, file_path: &str) -> ExtractionResul
 
     // Pattern: globalStyle(':root', { color: 'red' })
     search_pos = 0;
-    while let Some(pos) = code[search_pos..].find("globalStyle(") {
-        let abs_pos = search_pos + pos;
+    while let Some(abs_pos) = find_outside_strings(&code, "globalStyle(", search_pos) {
 
         let (selector, obj_str, full_end, has_match) = {
             let after = &code[abs_pos + 12..];
@@ -301,8 +374,7 @@ fn extract_css_template_calls(
     let mut result = code.to_string();
     let mut search_pos = 0;
 
-    while let Some(pos) = result[search_pos..].find("css`") {
-        let abs_pos = search_pos + pos;
+    while let Some(abs_pos) = find_outside_strings(&result, "css`", search_pos) {
         let (template, full_end, has_match) = {
             let after = &result[abs_pos + 4..];
             if let Some(end_tick) = after.find('`') {

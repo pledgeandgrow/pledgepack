@@ -38,11 +38,37 @@ pub struct LineDiff {
     pub new_lines: u32,
 }
 
+/// Configuration for HMR diff heuristics.
+///
+/// Controls the thresholds that determine whether a line-level diff is small
+/// enough to be sent as a partial update instead of the full module code.
+#[derive(Debug, Clone)]
+pub struct HmrDiffConfig {
+    /// Maximum number of diff operations for a diff to be considered "small".
+    /// Diffs with more operations than this will fall back to full code.
+    pub small_diff_threshold: usize,
+    /// Maximum fraction of changed lines (0.0–1.0) for a diff to be considered "small".
+    /// Diffs affecting more than this fraction of the module fall back to full code.
+    pub small_diff_percentage: f64,
+}
+
+impl Default for HmrDiffConfig {
+    fn default() -> Self {
+        Self {
+            small_diff_threshold: 10,
+            small_diff_percentage: 0.3,
+        }
+    }
+}
+
 impl LineDiff {
-    /// Check if the diff is small enough to be worth sending instead of full code
-    pub fn is_small(&self) -> bool {
-        // Send diff if it affects less than 30% of lines and has fewer than 10 ops
-        if self.ops.len() > 10 {
+    /// Check if the diff is small enough to be worth sending instead of full code.
+    ///
+    /// Uses the provided [`HmrDiffConfig`] thresholds. A diff is "small" when it
+    /// has fewer than `config.small_diff_threshold` operations AND affects less
+    /// than `config.small_diff_percentage` of the module's lines.
+    pub fn is_small(&self, config: &HmrDiffConfig) -> bool {
+        if self.ops.len() >= config.small_diff_threshold {
             return false;
         }
         let changed_lines: u32 = self
@@ -55,7 +81,13 @@ impl LineDiff {
             })
             .sum();
         let max_lines = self.old_lines.max(self.new_lines).max(1);
-        changed_lines < (max_lines * 30 / 100)
+        (changed_lines as f64) < (max_lines as f64 * config.small_diff_percentage)
+    }
+
+    /// Check if the diff is small using the default thresholds.
+    /// Convenience method for callers that don't need custom configuration.
+    pub fn is_small_default(&self) -> bool {
+        self.is_small(&HmrDiffConfig::default())
     }
 }
 
@@ -119,6 +151,10 @@ fn similar_to_diff_ops<'a>(diff: &TextDiff<'a, 'a, 'a, str>) -> Vec<DiffOp> {
     let mut pending_inserts: Vec<String> = Vec::new();
     let mut pending_deletes: u32 = 0;
     let mut pending_delete_start: u32 = 0;
+    // Line position where the current pending insert block begins (in old-file
+    // coordinates). Tracked separately from `pending_delete_start` so a pure
+    // insert doesn't inherit a stale delete position from a previous flush.
+    let mut pending_insert_pos: u32 = 0;
 
     for change in diff.iter_all_changes() {
         match change.tag() {
@@ -129,6 +165,7 @@ fn similar_to_diff_ops<'a>(diff: &TextDiff<'a, 'a, 'a, str>) -> Vec<DiffOp> {
                     &mut pending_inserts,
                     &mut pending_deletes,
                     &mut pending_delete_start,
+                    &mut pending_insert_pos,
                 );
                 old_line += 1;
             }
@@ -140,6 +177,11 @@ fn similar_to_diff_ops<'a>(diff: &TextDiff<'a, 'a, 'a, str>) -> Vec<DiffOp> {
                 old_line += 1;
             }
             ChangeTag::Insert => {
+                if pending_inserts.is_empty() {
+                    // First insert of a new pending block — record where it
+                    // goes in old-file line coordinates.
+                    pending_insert_pos = old_line;
+                }
                 pending_inserts.push(change.value().trim_end_matches('\n').to_string());
             }
         }
@@ -151,6 +193,7 @@ fn similar_to_diff_ops<'a>(diff: &TextDiff<'a, 'a, 'a, str>) -> Vec<DiffOp> {
         &mut pending_inserts,
         &mut pending_deletes,
         &mut pending_delete_start,
+        &mut pending_insert_pos,
     );
 
     ops
@@ -162,6 +205,7 @@ fn flush_pending(
     inserts: &mut Vec<String>,
     deletes: &mut u32,
     delete_start: &mut u32,
+    insert_pos: &mut u32,
 ) {
     if *deletes > 0 && !inserts.is_empty() {
         ops.push(DiffOp::Replace {
@@ -175,8 +219,10 @@ fn flush_pending(
             count: *deletes,
         });
     } else if !inserts.is_empty() {
+        // Pure insert — use the recorded insert position, not delete_start
+        // (which may hold a stale value from a previous flush).
         ops.push(DiffOp::Insert {
-            line: *delete_start,
+            line: *insert_pos,
             content: std::mem::take(inserts),
         });
     }

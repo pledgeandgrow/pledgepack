@@ -204,17 +204,25 @@ impl MemoryBackend {
     }
 
     /// Remove a task from the cache.
+    ///
+    /// All `self.lru.lock()` calls in this file use `.unwrap_or_else(|e|
+    /// e.into_inner())` rather than `.unwrap()`: a bare `.unwrap()` panics
+    /// the *next* caller too if any earlier holder of this same lock ever
+    /// panicked while holding it, turning one unrelated bug into a
+    /// permanently wedged build engine. `PoisonError::into_inner()` recovers
+    /// the (possibly-inconsistent-but-still-usable) guard instead. See
+    /// PRODUCTION-READINESS-100.md goal 21.
     pub fn remove(&self, id: &TaskId) {
         self.outputs.remove(id);
         self.output_hashes.remove(id);
-        self.lru.lock().unwrap().remove(id);
+        self.lru.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
     }
 
     /// G4.7: Evict the least recently accessed clean output.
     ///
     /// Returns the evicted TaskId, or None if the cache is empty.
     pub fn evict_lru(&self) -> Option<TaskId> {
-        let lru = self.lru.lock().unwrap();
+        let lru = self.lru.lock().unwrap_or_else(|e| e.into_inner());
         if lru.is_empty() {
             return None;
         }
@@ -242,7 +250,7 @@ impl MemoryBackend {
     /// G4.7: Touch the LRU counter for a task.
     fn touch_lru(&self, id: TaskId) {
         let ts = self.lru_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-        self.lru.lock().unwrap().insert(id, ts);
+        self.lru.lock().unwrap_or_else(|e| e.into_inner()).insert(id, ts);
     }
 
     /// Number of cached outputs.

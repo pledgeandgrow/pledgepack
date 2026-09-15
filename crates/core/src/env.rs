@@ -36,19 +36,21 @@ impl EnvVars {
 
         let mut vars = HashMap::new();
 
-        // Start with process environment variables matching prefixes
-        for (key, value) in std::env::vars() {
-            if prefixes.iter().any(|p| key.starts_with(p)) {
-                vars.insert(key, value);
-            }
-        }
-
-        // Load .env files (later files override earlier)
+        // Load .env files first (later files override earlier)
         for path in &candidates {
             if path.exists()
                 && let Ok(content) = std::fs::read_to_string(path)
             {
                 Self::parse_env_file(&content, &mut vars);
+            }
+        }
+
+        // Process environment variables take precedence over .env files:
+        // only insert process env values that are not already set, OR override
+        // existing .env values so the real environment always wins.
+        for (key, value) in std::env::vars() {
+            if prefixes.iter().any(|p| key.starts_with(p)) {
+                vars.insert(key, value);
             }
         }
 

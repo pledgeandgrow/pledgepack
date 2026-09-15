@@ -22,19 +22,27 @@ fn test_plugin_path() -> PathBuf {
         .join("test_plugin_guest.wasm")
 }
 
-/// Check if the test plugin was built. If not, skip the test.
+/// Check if the test plugin was built. If not, tests should fail (not silently skip).
 fn test_plugin_exists() -> bool {
     test_plugin_path().exists()
 }
 
+/// Panic with a helpful message if the test plugin artifact is missing.
+/// In CI, the guest component must be built before running tests.
+macro_rules! require_test_plugin {
+    () => {
+        if !test_plugin_exists() {
+            panic!(
+                "Test plugin not built. Run 'cargo component build -p test-plugin-guest' first.\n\
+                 In CI, ensure the guest component is built before running tests."
+            );
+        }
+    };
+}
+
 #[test]
 fn test_plugin_loads() {
-    if !test_plugin_exists() {
-        eprintln!(
-            "Skipping test: test plugin not built. Run: cd tests/test-plugin-guest && cargo component build --release"
-        );
-        return;
-    }
+    require_test_plugin!();
     let path = test_plugin_path();
     let plugin = WasmPlugin::load_from_file(&path);
     assert!(plugin.is_ok(), "Failed to load test plugin: {:?}", plugin.err());
@@ -50,10 +58,7 @@ fn test_plugin_loads() {
 
 #[test]
 fn test_plugin_resolve_id_virtual() {
-    if !test_plugin_exists() {
-        eprintln!("Skipping test: test plugin not built");
-        return;
-    }
+    require_test_plugin!();
     let path = test_plugin_path();
     let mut plugin = WasmPlugin::load_from_file(&path).unwrap();
 
@@ -68,10 +73,7 @@ fn test_plugin_resolve_id_virtual() {
 
 #[test]
 fn test_plugin_resolve_id_passthrough() {
-    if !test_plugin_exists() {
-        eprintln!("Skipping test: test plugin not built");
-        return;
-    }
+    require_test_plugin!();
     let path = test_plugin_path();
     let mut plugin = WasmPlugin::load_from_file(&path).unwrap();
 
@@ -82,10 +84,7 @@ fn test_plugin_resolve_id_passthrough() {
 
 #[test]
 fn test_plugin_load_virtual() {
-    if !test_plugin_exists() {
-        eprintln!("Skipping test: test plugin not built");
-        return;
-    }
+    require_test_plugin!();
     let path = test_plugin_path();
     let mut plugin = WasmPlugin::load_from_file(&path).unwrap();
 
@@ -100,10 +99,7 @@ fn test_plugin_load_virtual() {
 
 #[test]
 fn test_plugin_load_passthrough() {
-    if !test_plugin_exists() {
-        eprintln!("Skipping test: test plugin not built");
-        return;
-    }
+    require_test_plugin!();
     let path = test_plugin_path();
     let mut plugin = WasmPlugin::load_from_file(&path).unwrap();
 
@@ -114,10 +110,7 @@ fn test_plugin_load_passthrough() {
 
 #[test]
 fn test_plugin_transform_js() {
-    if !test_plugin_exists() {
-        eprintln!("Skipping test: test plugin not built");
-        return;
-    }
+    require_test_plugin!();
     let path = test_plugin_path();
     let mut plugin = WasmPlugin::load_from_file(&path).unwrap();
 
@@ -132,10 +125,7 @@ fn test_plugin_transform_js() {
 
 #[test]
 fn test_plugin_transform_ts() {
-    if !test_plugin_exists() {
-        eprintln!("Skipping test: test plugin not built");
-        return;
-    }
+    require_test_plugin!();
     let path = test_plugin_path();
     let mut plugin = WasmPlugin::load_from_file(&path).unwrap();
 
@@ -148,10 +138,7 @@ fn test_plugin_transform_ts() {
 
 #[test]
 fn test_plugin_transform_css_passthrough() {
-    if !test_plugin_exists() {
-        eprintln!("Skipping test: test plugin not built");
-        return;
-    }
+    require_test_plugin!();
     let path = test_plugin_path();
     let mut plugin = WasmPlugin::load_from_file(&path).unwrap();
 
@@ -162,10 +149,7 @@ fn test_plugin_transform_css_passthrough() {
 
 #[test]
 fn test_plugin_transform_index_html_passthrough() {
-    if !test_plugin_exists() {
-        eprintln!("Skipping test: test plugin not built");
-        return;
-    }
+    require_test_plugin!();
     let path = test_plugin_path();
     let mut plugin = WasmPlugin::load_from_file(&path).unwrap();
 
@@ -178,10 +162,7 @@ fn test_plugin_transform_index_html_passthrough() {
 
 #[test]
 fn host_loads_test_plugin() {
-    if !test_plugin_exists() {
-        eprintln!("Skipping test: test plugin not built");
-        return;
-    }
+    require_test_plugin!();
     let path = test_plugin_path();
     let mut host = WasmPluginHost::new().unwrap();
     assert!(host.is_empty());
@@ -194,10 +175,7 @@ fn host_loads_test_plugin() {
 
 #[test]
 fn host_resolve_id_through_plugin() {
-    if !test_plugin_exists() {
-        eprintln!("Skipping test: test plugin not built");
-        return;
-    }
+    require_test_plugin!();
     let path = test_plugin_path();
     let mut host = WasmPluginHost::new().unwrap();
     host.load_plugin(&path).unwrap();
@@ -209,10 +187,7 @@ fn host_resolve_id_through_plugin() {
 
 #[test]
 fn host_transform_through_plugin() {
-    if !test_plugin_exists() {
-        eprintln!("Skipping test: test plugin not built");
-        return;
-    }
+    require_test_plugin!();
     let path = test_plugin_path();
     let mut host = WasmPluginHost::new().unwrap();
     host.load_plugin(&path).unwrap();
@@ -226,10 +201,7 @@ fn host_transform_through_plugin() {
 
 #[test]
 fn bridge_transform_closure_with_real_plugin() {
-    if !test_plugin_exists() {
-        eprintln!("Skipping test: test plugin not built");
-        return;
-    }
+    require_test_plugin!();
     let path = test_plugin_path();
     let mut host = WasmPluginHost::new().unwrap();
     host.load_plugin(&path).unwrap();
@@ -245,10 +217,7 @@ fn bridge_transform_closure_with_real_plugin() {
 
 #[test]
 fn bridge_transform_closure_passthrough_for_css() {
-    if !test_plugin_exists() {
-        eprintln!("Skipping test: test plugin not built");
-        return;
-    }
+    require_test_plugin!();
     let path = test_plugin_path();
     let mut host = WasmPluginHost::new().unwrap();
     host.load_plugin(&path).unwrap();
@@ -264,10 +233,7 @@ fn bridge_transform_closure_passthrough_for_css() {
 
 #[test]
 fn test_wasm_plugin_is_post_by_default() {
-    if !test_plugin_exists() {
-        eprintln!("Skipping test: test plugin not built");
-        return;
-    }
+    require_test_plugin!();
     let path = test_plugin_path();
     let plugin = WasmPlugin::load_from_file(&path).unwrap();
     // The test plugin has no enforce field → default = "post"
@@ -277,10 +243,7 @@ fn test_wasm_plugin_is_post_by_default() {
 
 #[test]
 fn test_wasm_host_has_pre_post_detection() {
-    if !test_plugin_exists() {
-        eprintln!("Skipping test: test plugin not built");
-        return;
-    }
+    require_test_plugin!();
     let path = test_plugin_path();
     let mut host = WasmPluginHost::new().unwrap();
     host.load_plugin(&path).unwrap();
@@ -292,10 +255,7 @@ fn test_wasm_host_has_pre_post_detection() {
 
 #[test]
 fn test_wasm_bridge_has_pre_post_detection() {
-    if !test_plugin_exists() {
-        eprintln!("Skipping test: test plugin not built");
-        return;
-    }
+    require_test_plugin!();
     let path = test_plugin_path();
     let mut host = WasmPluginHost::new().unwrap();
     host.load_plugin(&path).unwrap();
@@ -307,10 +267,7 @@ fn test_wasm_bridge_has_pre_post_detection() {
 
 #[test]
 fn test_wasm_bridge_pre_transform_closure_returns_none_when_no_pre() {
-    if !test_plugin_exists() {
-        eprintln!("Skipping test: test plugin not built");
-        return;
-    }
+    require_test_plugin!();
     let path = test_plugin_path();
     let mut host = WasmPluginHost::new().unwrap();
     host.load_plugin(&path).unwrap();
@@ -329,10 +286,7 @@ fn test_wasm_plugin_state_host_config() {
     // PluginState::new is private — we test host_config via the public API
     // by loading a plugin and checking that set_host_config doesn't panic.
     // The actual host_config field is tested via the get-config host import.
-    if !test_plugin_exists() {
-        eprintln!("Skipping test: test plugin not built");
-        return;
-    }
+    require_test_plugin!();
     let path = test_plugin_path();
     let plugin = WasmPlugin::load_from_file(&path).unwrap();
     // Just verify the plugin loads — host_config is tested internally
@@ -343,10 +297,7 @@ fn test_wasm_plugin_state_host_config() {
 fn test_wasm_plugin_state_emitted_files() {
     // PluginState::new is private — we test emitted_files via the public API
     // by loading a plugin and checking that it doesn't emit files by default.
-    if !test_plugin_exists() {
-        eprintln!("Skipping test: test plugin not built");
-        return;
-    }
+    require_test_plugin!();
     let path = test_plugin_path();
     let plugin = WasmPlugin::load_from_file(&path).unwrap();
     // The test plugin doesn't emit files — just verify it loads

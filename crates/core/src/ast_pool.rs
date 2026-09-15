@@ -71,6 +71,14 @@ impl PreParsedAst {
     /// Get a reference to the parsed program.
     /// The lifetime is tied to `&self` — the program references the allocator
     /// which is owned by this struct.
+    ///
+    /// # Safety
+    ///
+    /// The returned `Program<'_>` borrows from the `PreParsedAst`'s `Allocator`.
+    /// The caller must ensure the `PreParsedAst` (and its allocator) outlives all
+    /// uses of the returned `Program`. Dropping the `PreParsedAst` while the
+    /// `Program` is still in use causes undefined behavior because the
+    /// arena memory the `Program` references would be freed.
     pub fn program(&self) -> &Program<'_> {
         // SAFETY: The program references self.allocator, which is alive
         // as long as self is alive.
@@ -78,7 +86,17 @@ impl PreParsedAst {
     }
 
     /// Get a mutable reference to the parsed program.
+    ///
+    /// # Safety
+    ///
+    /// The returned `&mut Program<'_>` borrows from the `PreParsedAst`'s
+    /// `Allocator`. The caller must ensure the `PreParsedAst` (and its
+    /// allocator) outlives all uses of the returned `Program`. Mutating the
+    /// program must not introduce references to memory outside the
+    /// allocator's arena.
     pub fn program_mut(&mut self) -> &mut Program<'_> {
+        // SAFETY: The program references self.allocator, which is alive
+        // as long as self is alive.
         unsafe { std::mem::transmute(&mut self.program) }
     }
 
@@ -89,6 +107,15 @@ impl PreParsedAst {
 
     /// Decompose into owned allocator and program.
     /// The caller must keep them alive together.
+    ///
+    /// # Safety
+    ///
+    /// The returned `Program<'static>` references memory inside the returned
+    /// `Box<Allocator>`'s arena. The caller is responsible for keeping the
+    /// `Allocator` alive for as long as the `Program` is in use. Dropping the
+    /// `Allocator` while the `Program` is still referenced causes undefined
+    /// behavior. The `'static` lifetime is a lie (erased via `transmute`) and
+    /// must not be used to escape the allocator's lifetime.
     pub fn into_parts(self) -> (Box<Allocator>, Program<'static>) {
         (self.allocator, self.program)
     }
@@ -315,6 +342,15 @@ impl AstPool {
     ///
     /// Returns `(Allocator, Program)` — the caller owns both and must keep
     /// them alive together.
+    ///
+    /// # Safety
+    ///
+    /// The returned `Program<'static>` references memory inside the returned
+    /// `Box<Allocator>`'s arena. The `'static` lifetime is erased via
+    /// `transmute` and is not real — the caller must keep the `Allocator`
+    /// alive for as long as the `Program` is in use. Dropping the `Allocator`
+    /// while the `Program` is still referenced causes undefined behavior
+    /// (use-after-free of arena memory).
     pub fn take(&mut self, handle: AstHandle) -> Option<(Box<Allocator>, Program<'static>)> {
         let entry = self.entries.remove(&handle.0)?;
         self.insertion_order.retain(|&h| h != handle.0);
@@ -425,36 +461,16 @@ impl PluginAstSource for AstPool {
 
         let handle = self.get_or_parse(source, source_type)?;
 
-        // Serialize the AST to a plugin-visible format.
-        //
-        // NOTE: Oxc's `Program` does not implement `serde::Serialize` by default
-        // (requires the `oxc/serde` feature, which is not enabled in this build).
-        // For now, we provide the source code and a structural summary (imports,
-        // exports, dynamic imports) that plugins can use.
-        //
-        // When Phase 0 (WIT contract) and Phase 2 (Wasmtime host) land, this
-        // will be replaced with full ESTree JSON serialization via:
-        //   1. Enable `oxc/serde` feature, OR
-        //   2. Write an Oxc → ESTree converter (like oxc-parser's ESTree output)
-        //
-        // The current approach is sufficient for the QuickJS-based plugin host,
-        // which can re-parse the source itself if it needs the full AST.
-        let summary = self.with_program(handle, |program| {
-            // Extract a structural summary from the AST using dynamic import detection
-            // (which is already implemented) as a proof-of-concept.
-            let dynamic_imports = crate::transform::detect_dynamic_imports_from_program(program);
-
-            serde_json::json!({
-                "type": "Program",
-                "sourceType": "module",
-                "dynamicImports": dynamic_imports,
-                "note": "Full ESTree serialization requires oxc/serde feature (Phase 0/2)",
-            }).to_string()
+        // Serialize the AST to ESTree-compatible JSON via the hand-written
+        // Oxc → ESTree converter. This gives WASM and JS plugins full AST
+        // access (the format Babel, ESLint, and most JS tooling expect).
+        let ast_json = self.with_program(handle, |program| {
+            crate::estree::program_to_estree(program).to_string()
         }).ok_or("Failed to access AST for serialization")?;
 
         Ok(PluginAst {
             source: source.to_string(),
-            ast_json: summary,
+            ast_json,
             kind: kind.to_string(),
             file_path: file_path.to_string(),
         })

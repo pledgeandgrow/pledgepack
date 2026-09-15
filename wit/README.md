@@ -1,6 +1,6 @@
-# PledgePack Plugin ABI — WIT Contract v0.1.0
+# PledgePack Plugin ABI — WIT Contract v0.1.2
 
-> **FROZEN**: This contract is frozen at v0.1.0. Breaking changes require a new world (`pledgepack-plugin-v1`). Additive changes (new hooks, new optional fields) are allowed within v0.1.x.
+> **FROZEN**: This contract is frozen at v0.1.2. Breaking changes require a new world (`pledgepack-plugin-v1`). Additive changes (new hooks, new optional fields) are allowed within v0.1.x.
 
 ## What This Is
 
@@ -30,6 +30,12 @@ Both tiers implement the same hook shapes. The JS shim wraps Vite/Rollup plugins
 | Hook | Input | Output | Semantics |
 |---|---|---|---|
 | `transform-index-html` | html, path | html, tags[], cache-key | Chain |
+
+### Render Chunk (sequential)
+
+| Hook | Input | Output | Semantics |
+|---|---|---|---|
+| `render-chunk` | code, filename, chunk-type | code, map, cache-key | Chain — each plugin sees previous output |
 
 ### Lifecycle (parallel)
 
@@ -61,15 +67,17 @@ The `transform` hook includes an optional `ast-json` field in its input. This is
 
 Plugins **must** handle `ast-json: none` gracefully (fall back to parsing the code themselves).
 
-In v0.1.0, `ast-json` is always `none`. This field is a forward-compatible extension point.
+In v0.1.x, `ast-json` is always `none`. This field is a forward-compatible extension point.
 
 ## Versioning Policy
 
-### v0.1.0 (this version) — FROZEN
+### v0.1.2 (this version) — FROZEN
 
-- 8 hooks: resolve-id, load, transform, transform-index-html, build-start, build-end, generate-bundle, configure-server
-- All outputs include cache-key
-- AST access via `ast-json` field (always `none` in v0.1.0)
+- 9 hooks: resolve-id, load, transform, transform-index-html, render-chunk, build-start, build-end, generate-bundle, configure-server
+- All outputs include cache-key and `schema-version`
+- AST access via `ast-json` field (always `none` in v0.1.x)
+- `render-chunk` hook added (additive, backward-compatible)
+- `schema-version: option<u32>` field on all output records (G7.6)
 
 ### Additive changes allowed in v0.1.x
 
@@ -92,6 +100,7 @@ In v0.1.0, `ast-json` is always `none`. This field is a forward-compatible exten
 | `load(id)` | `load(input)` | Same semantics |
 | `transform(code, id)` | `transform(input)` | Added `ast-json` extension |
 | `transformIndexHtml(html)` | `transform-index-html(input)` | Added `tags` in output |
+| `renderChunk(code, chunk, outputOptions)` | `render-chunk(input)` | Added in v0.1.2 — `chunk.name` → `filename`, `chunk.type` → `chunk-type` |
 | `buildStart()` | `build-start()` | Same |
 | `buildEnd()` | `build-end()` | Same |
 | `generateBundle()` | `generate-bundle()` | Same |
@@ -100,7 +109,7 @@ In v0.1.0, `ast-json` is always `none`. This field is a forward-compatible exten
 ### Intentional differences from Vite
 
 1. **No `config`/`configResolved` hooks** — PledgePack config is resolved before plugins load. Plugins read config via a future `get-config` host import (not in v0.1.0).
-2. **No `renderChunk`/`writeBundle`/`closeBundle`** — deferred to v0.1.x (additive).
+2. **No `writeBundle`/`closeBundle`** — deferred to v0.1.x (additive). `renderChunk` was added in v0.1.2.
 3. **No `handleHotUpdate`/`watchChange`** — HMR is handled internally by PledgePack's dev server. Plugin HMR hooks may be added in v0.1.x.
 4. **`configure-server` returns middleware source** — instead of receiving a server object to mutate, the plugin returns middleware source code. This is sandbox-friendly (no object references cross the WASM boundary).
 5. **`cache-key` in every output** — Vite/Rollup don't have this. It's the PledgePack moat: every hook output is a cacheable task node.

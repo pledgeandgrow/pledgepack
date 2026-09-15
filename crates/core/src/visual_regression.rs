@@ -194,10 +194,23 @@ fn test_page(
     })
 }
 
-/// Capture a screenshot of a URL (placeholder — would use headless browser in production)
+/// Capture a screenshot of a URL.
+///
+/// # ⚠️ STUB IMPLEMENTATION — NOT FUNCTIONAL
+///
+/// This function does **not** capture real screenshots. It generates a
+/// synthetic 1×1 PNG with URL/viewport metadata appended as trailing bytes.
+/// Visual regression testing is therefore **not functional** — every
+/// "screenshot" is identical regardless of the page content, so pixel diffs
+/// only detect metadata changes (e.g. timestamp), not actual visual
+/// regressions.
+///
+/// TODO: Integrate a headless browser (Chrome CDP or WebDriver) for real
+/// screenshot capture before enabling visual regression testing in CI.
 fn capture_screenshot(url: &str, width: u32, height: u32) -> Result<Vec<u8>> {
-    // In production, this would use a headless browser (Chrome/Firefox via CDP or WebDriver)
-    // For now, generate a placeholder PNG with the URL encoded
+    // STUB: In production, this would use a headless browser (Chrome/Firefox via
+    // CDP or WebDriver) to render the page and capture a real screenshot.
+    // For now, generate a placeholder PNG with the URL encoded as metadata.
     let placeholder = format!(
         "PledgePack Visual Test\nURL: {}\nViewport: {}x{}\nTimestamp: {}\n",
         url,

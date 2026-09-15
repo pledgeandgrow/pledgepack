@@ -97,6 +97,10 @@ impl NextAdapter {
 
     /// Detect all routes from the file system
     pub fn discover_routes(&mut self) -> Result<()> {
+        // Clear any previously discovered routes and middleware before rescanning
+        self.routes.clear();
+        self.middleware = None;
+
         // Detect middleware.ts (can be at root or src/)
         self.detect_middleware();
 
@@ -106,10 +110,10 @@ impl NextAdapter {
 
         if app_dir.exists() && app_dir.is_dir() {
             self.router_type = RouterType::AppRouter;
-            self.discover_app_routes(&app_dir, "", &[])?;
+            self.discover_app_routes(&app_dir, "", &[], None, None)?;
         } else if src_app_dir.exists() && src_app_dir.is_dir() {
             self.router_type = RouterType::AppRouter;
-            self.discover_app_routes(&src_app_dir, "", &[])?;
+            self.discover_app_routes(&src_app_dir, "", &[], None, None)?;
         }
 
         // Check for pages/ directory — supports both root/pages and root/src/pages
@@ -120,12 +124,12 @@ impl NextAdapter {
             if self.routes.is_empty() {
                 self.router_type = RouterType::PagesRouter;
             }
-            self.discover_pages_routes(&pages_dir, "")?;
+            self.discover_pages_routes(&pages_dir, "", None, None)?;
         } else if src_pages_dir.exists() && src_pages_dir.is_dir() {
             if self.routes.is_empty() {
                 self.router_type = RouterType::PagesRouter;
             }
-            self.discover_pages_routes(&src_pages_dir, "")?;
+            self.discover_pages_routes(&src_pages_dir, "", None, None)?;
         }
 
         Ok(())
@@ -137,12 +141,9 @@ impl NextAdapter {
             for ext in ["ts", "js", "tsx", "jsx"] {
                 let mw = base.join(format!("middleware.{}", ext));
                 if mw.exists() {
-                    self.middleware = Some(
-                        mw.strip_prefix(&self.root)
-                            .unwrap_or(&mw)
-                            .to_string_lossy()
-                            .replace('\\', "/"),
-                    );
+                    self.middleware = Some(pledgepack_core::normalize_path(
+                        mw.strip_prefix(&self.root).unwrap_or(&mw),
+                    ));
                     return;
                 }
             }
@@ -151,11 +152,15 @@ impl NextAdapter {
 
     /// Discover routes from app/ directory (App Router)
     /// `accumulated_params` tracks dynamic params from parent directories
+    /// `current_slot` is the parallel route slot name inherited from a parent `@slot` directory
+    /// `current_intercept` is the intercepting route kind inherited from a parent intercept directory
     fn discover_app_routes(
         &mut self,
         dir: &Path,
         prefix: &str,
         accumulated_params: &[String],
+        current_slot: Option<String>,
+        current_intercept: Option<InterceptKind>,
     ) -> Result<()> {
         let entries = std::fs::read_dir(dir)?;
 
@@ -167,6 +172,17 @@ impl NextAdapter {
             if path.is_dir() {
                 // Parse directory name for routing convention
                 let dir_info = parse_dir_name(&name);
+
+                // Compute slot/intercept for this directory level.
+                // A `@slot` directory sets the parallel route slot name.
+                // An intercepting route prefix (`(.)`, `(..)`, etc.) sets the intercept kind.
+                // Nested directories inherit the parent's slot/intercept unless overridden.
+                let new_slot = if name.starts_with('@') {
+                    Some(name.trim_start_matches('@').to_string())
+                } else {
+                    current_slot.clone()
+                };
+                let new_intercept = parse_intercept(&name).or(current_intercept);
 
                 let new_prefix = match &dir_info.segment {
                     DirSegment::None => prefix.to_string(),
@@ -198,8 +214,8 @@ impl NextAdapter {
                         params: child_params.clone(),
                         catch_all: dir_info.is_catch_all,
                         catch_all_optional: dir_info.is_catch_all_optional,
-                        slot: None,
-                        intercept: None,
+                        slot: new_slot.clone(),
+                        intercept: new_intercept,
                     });
                 }
 
@@ -211,20 +227,19 @@ impl NextAdapter {
                         params: child_params.clone(),
                         catch_all: dir_info.is_catch_all,
                         catch_all_optional: dir_info.is_catch_all_optional,
-                        slot: None,
-                        intercept: None,
+                        slot: new_slot.clone(),
+                        intercept: new_intercept,
                     });
                 }
 
                 // Recurse into subdirectories
-                self.discover_app_routes(&path, &new_prefix, &child_params)?;
-
-                // Handle parallel routes (@slot directories)
-                if name.starts_with('@') {
-                    // Also recurse into the slot itself for route discovery
-                    // The slot name is the directory name
-                    // Routes inside @slot are parallel routes
-                }
+                self.discover_app_routes(
+                    &path,
+                    &new_prefix,
+                    &child_params,
+                    new_slot,
+                    new_intercept,
+                )?;
             } else {
                 // File-level route conventions
                 let kind = match name.as_str() {
@@ -262,8 +277,8 @@ impl NextAdapter {
                     params: accumulated_params.to_vec(),
                     catch_all: false,
                     catch_all_optional: false,
-                    slot: None,
-                    intercept: None,
+                    slot: current_slot.clone(),
+                    intercept: current_intercept,
                 });
             }
         }
@@ -272,7 +287,15 @@ impl NextAdapter {
     }
 
     /// Discover routes from pages/ directory (Pages Router)
-    fn discover_pages_routes(&mut self, dir: &Path, prefix: &str) -> Result<()> {
+    /// `current_slot` is the parallel route slot name inherited from a parent `@slot` directory
+    /// `current_intercept` is the intercepting route kind inherited from a parent intercept directory
+    fn discover_pages_routes(
+        &mut self,
+        dir: &Path,
+        prefix: &str,
+        current_slot: Option<String>,
+        current_intercept: Option<InterceptKind>,
+    ) -> Result<()> {
         let entries = std::fs::read_dir(dir)?;
 
         for entry in entries {
@@ -282,6 +305,14 @@ impl NextAdapter {
 
             if path.is_dir() {
                 let dir_info = parse_dir_name(&name);
+
+                // Compute slot/intercept for this directory level (same logic as App Router)
+                let new_slot = if name.starts_with('@') {
+                    Some(name.trim_start_matches('@').to_string())
+                } else {
+                    current_slot.clone()
+                };
+                let new_intercept = parse_intercept(&name).or(current_intercept);
 
                 let new_prefix = match &dir_info.segment {
                     DirSegment::None => prefix.to_string(),
@@ -320,12 +351,12 @@ impl NextAdapter {
                         params: child_params.clone(),
                         catch_all: dir_info.is_catch_all,
                         catch_all_optional: dir_info.is_catch_all_optional,
-                        slot: None,
-                        intercept: None,
+                        slot: new_slot.clone(),
+                        intercept: new_intercept,
                     });
                 }
 
-                self.discover_pages_routes(&path, &new_prefix)?;
+                self.discover_pages_routes(&path, &new_prefix, new_slot, new_intercept)?;
             } else {
                 // File-level routes
                 let (route_path, kind, file_params) = if name == "index.tsx"
@@ -397,8 +428,8 @@ impl NextAdapter {
                     params: file_params,
                     catch_all: false,
                     catch_all_optional: false,
-                    slot: None,
-                    intercept: None,
+                    slot: current_slot.clone(),
+                    intercept: current_intercept,
                 });
             }
         }
@@ -419,7 +450,7 @@ impl NextAdapter {
                 code.push_str(&format!(
                     "  '{}': () => import('/{}'),\n",
                     route.path,
-                    route.file.replace('\\', "/")
+                    pledgepack_core::normalize_path_str(&route.file)
                 ));
             }
         }
@@ -432,7 +463,7 @@ impl NextAdapter {
                 code.push_str(&format!(
                     "  '{}': () => import('/{}'),\n",
                     route.path,
-                    route.file.replace('\\', "/")
+                    pledgepack_core::normalize_path_str(&route.file)
                 ));
             }
         }
@@ -445,7 +476,7 @@ impl NextAdapter {
                 code.push_str(&format!(
                     "  '{}': () => import('/{}'),\n",
                     route.path,
-                    route.file.replace('\\', "/")
+                    pledgepack_core::normalize_path_str(&route.file)
                 ));
             }
         }
@@ -456,19 +487,26 @@ impl NextAdapter {
             r#"export function navigate(path) {
   const route = routes[path];
   if (route) {
+    history.pushState({}, '', path);
+    window.dispatchEvent(new PopStateEvent('popstate', { state: {} }));
+  }
+}
+
+window.addEventListener('popstate', () => {
+  const path = window.location.pathname;
+  const route = routes[path];
+  if (route) {
     route().then(mod => {
-      const app = document.getElementById('root');
+      const app = document.getElementById('__next');
       if (app && mod.default) {
         app.innerHTML = '';
         if (typeof mod.default === 'function') {
           mod.default(app);
-        } else if (mod.default.render) {
-          mod.default.render(app);
         }
       }
     });
   }
-}
+});
 
 export function getRoutes() {
   return Object.keys(routes);
@@ -577,10 +615,7 @@ fn find_file(dir: &Path, candidates: &[&str]) -> PathBuf {
 
 /// Get relative path from root, with forward slashes
 fn rel_path(root: &Path, abs: &Path) -> String {
-    abs.strip_prefix(root)
-        .unwrap_or(abs)
-        .to_string_lossy()
-        .replace('\\', "/")
+    pledgepack_core::normalize_path(abs.strip_prefix(root).unwrap_or(abs))
 }
 
 /// Join a prefix with a segment, handling empty prefix

@@ -144,7 +144,7 @@ impl TanStackAdapter {
 
         // Import all route files
         for route in &self.routes {
-            let import_path = format!("/{}", route.file.replace('\\', "/"));
+            let import_path = format!("/{}", pledgepack_core::normalize_path_str(&route.file));
             code.push_str(&format!(
                 "const {}Route = lazyRouteComponent(() => import('{}'));\n",
                 route.name, import_path
@@ -165,22 +165,14 @@ impl TanStackAdapter {
 
         // Generate router setup
         code.push_str(
-            r#"export function createRouter() {
-  return {
-    routes: routeTree,
-    navigate(path) {
-      const route = routeTree[path];
-      if (route) {
-        route.component().then(mod => {
-          const app = document.getElementById('root');
-          if (app && mod.default) {
-            app.innerHTML = '';
-            mod.default(app);
-          }
-        });
-      }
-    }
-  };
+            r#"import { createRouter as createTanStackRouter } from '@tanstack/router';
+
+export function createRouter(routes) {
+  const routeTree = Object.entries(routes).map(([path, loader]) => ({
+    path,
+    component: () => loader().then(mod => mod.default),
+  }));
+  return createTanStackRouter({ routeTree });
 }
 "#,
         );
@@ -206,5 +198,122 @@ impl TanStackAdapter {
             .collect();
 
         serde_json::to_string_pretty(&manifest).unwrap_or("[]".to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // PRODUCTION-READINESS-100.md goal 69: zero tests existed for this
+    // crate before this pass.
+    use super::*;
+
+    fn write_route(dir: &Path, rel: &str, content: &str) {
+        let path = dir.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+    }
+
+    #[test]
+    fn discovers_index_and_static_routes() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_route(tmp.path(), "src/routes/index.tsx", "export default () => null;");
+        write_route(tmp.path(), "src/routes/about.tsx", "export default () => null;");
+
+        let mut adapter = TanStackAdapter::new(tmp.path());
+        adapter.discover_routes().unwrap();
+
+        let paths: Vec<&str> = adapter.routes.iter().map(|r| r.path.as_str()).collect();
+        assert!(paths.contains(&"/"), "expected index route '/', got {paths:?}");
+        assert!(paths.contains(&"/about"), "expected '/about' route, got {paths:?}");
+    }
+
+    #[test]
+    fn discovers_dynamic_param_routes() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_route(tmp.path(), "src/routes/posts/$id.tsx", "export default () => null;");
+
+        let mut adapter = TanStackAdapter::new(tmp.path());
+        adapter.discover_routes().unwrap();
+
+        let route = adapter
+            .routes
+            .iter()
+            .find(|r| r.file.ends_with("$id.tsx"))
+            .expect("dynamic route not discovered");
+        assert_eq!(route.path, "/posts/:id");
+        assert_eq!(route.params, vec!["$id".to_string()]);
+    }
+
+    #[test]
+    fn discovers_root_and_nested_layout_routes() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_route(tmp.path(), "src/routes/__root.tsx", "export default () => null;");
+        write_route(tmp.path(), "src/routes/dashboard/layout.tsx", "export default () => null;");
+        write_route(tmp.path(), "src/routes/dashboard/index.tsx", "export default () => null;");
+
+        let mut adapter = TanStackAdapter::new(tmp.path());
+        adapter.discover_routes().unwrap();
+
+        let root = adapter.routes.iter().find(|r| r.file.ends_with("__root.tsx")).unwrap();
+        assert!(root.is_layout);
+
+        let layout = adapter
+            .routes
+            .iter()
+            .find(|r| r.file.ends_with("dashboard/layout.tsx") || r.file.ends_with("dashboard\\layout.tsx"))
+            .unwrap();
+        assert!(layout.is_layout);
+
+        let nested_index = adapter
+            .routes
+            .iter()
+            .find(|r| r.path == "/dashboard")
+            .expect("nested index route should resolve to the parent prefix");
+        assert!(!nested_index.is_layout);
+    }
+
+    #[test]
+    fn missing_routes_directory_yields_no_routes_not_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut adapter = TanStackAdapter::new(tmp.path());
+        let result = adapter.discover_routes();
+        assert!(result.is_ok());
+        assert!(adapter.routes.is_empty());
+    }
+
+    #[test]
+    fn route_tree_codegen_includes_every_discovered_route() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_route(tmp.path(), "src/routes/index.tsx", "export default () => null;");
+        write_route(tmp.path(), "src/routes/about.tsx", "export default () => null;");
+
+        let mut adapter = TanStackAdapter::new(tmp.path());
+        adapter.discover_routes().unwrap();
+        let tree = adapter.generate_route_tree();
+
+        assert!(tree.contains("lazyRouteComponent"));
+        for route in &adapter.routes {
+            assert!(
+                tree.contains(&format!("'{}'", route.path)),
+                "generated route tree missing entry for '{}':\n{}",
+                route.path,
+                tree
+            );
+        }
+    }
+
+    #[test]
+    fn route_manifest_is_valid_json_matching_discovered_routes() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_route(tmp.path(), "src/routes/posts/$id.tsx", "export default () => null;");
+
+        let mut adapter = TanStackAdapter::new(tmp.path());
+        adapter.discover_routes().unwrap();
+        let manifest = adapter.generate_route_manifest();
+
+        let parsed: serde_json::Value = serde_json::from_str(&manifest).expect("manifest must be valid JSON");
+        let arr = parsed.as_array().expect("manifest must be a JSON array");
+        assert_eq!(arr.len(), adapter.routes.len());
+        assert_eq!(arr[0]["path"], "/posts/:id");
     }
 }

@@ -347,7 +347,9 @@ document.addEventListener("click", function(e) {
   }
 });
 
-window.__pledge_fast_refresh = window.__pledge_fast_refresh || {};
+window.__pledge_fast_refresh = window.__pledge_fast_refresh || function(name, reload) {
+  (window.__pledge_fast_refresh_registry = window.__pledge_fast_refresh_registry || {})[name] = reload;
+};
 window.__pledge_fast_refresh.render = renderApp;
 "#
     .to_string()

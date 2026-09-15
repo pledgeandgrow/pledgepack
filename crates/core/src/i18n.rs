@@ -88,11 +88,11 @@ pub fn is_locale_message_file(path: &str, config: &I18nConfig) -> bool {
     let pattern_base = pattern.replace("${locale}", "");
 
     // Normalize path for comparison
-    let path_normalized = path.replace('\\', "/");
+    let path_normalized = crate::normalize_path_str(path);
 
     for locale in &config.locales {
         let expected = pattern.replace("${locale}", locale);
-        let expected_normalized = expected.replace('\\', "/");
+        let expected_normalized = crate::normalize_path_str(&expected);
         if path_normalized.ends_with(&expected_normalized) || path_normalized == expected_normalized
         {
             return true;

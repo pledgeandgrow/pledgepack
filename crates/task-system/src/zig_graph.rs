@@ -148,7 +148,10 @@ impl ZigTaskGraph {
     /// invalidated when the given task changes. This is a BFS through
     /// the reverse dependency graph.
     pub fn invalidation_set(&self, id: &TaskId) -> HashSet<TaskId> {
-        let ids = self.handle.get_invalidation_set(id.as_bytes(), 256);
+        // Use a large buffer; the Zig side will fill up to this capacity.
+        // TODO: Query required size from Zig side for dynamic allocation.
+        const MAX_INVALIDATION: usize = 65536;
+        let ids = self.handle.get_invalidation_set(id.as_bytes(), MAX_INVALIDATION);
         ids.into_iter().map(TaskId::from_bytes).collect()
     }
 

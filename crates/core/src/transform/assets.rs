@@ -16,6 +16,11 @@ pub(super) fn transform_json(source: &str) -> Result<TransformOutput> {
 
     if let serde_json::Value::Object(map) = &value {
         for (key, val) in map {
+            // Only generate a named export if the key is a valid JS identifier.
+            // Keys with hyphens (e.g. "my-key"), dots (e.g. "nested.key"), or
+            // other special characters are NOT valid JS identifiers, so they
+            // are skipped for named exports — but they remain fully accessible
+            // via the default export below (which serializes the entire object).
             if key
                 .chars()
                 .all(|c| c.is_alphanumeric() || c == '_' || c == '$')
@@ -57,6 +62,76 @@ pub(super) fn transform_asset(
     let is_inline = file_path.contains("?inline")
         || (is_production && source.len() < config.build.assets_inline_limit);
     let clean_path = file_path.split('?').next().unwrap_or(file_path);
+
+    // SVG assets get dedicated handling regardless of image optimization
+    // settings: SVGO-style optimization in production, `?sprite` imports in
+    // all modes, and the proper image/svg+xml content type when inlined.
+    if crate::svg::is_svg(std::path::Path::new(clean_path)) {
+        let svg_source = std::str::from_utf8(source).unwrap_or("");
+        let optimize = is_production && config.image.enabled;
+        let optimized = if optimize {
+            crate::svg::optimize_svg(svg_source, &crate::svg::SvgOptions::default())
+        } else {
+            svg_source.to_string()
+        };
+
+        if file_path.contains("?sprite") {
+            let sprite_id = std::path::Path::new(clean_path)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("icon");
+            let sprite_entry = crate::svg::SvgSpriteEntry {
+                id: sprite_id.to_string(),
+                svg: optimized.clone(),
+            };
+            let sprite = crate::svg::generate_sprite(&[sprite_entry]);
+            let url = format!("/{}", crate::normalize_path_str(clean_path));
+            let code = format!(
+                r#"export default "{}";
+export const sprite = `{}`;"#,
+                url, sprite
+            );
+            return Ok(TransformOutput {
+                code,
+                source_map: None,
+                css_modules: None,
+                is_css: false,
+                extracted_css: Some(sprite),
+                is_worker: false,
+                dynamic_imports: Vec::new(),
+                content_hash: None,
+            });
+        }
+
+        if is_inline {
+            use base64::Engine;
+            let b64 = base64::engine::general_purpose::STANDARD.encode(optimized.as_bytes());
+            let code = format!("export default \"data:image/svg+xml;base64,{}\";", b64);
+            return Ok(TransformOutput {
+                code,
+                source_map: None,
+                css_modules: None,
+                is_css: false,
+                extracted_css: None,
+                is_worker: false,
+                dynamic_imports: Vec::new(),
+                content_hash: None,
+            });
+        }
+
+        let url = format!("/{}", crate::normalize_path_str(clean_path));
+        let code = format!("export default \"{}\";", url);
+        return Ok(TransformOutput {
+            code,
+            source_map: None,
+            css_modules: None,
+            is_css: false,
+            extracted_css: if optimize { Some(optimized) } else { None },
+            is_worker: false,
+            dynamic_imports: Vec::new(),
+            content_hash: None,
+        });
+    }
 
     if is_production && config.image.enabled && !is_inline {
         if crate::image_pipeline::is_raster_image(source) {
@@ -104,53 +179,6 @@ pub(super) fn transform_asset(
                     tracing::warn!("Image optimization failed for {}: {}", clean_path, e);
                 }
             }
-        }
-
-        if crate::svg::is_svg(std::path::Path::new(clean_path)) {
-            let svg_source = std::str::from_utf8(source).unwrap_or("");
-            let optimized =
-                crate::svg::optimize_svg(svg_source, &crate::svg::SvgOptions::default());
-
-            if file_path.contains("?sprite") {
-                let sprite_id = std::path::Path::new(clean_path)
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("icon");
-                let sprite_entry = crate::svg::SvgSpriteEntry {
-                    id: sprite_id.to_string(),
-                    svg: optimized.clone(),
-                };
-                let sprite = crate::svg::generate_sprite(&[sprite_entry]);
-                let url = format!("/{}", clean_path.replace('\\', "/"));
-                let code = format!(
-                    r#"export default "{}";
-export const sprite = `{}`;"#,
-                    url, sprite
-                );
-                return Ok(TransformOutput {
-                    code,
-                    source_map: None,
-                    css_modules: None,
-                    is_css: false,
-                    extracted_css: Some(sprite),
-                    is_worker: false,
-                    dynamic_imports: Vec::new(),
-                    content_hash: None,
-                });
-            }
-
-            let url = format!("/{}", clean_path.replace('\\', "/"));
-            let code = format!("export default \"{}\";", url);
-            return Ok(TransformOutput {
-                code,
-                source_map: None,
-                css_modules: None,
-                is_css: false,
-                extracted_css: Some(optimized),
-                is_worker: false,
-                dynamic_imports: Vec::new(),
-                content_hash: None,
-            });
         }
     }
 
@@ -211,7 +239,7 @@ export const sprite = `{}`;"#,
             content_hash: None,
         })
     } else {
-        let url = format!("/{}", clean_path.replace('\\', "/"));
+        let url = format!("/{}", crate::normalize_path_str(clean_path));
         let code = format!("export default \"{}\";", url);
         Ok(TransformOutput {
             code,
@@ -232,7 +260,7 @@ export const sprite = `{}`;"#,
 /// that uses WebAssembly.validate() to check for SIMD support, then loads
 /// the appropriate WASM module variant.
 pub(super) fn transform_wasm(file_path: &str, config: &PledgeConfig) -> Result<TransformOutput> {
-    let url = format!("/{}", file_path.replace('\\', "/"));
+    let url = format!("/{}", crate::normalize_path_str(file_path));
     let simd_mode = &config.build.wasm_simd;
 
     let code = match simd_mode.as_str() {

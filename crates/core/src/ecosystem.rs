@@ -63,7 +63,7 @@ fn parse_framework(s: &str) -> Option<Framework> {
         "next" => Some(Framework::Next),
         "tanstack" => Some(Framework::TanStack),
         "astro" => Some(Framework::Astro),
-        "pledgestack" => Some(Framework::PledgeStack),
+        "pledge" => Some(Framework::Pledge),
         "auto" => Some(Framework::Auto),
         _ => None,
     }

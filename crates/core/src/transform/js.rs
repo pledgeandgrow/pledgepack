@@ -3,16 +3,88 @@
 use super::TransformOutput;
 use super::env;
 use super::utils;
-use crate::config::{Framework, PledgeConfig};
+use crate::config::{Framework, PledgeConfig, Target, TargetConfig};
 use crate::module::ModuleKind;
 use anyhow::{Result, bail};
 use oxc::allocator::Allocator;
 use oxc::codegen::{Codegen, CodegenOptions};
 use oxc::parser::{Parser, ParserReturn};
 use oxc::span::SourceType;
-use oxc::transformer::{JsxRuntime, TransformOptions, Transformer};
-use std::path::Path;
+use oxc::transformer::{EnvOptions, JsxRuntime, TransformOptions, Transformer};
+use regex::Regex;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use tracing::warn;
+
+/// Per-project-root settings read from tsconfig.json and browserslist sources,
+/// cached so the files are only read once per project root instead of once
+/// per transformed module.
+#[derive(Clone, Default)]
+struct RootSettings {
+    /// Browserslist-derived JS target query (`.browserslistrc` / package.json
+    /// "browserslist"), if configured.
+    browserslist_target: Option<String>,
+    /// tsconfig `compilerOptions.experimentalDecorators`.
+    legacy_decorators: bool,
+    /// tsconfig `compilerOptions.emitDecoratorMetadata`.
+    emit_decorator_metadata: bool,
+}
+
+static ROOT_SETTINGS: OnceLock<Mutex<HashMap<PathBuf, RootSettings>>> = OnceLock::new();
+
+/// Get cached project-root settings, loading them on first access.
+fn root_settings(root: &Path) -> RootSettings {
+    let cache = ROOT_SETTINGS.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(settings) = cache.lock().ok().and_then(|m| m.get(root).cloned()) {
+        return settings;
+    }
+
+    let settings = load_root_settings(root);
+    if let Ok(mut map) = cache.lock() {
+        map.insert(root.to_path_buf(), settings.clone());
+    }
+    settings
+}
+
+/// Read tsconfig.json decorator flags and browserslist targets for a project root.
+fn load_root_settings(root: &Path) -> RootSettings {
+    let mut settings = RootSettings::default();
+
+    // tsconfig.json: `experimentalDecorators` / `emitDecoratorMetadata`.
+    // Parsed as JSON5 since tsconfig allows comments and trailing commas.
+    if let Ok(content) = std::fs::read_to_string(root.join("tsconfig.json"))
+        && let Ok(json) = json5::from_str::<serde_json::Value>(&content)
+        && let Some(opts) = json.get("compilerOptions")
+    {
+        settings.legacy_decorators = opts
+            .get("experimentalDecorators")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        settings.emit_decorator_metadata = opts
+            .get("emitDecoratorMetadata")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+    }
+
+    // Browserslist: reuse the same discovery used for CSS targets.
+    let browserslist = crate::postcss::BrowserslistConfig::from_root(root);
+    if browserslist.is_configured() {
+        // Multiple queries are OR'ed in browserslist semantics, same as a
+        // comma-separated query string.
+        settings.browserslist_target = Some(browserslist.targets.join(","));
+    }
+
+    settings
+}
+
+/// Whether the build produces browser output (browserslist targets apply).
+fn targets_browser(target: &TargetConfig) -> bool {
+    match target {
+        TargetConfig::Single(t) => *t == Target::Browser,
+        TargetConfig::Multiple(ts) => ts.contains(&Target::Browser),
+    }
+}
 
 /// Transform JavaScript/TypeScript/JSX using Oxc
 pub(super) fn transform_js(
@@ -43,20 +115,41 @@ pub(super) fn transform_js(
         for err in &parser_errors {
             warn!("Parse error in {}: {:?}", file_path, err);
         }
-        if panicked {
-            bail!(
-                "Failed to parse {}: {}",
-                file_path,
-                parser_errors
-                    .first()
-                    .map(|e| e.to_string())
-                    .unwrap_or("unknown".into())
-            );
-        }
+        let errors: Vec<String> = parser_errors.iter().map(|e| format!("{:?}", e)).collect();
+        bail!("Parse errors in {}: {}", file_path, errors.join("; "));
     }
 
     let mut options = TransformOptions::default();
     options.typescript.only_remove_type_imports = false;
+
+    let settings = root_settings(&config.root);
+
+    // Configure the JS compilation target for syntax lowering.
+    // `build.target` accepts esbuild-style targets ("es2020", "chrome90",
+    // "node18", "esnext") or a browserslist query. When unset, the project's
+    // browserslist config is used for browser builds.
+    let browserslist_target = if targets_browser(&config.target) {
+        settings.browserslist_target.as_deref()
+    } else {
+        None
+    };
+    if let Some(target) = config.build.target.as_deref().or(browserslist_target) {
+        match EnvOptions::from_target(target)
+            .or_else(|_| EnvOptions::from_browserslist_query(target))
+        {
+            Ok(env_options) => options.env = env_options,
+            Err(err) => warn!("Ignoring invalid JS target {:?}: {}", target, err),
+        }
+    }
+
+    // Enable TypeScript legacy ("experimental") decorators when configured via
+    // `build.experimental_decorators` or detected from tsconfig.json
+    // (`compilerOptions.experimentalDecorators`).
+    if config.build.experimental_decorators || settings.legacy_decorators {
+        options.decorator.legacy = true;
+        options.decorator.emit_decorator_metadata =
+            config.build.emit_decorator_metadata || settings.emit_decorator_metadata;
+    }
 
     match config.framework {
         Framework::Solid => {
@@ -69,7 +162,7 @@ pub(super) fn transform_js(
             options.jsx.development = !is_production;
             options.jsx.import_source = Some("vue".to_string());
         }
-        Framework::Next | Framework::TanStack | Framework::PledgeStack => {
+        Framework::Next | Framework::TanStack | Framework::Pledge => {
             options.jsx.runtime = JsxRuntime::Automatic;
             options.jsx.development = !is_production;
             options.jsx.import_source = Some("react".to_string());
@@ -90,14 +183,23 @@ pub(super) fn transform_js(
     let transform_result = transformer.build_with_scoping(scoping, &mut program);
 
     if !transform_result.diagnostics.is_empty() {
-        for err in &transform_result.diagnostics {
-            warn!("Transform error in {}: {:?}", file_path, err);
+        for diag in &transform_result.diagnostics {
+            warn!("Transform diagnostic in {}: {:?}", file_path, diag);
+        }
+        if transform_result.diagnostics.has_errors() {
+            let errors: Vec<String> = transform_result
+                .diagnostics
+                .errors()
+                .map(|e| format!("{:?}", e))
+                .collect();
+            bail!("Transform errors in {}: {}", file_path, errors.join("; "));
         }
     }
 
     if is_production {
         let minifier = oxc::minifier::Minifier::new(oxc::minifier::MinifierOptions {
             mangle: Some(Default::default()),
+            compress: Some(Default::default()),
             ..Default::default()
         });
         minifier.minify(&allocator, &mut program);
@@ -136,7 +238,7 @@ pub(super) fn transform_js(
     if !is_production
         && matches!(
             config.framework,
-            Framework::React | Framework::Next | Framework::TanStack | Framework::PledgeStack
+            Framework::React | Framework::Next | Framework::TanStack | Framework::Pledge
         )
         && is_react_component(source, file_path)
     {
@@ -227,16 +329,47 @@ pub(super) fn transform_js(
     })
 }
 
-/// Check if a source file is a React component (has JSX and starts with capital or function)
+/// Regexes used to detect React components, compiled once on first use.
+static RE_COMPONENT_PATTERNS: OnceLock<Vec<Regex>> = OnceLock::new();
+
+fn component_patterns() -> &'static [Regex] {
+    RE_COMPONENT_PATTERNS.get_or_init(|| {
+        vec![
+            // Uppercase function declarations: `function App(`
+            Regex::new(r"function\s+([A-Z]\w*)\s*\(").unwrap(),
+            // Arrow function components: `const App = (...) =>` (optionally typed)
+            Regex::new(r"const\s+([A-Z]\w*)\s*=\s*(\([^)]*\)\s*=>|\([^)]*\)\s*:\s*\w+\s*=>)")
+                .unwrap(),
+            // `export default function ComponentName` with uppercase name
+            Regex::new(r"export\s+default\s+function\s+([A-Z]\w*)").unwrap(),
+        ]
+    })
+}
+
+/// Check if a source file is a React component.
+/// Detects common React component patterns while avoiding false positives on
+/// files that merely contain `<` and `=>` but aren't actual components.
 fn is_react_component(source: &str, _file_path: &str) -> bool {
-    if !source.contains("<") || !source.contains("/>") && !source.contains("</") {
+    // Must contain some JSX-like syntax to be a component candidate.
+    if !source.contains('<') {
         return false;
     }
 
-    source.contains("function App")
-        || source.contains("function Component")
-        || source.contains("export default function")
-        || (source.contains("=>") && source.contains("return") && source.contains("<"))
+    if component_patterns().iter().any(|re| re.is_match(source)) {
+        return true;
+    }
+
+    // React.memo / React.forwardRef wrappers
+    if source.contains("React.memo(") || source.contains("React.forwardRef(") {
+        return true;
+    }
+
+    // `export default ()` or `export default (props` arrow function components
+    if source.contains("export default ()") || source.contains("export default (props") {
+        return true;
+    }
+
+    false
 }
 
 /// Inject React Fast Refresh runtime code for HMR state preservation
@@ -275,32 +408,34 @@ if (import.meta.hot) {{
 fn extract_component_name(code: &str) -> Option<String> {
     for line in code.lines() {
         let trimmed = line.trim();
-        if let Some(after_fn) = trimmed.strip_prefix("function ")
+
+        // Strip `export` / `export default` prefixes so exported and plain
+        // declarations are handled uniformly.
+        let decl = trimmed
+            .strip_prefix("export default ")
+            .or_else(|| trimmed.strip_prefix("export "))
+            .unwrap_or(trimmed);
+
+        if let Some(after_fn) = decl
+            .strip_prefix("function ")
+            .or_else(|| decl.strip_prefix("async function "))
             && let Some(paren) = after_fn.find('(')
         {
             let name = after_fn[..paren].trim();
-            if !name.is_empty()
-                && name
-                    .chars()
-                    .next()
-                    .map(|c| c.is_uppercase())
-                    .unwrap_or(false)
-            {
+            if !name.is_empty() && name.chars().next().is_some_and(char::is_uppercase) {
                 return Some(name.to_string());
             }
         }
-        if trimmed.starts_with("const ") || trimmed.starts_with("export const ") {
-            let parts: Vec<&str> = trimmed.splitn(3, ' ').collect();
-            if parts.len() >= 2 {
-                let name = parts[1].trim();
-                if name
-                    .chars()
-                    .next()
-                    .map(|c| c.is_uppercase())
-                    .unwrap_or(false)
-                {
-                    return Some(name.to_string());
-                }
+
+        if let Some(rest) = decl.strip_prefix("const ") {
+            // Take the identifier following `const` (stops at `=`, `:`, whitespace).
+            let rest = rest.trim_start();
+            let end = rest
+                .find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$'))
+                .unwrap_or(rest.len());
+            let name = &rest[..end];
+            if name.chars().next().is_some_and(char::is_uppercase) {
+                return Some(name.to_string());
             }
         }
     }

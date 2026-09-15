@@ -28,6 +28,8 @@ impl Guest for TestPlugin {
                 build_end: false,
                 generate_bundle: false,
                 configure_server: false,
+                render_chunk: false,
+                handle_hot_update: false,
             },
             apply: Some("all".to_string()),
             enforce: None, // default = "post"
@@ -41,6 +43,7 @@ impl Guest for TestPlugin {
                 id: "\0virtual:test-plugin".to_string(),
                 external: false,
                 cache_key: blake3_hash(input.source.as_bytes()),
+                schema_version: Some(1),
             })
         } else {
             None
@@ -54,6 +57,7 @@ impl Guest for TestPlugin {
                 code: "export const hello = 'from test-plugin';".to_string(),
                 source_map: None,
                 cache_key: blake3_hash(input.id.as_bytes()),
+                schema_version: Some(1),
             })
         } else {
             None
@@ -71,6 +75,7 @@ impl Guest for TestPlugin {
                 code: transformed,
                 source_map: None,
                 cache_key: blake3_hash(&hasher_input),
+                schema_version: Some(1),
             })
         } else {
             None
@@ -88,6 +93,16 @@ impl Guest for TestPlugin {
     fn generate_bundle() {}
 
     fn configure_server() -> Option<ServerMiddleware> {
+        None
+    }
+
+    fn render_chunk(_input: RenderChunkInput) -> Option<RenderChunkOutput> {
+        // Not implemented by this test plugin (hooks.render_chunk = false).
+        None
+    }
+
+    fn handle_hot_update(_input: HotUpdateInput) -> Option<HotUpdateOutput> {
+        // Not implemented by this test plugin (hooks.handle_hot_update = false).
         None
     }
 }

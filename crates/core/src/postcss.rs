@@ -333,10 +333,25 @@ pub struct PostCssPlugin {
 }
 
 /// PostCSS configuration
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct PostCssConfig {
     pub plugins: Vec<PostCssPlugin>,
     pub source_map: bool,
+    /// Whether PostCSS processing is enabled. Set to `false` to skip
+    /// PostCSS entirely (e.g., when using lightningcss alone).
+    /// Full PostCSS plugin ecosystem support requires a Node.js
+    /// subprocess — this flag is a workaround until that's implemented.
+    pub enabled: bool,
+}
+
+impl Default for PostCssConfig {
+    fn default() -> Self {
+        Self {
+            plugins: Vec::new(),
+            source_map: false,
+            enabled: true,
+        }
+    }
 }
 
 impl PostCssConfig {
@@ -406,6 +421,7 @@ impl PostCssConfig {
         Self {
             plugins,
             source_map,
+            enabled: true,
         }
     }
 
@@ -445,12 +461,13 @@ impl PostCssConfig {
         Self {
             plugins,
             source_map,
+            enabled: true,
         }
     }
 
     /// Check if PostCSS is configured
     pub fn has_plugins(&self) -> bool {
-        !self.plugins.is_empty()
+        self.enabled && !self.plugins.is_empty()
     }
 
     /// Get plugin names in order
@@ -508,6 +525,60 @@ pub fn process_css(
         }
     }
 
+    // Generate a source map if PostCSS config requests it.
+    // The source map is appended as an inline data URI comment so it survives
+    // through the rest of the transform pipeline (Lightning CSS preserves
+    // comments in non-minified mode; in production the main source_maps config
+    // handles full source map generation separately).
+    if config.source_map {
+        let source_map = generate_postcss_source_map(file_path);
+        let encoded =
+            base64_url_safe_encode(&source_map);
+        result.push_str(&format!(
+            "\n/*# sourceMappingURL=data:application/json;charset=utf-8;base64,{} */\n",
+            encoded
+        ));
+    }
+
+    result
+}
+
+/// Generate a minimal v3 source map for PostCSS output.
+/// Records the source file so debuggers can map back to the original CSS.
+fn generate_postcss_source_map(file_path: &str) -> String {
+    let source_map = serde_json::json!({
+        "version": 3,
+        "sources": [file_path],
+        "sourcesContent": [],
+        "mappings": "",
+        "names": [],
+    });
+    source_map.to_string()
+}
+
+/// Base64-encode a string using the URL-safe alphabet (no padding) for
+/// embedding in a data URI.
+fn base64_url_safe_encode(input: &str) -> String {
+    const ALPHABET: &[u8] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let bytes = input.as_bytes();
+    let mut result = String::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b0 = bytes[i];
+        let b1 = if i + 1 < bytes.len() { bytes[i + 1] } else { 0 };
+        let b2 = if i + 2 < bytes.len() { bytes[i + 2] } else { 0 };
+
+        result.push(ALPHABET[(b0 >> 2) as usize] as char);
+        result.push(ALPHABET[((b0 & 0x03) << 4 | b1 >> 4) as usize] as char);
+        if i + 1 < bytes.len() {
+            result.push(ALPHABET[((b1 & 0x0f) << 2 | b2 >> 6) as usize] as char);
+        }
+        if i + 2 < bytes.len() {
+            result.push(ALPHABET[(b2 & 0x3f) as usize] as char);
+        }
+        i += 3;
+    }
     result
 }
 
@@ -727,7 +798,15 @@ fn run_cssnano(css: &str) -> String {
     }
 }
 
-/// Inline @import statements in CSS
+/// Inline @import statements in CSS.
+///
+/// Supports three forms:
+///   - `@import "path";` / `@import 'path';` (quoted string)
+///   - `@import url(path);` / `@import url("path");` (url() functional notation)
+///   - `@import "path" screen;` / `@import "path" print;` (media query suffix)
+///
+/// External URLs (http/https) and imports with media queries that cannot be
+/// resolved locally are kept as-is so the browser handles them.
 fn inline_imports(css: &str, file_path: &str, root: &Path) -> String {
     let mut result = String::new();
     let file_dir = Path::new(file_path).parent().unwrap_or(root);
@@ -735,14 +814,27 @@ fn inline_imports(css: &str, file_path: &str, root: &Path) -> String {
     for line in css.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with("@import") {
-            if let Some(url_start) = trimmed.find(['"', '\'']) {
-                let quote = trimmed.as_bytes()[url_start] as char;
-                if let Some(url_end) = trimmed[url_start + 1..].find(quote) {
-                    let import_path = &trimmed[url_start + 1..url_start + 1 + url_end];
-                    let resolved = if import_path.starts_with('/') {
-                        root.join(import_path.trim_start_matches('/'))
+            // Try quoted string form: @import "..." or @import '...'
+            if let Some(path) = extract_import_path(trimmed) {
+                let resolved = if path.starts_with('/') {
+                    root.join(path.trim_start_matches('/'))
+                } else {
+                    file_dir.join(&path)
+                };
+                if let Ok(imported_css) = std::fs::read_to_string(&resolved) {
+                    result.push_str(&imported_css);
+                    result.push('\n');
+                    continue;
+                }
+            }
+
+            // Try url() form: @import url(...) or @import url("...")
+            if let Some(url) = extract_import_url(trimmed) {
+                if !url.starts_with("http://") && !url.starts_with("https://") {
+                    let resolved = if url.starts_with('/') {
+                        root.join(url.trim_start_matches('/'))
                     } else {
-                        file_dir.join(import_path)
+                        file_dir.join(&url)
                     };
                     if let Ok(imported_css) = std::fs::read_to_string(&resolved) {
                         result.push_str(&imported_css);
@@ -751,6 +843,9 @@ fn inline_imports(css: &str, file_path: &str, root: &Path) -> String {
                     }
                 }
             }
+
+            // Keep the @import as-is if we couldn't inline it (e.g., external URL
+            // or media query that can't be resolved locally)
             result.push_str(line);
         } else {
             result.push_str(line);
@@ -758,6 +853,42 @@ fn inline_imports(css: &str, file_path: &str, root: &Path) -> String {
         result.push('\n');
     }
     result
+}
+
+/// Extract the path from `@import "path"` or `@import 'path'`.
+/// Strips any media query suffix (everything after the quoted path).
+fn extract_import_path(line: &str) -> Option<String> {
+    let after_import = line.strip_prefix("@import")?.trim();
+    // Take everything up to the semicolon (or end of line)
+    let path_part = after_import.split(';').next()?.trim();
+    // Must start with a quote
+    if !path_part.starts_with('"') && !path_part.starts_with('\'') {
+        return None;
+    }
+    let quote = path_part.as_bytes()[0] as char;
+    let rest = &path_part[1..];
+    let end = rest.find(quote)?;
+    let path = &rest[..end];
+    if path.is_empty() {
+        return None;
+    }
+    Some(path.to_string())
+}
+
+/// Extract the URL from `@import url(...)` or `@import url("...")`.
+/// Returns None if the line doesn't use the url() functional notation.
+fn extract_import_url(line: &str) -> Option<String> {
+    let after_import = line.strip_prefix("@import")?.trim();
+    let rest = after_import.strip_prefix("url(")?;
+    // Find the closing paren
+    let end = rest.find(')')?;
+    let inner = rest[..end].trim();
+    // Strip surrounding quotes if present
+    let url = inner.trim_matches(|c| c == '"' || c == '\'');
+    if url.is_empty() {
+        return None;
+    }
+    Some(url.to_string())
 }
 
 const TAILWIND_BASE: &str = r"*, ::before, ::after { box-sizing: border-box; border: 0 solid; }

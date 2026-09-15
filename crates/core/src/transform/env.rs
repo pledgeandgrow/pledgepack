@@ -331,6 +331,12 @@ pub(super) fn expand_import_meta_glob(
             if eager {
                 let var_name = format!("__pledge_glob_{}", i);
                 if is_raw {
+                    // TODO(#fix): Make this transform fully async so file reads
+                    // use tokio::task::spawn_blocking instead of blocking the
+                    // worker thread. For now this runs on rayon workers (not
+                    // the tokio runtime), but synchronous I/O still stalls the
+                    // transform pipeline. A future refactor should collect all
+                    // raw paths and batch-read them via spawn_blocking.
                     let content = std::fs::read_to_string(abs_path).unwrap_or_default();
                     imports_prefix.push_str(&format!(
                         "const {} = {};\n",
@@ -355,13 +361,15 @@ pub(super) fn expand_import_meta_glob(
                 ));
             } else {
                 if is_raw {
+                    // Non-eager + raw: generate a lazy runtime import instead of
+                    // reading the file synchronously at build time. This avoids
+                    // blocking the transform worker thread on file I/O for files
+                    // that are only needed on demand at runtime.
+                    // The `?raw` suffix is a convention for raw string imports.
                     map_entries.push(format!(
-                        "{}: () => Promise.resolve({})",
+                        "{}: () => import('{}?raw').then(m => m.default)",
                         serde_json::to_string(rel_path).unwrap_or_else(|_| "\"\"".to_string()),
-                        serde_json::to_string(
-                            &std::fs::read_to_string(abs_path).unwrap_or_default()
-                        )
-                        .unwrap_or_else(|_| "\"\"".to_string())
+                        rel_path
                     ));
                 } else {
                     map_entries.push(format!(
@@ -421,7 +429,7 @@ fn extract_import_filter(args: &str) -> &str {
 
 /// Glob-match files against a pattern with * and ** wildcards using globset
 fn glob_files(pattern: &Path, root: &Path) -> Vec<(String, std::path::PathBuf)> {
-    let pattern_str = pattern.to_string_lossy().replace('\\', "/");
+    let pattern_str = crate::normalize_path(pattern);
     let mut results = Vec::new();
 
     let parts: Vec<&str> = pattern_str.split('/').collect();
@@ -453,6 +461,35 @@ fn glob_files(pattern: &Path, root: &Path) -> Vec<(String, std::path::PathBuf)> 
     results
 }
 
+/// Generate a `pledge-env.d.ts` file declaring `import.meta.env` types.
+///
+/// This produces TypeScript ambient declarations so editors and `tsc` know
+/// the shape of `import.meta.env` at build time. Each env var is typed based on
+/// its value: numbers → `number`, booleans → `boolean`, everything else → `string`.
+///
+/// This complements [`EnvVars::generate_dts`] (which includes built-in vars and
+/// is used during the build) by providing a standalone, config-driven entry
+/// point that the transform pipeline can call when `config.env_dts` is enabled.
+pub fn generate_env_dts(env_vars: &[(String, String)]) -> String {
+    let mut content = String::from("/// <reference types=\"vite/client\" />\n\n");
+    content.push_str("interface ImportMetaEnv {\n");
+    for (key, value) in env_vars {
+        let type_str = if value.parse::<i64>().is_ok() {
+            "number"
+        } else if value.parse::<bool>().is_ok() {
+            "boolean"
+        } else {
+            "string"
+        };
+        content.push_str(&format!("  readonly {}: {}\n", key, type_str));
+    }
+    content.push_str("}\n\n");
+    content.push_str("interface ImportMeta {\n");
+    content.push_str("  readonly env: ImportMetaEnv;\n");
+    content.push_str("}\n");
+    content
+}
+
 /// Recursively walk a directory and collect files matching a globset matcher
 fn glob_walk(
     current_dir: &Path,
@@ -475,7 +512,7 @@ fn glob_walk(
                 if matcher.is_match(&name)
                     && let Ok(rel) = path.strip_prefix(root)
                 {
-                    let rel_str = rel.to_string_lossy().replace('\\', "/");
+                    let rel_str = crate::normalize_path(rel);
                     results.push((rel_str, path));
                 }
             }

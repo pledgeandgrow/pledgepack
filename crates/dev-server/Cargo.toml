@@ -3,12 +3,17 @@ name = "pledgepack-dev-server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish.workspace = true
+description = "Development server for PledgePack"
+repository = "https://github.com/pledgeandgrow/pledgepack"
+keywords = ["bundler", "build", "rust"]
+categories = ["web-programming", "compilers"]
 
 [dependencies]
 anyhow = { workspace = true }
 tokio = { workspace = true }
 axum = { workspace = true, features = ["ws"] }
-tower-http = { workspace = true, features = ["compression-gzip", "fs", "trace"] }
+tower-http = { workspace = true, features = ["compression-gzip", "compression-br", "fs", "trace", "limit", "set-header", "cors"] }
 tokio-tungstenite = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
@@ -25,9 +30,15 @@ rustls-pki-types = { version = "1", features = ["alloc"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 futures-util = "0.3"
 similar = { workspace = true }
+base64 = { workspace = true }
 opener = { workspace = true }
 local-ip-address = { workspace = true }
 rcgen = "0.14"
+# `tower::limit::RateLimitLayer` for goal 74 (dev-server request rate
+# limiting) — distinct from tower-http's "limit" feature above, which is
+# request-body-*size* limiting, not request-*rate* limiting. "util" is kept
+# for `ServiceExt::oneshot` used by the e2e tests below.
+tower = { version = "0.5", features = ["limit", "buffer", "util"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

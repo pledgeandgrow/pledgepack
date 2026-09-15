@@ -15,9 +15,41 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # ── Security gate: block the release if a vulnerability is disclosed ──
+  # between the last CI run on this commit and the tag push. ci.yml already
+  # runs these checks on every push/PR, but a release can be tagged days or
+  # weeks after the commit that produced it was last checked — this closes
+  # that window. See PRODUCTION-READINESS-100.md goal 28.
+  security-gate:
+    name: Security Gate (audit + deny)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Check ignored-advisory review dates haven't lapsed
+        run: bash scripts/check-stale-ignores.sh
+
+      - name: Check CHANGELOG.md has an entry for this release
+        run: bash scripts/check-changelog-entry.sh
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: Run cargo-audit
+        run: cargo audit --ignore RUSTSEC-2026-0235 --ignore RUSTSEC-2025-0141 --ignore RUSTSEC-2024-0436
+
+      - name: Run cargo-deny (licenses + advisories + bans + sources)
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories licenses bans sources
+
   # ── Build native binaries for all platforms ───────────────────────────
   build:
     name: Build ${{ matrix.target }}
+    needs: security-gate
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -47,6 +79,11 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             zig-target: x86_64-windows-msvc
+            archive: zip
+            binary: pledge.exe
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+            zig-target: aarch64-windows-msvc
             archive: zip
             binary: pledge.exe
     steps:
@@ -131,6 +168,29 @@ jobs:
       - name: List artifacts
         run: ls -la artifacts/
 
+      - name: Generate checksums
+        run: |
+          cd artifacts
+          for f in *; do
+            sha256sum "$f" > "$f.sha256"
+          done
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign artifacts
+        run: |
+          cd artifacts
+          for f in *; do
+            [ "$f" = "*.sha256" ] && continue
+            case "$f" in
+              *.sha256) continue ;;
+            esac
+            cosign sign-blob --yes "$f" --output-signature "$f.sig" --output-certificate "$f.pem"
+          done
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -157,6 +217,7 @@ jobs:
             - `x86_64-apple-darwin` — macOS Intel
             - `aarch64-apple-darwin` — macOS Apple Silicon
             - `x86_64-pc-windows-msvc` — Windows x64
+            - `aarch64-pc-windows-msvc` — Windows ARM64
 
             ### Verify
             ```bash

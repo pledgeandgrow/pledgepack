@@ -1,15 +1,43 @@
-// Build-time string encryption (#109)
+// Build-time string obfuscation (#109)
 //
-// Encrypts sensitive strings in source at build time, decrypts at runtime
-// via injected shim. Prevents plain-text secrets in bundles.
-
+// Replaces configured string literals in source with an XOR-obfuscated,
+// base64-encoded form at build time, decoded at runtime via an injected JS
+// shim.
+//
+// # This is obfuscation, not encryption — by construction, not by omission
+//
+// PRODUCTION-READINESS-100.md goal 14 asked whether this should use
+// `aes-gcm`/`chacha20poly1305` instead of XOR. It shouldn't, and swapping the
+// cipher wouldn't fix the actual problem: the decryption key is embedded
+// directly in the same JS bundle as the "encrypted" strings (see the
+// `__pledge_key` constant `encrypt_strings` injects below), because the
+// browser has to be able to decode the value at runtime with nothing else
+// available. Any client-side scheme — XOR, AES-GCM, ChaCha20 — is reversible
+// by anyone who can run the same JS the browser runs, i.e. everyone. A
+// stronger cipher raises the bar from "grep the bundle" to "run the
+// deobfuscation function with the key that's right there," which is a real
+// (if modest) improvement against casual inspection, but it is not
+// confidentiality against a motivated reader and must never be used to ship
+// anything that needs to actually stay secret (API keys, credentials, etc.
+// belong server-side, not in a client bundle, obfuscated or not).
+//
+// Given that ceiling, this deliberately stays a lightweight, dependency-free,
+// fully synchronous transform (real AEAD ciphers decrypt asynchronously via
+// the browser's Web Crypto API, which would force every call site of a
+// replaced string literal to become `await`-able — a bigger, riskier change
+// for a feature that can't deliver real security either way) rather than a
+// hand-rolled from-scratch cipher implementation duplicated across Rust and
+// JS, which would trade a known, clearly-labeled weakness for the much worse
+// risk of a subtly-wrong custom crypto implementation.
 use crate::config::EncryptConfig;
-use anyhow::Result;
 use tracing::info;
 
-/// Simple XOR-based encryption (lightweight, obfuscation-level)
-/// For production use, consider AES-GCM via WASM.
 fn xor_encrypt(data: &[u8], key: &[u8]) -> Vec<u8> {
+    if key.is_empty() {
+        // No encryption with an empty key — return data unchanged
+        // (also avoids division-by-zero panic on `key.len()`)
+        return data.to_vec();
+    }
     data.iter()
         .enumerate()
         .map(|(i, &b)| b ^ key[i % key.len()])
@@ -35,32 +63,33 @@ fn get_or_create_key(config: &EncryptConfig) -> Vec<u8> {
             key
         }
     } else {
-        // Generate a deterministic key from build timestamp + keys
-        let seed = format!(
-            "{}-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0),
-            config.keys.join(","),
-        );
-        let seed_bytes = seed.as_bytes();
+        // Generate a fresh random key for this build. This does NOT need to
+        // be reproducible across builds or derivable from anything: the key
+        // is embedded directly in the emitted bundle alongside the
+        // obfuscated values (see `encrypt_strings`'s `__pledge_key`
+        // constant) and is only ever used to encrypt/decrypt within that
+        // single build's own output. It previously derived from
+        // `SystemTime::now()` (build timestamp) plus the configured key
+        // names joined by commas — both guessable/reconstructable by anyone
+        // who can see roughly when the build ran (e.g. from an HTTP
+        // `Last-Modified` header or a git commit timestamp) and the
+        // (non-secret) list of env var names being obfuscated. See
+        // PRODUCTION-READINESS-100.md goal 15.
         let mut key = vec![0u8; 32];
-        for (i, &b) in seed_bytes.iter().enumerate().take(32) {
-            key[i] = b;
-        }
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut key);
         key
     }
 }
 
-/// Encrypt a single string value
+/// Obfuscate a single string value. See the module-level doc comment above —
+/// this is not encryption.
 pub fn encrypt_value(value: &str, key: &[u8]) -> String {
     let encrypted = xor_encrypt(value.as_bytes(), key);
     // Base64 encode for safe embedding
     base64_encode(&encrypted)
 }
 
-/// Decrypt a single string value (used in the runtime shim)
+/// Reverse [`encrypt_value`] (used in the runtime shim).
 pub fn decrypt_value(encrypted: &str, key: &[u8]) -> String {
     let decoded = base64_decode(encrypted);
     let decrypted = xor_encrypt(&decoded, key);
@@ -69,7 +98,7 @@ pub fn decrypt_value(encrypted: &str, key: &[u8]) -> String {
 
 /// Transform source code: encrypt sensitive string literals
 /// Replaces string literals matching configured keys with encrypted versions
-pub fn encrypt_strings(code: &str, config: &EncryptConfig) -> Result<(String, Vec<u8>)> {
+pub fn encrypt_strings(code: &str, config: &EncryptConfig) -> anyhow::Result<(String, Vec<u8>)> {
     if !config.enabled || config.keys.is_empty() {
         return Ok((code.to_string(), Vec::new()));
     }
@@ -189,4 +218,59 @@ fn base64_decode(s: &str) -> Vec<u8> {
     }
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encrypt_decrypt_round_trip() {
+        let key = b"01234567890123456789012345678901".to_vec();
+        let value = "super-secret-ish-value";
+        let encrypted = encrypt_value(value, &key);
+        assert_ne!(encrypted, value);
+        assert_eq!(decrypt_value(&encrypted, &key), value);
+    }
+
+    #[test]
+    fn auto_generated_keys_are_random_not_derived_from_timestamp() {
+        // Regression test for goal 15: two calls with no explicit key and
+        // identical `keys` lists must NOT produce the same key — the old
+        // implementation derived deterministically from
+        // `SystemTime::now()` + `keys.join(",")`, so two calls made within
+        // the same second (as these two will be) previously collided.
+        let config = EncryptConfig {
+            enabled: true,
+            keys: vec!["API_TOKEN".to_string()],
+            key: None,
+        };
+        let key_a = get_or_create_key(&config);
+        let key_b = get_or_create_key(&config);
+        assert_eq!(key_a.len(), 32);
+        assert_ne!(
+            key_a, key_b,
+            "auto-generated keys must be random, not derived from guessable build-time state"
+        );
+    }
+
+    #[test]
+    fn explicit_hex_key_is_used_verbatim() {
+        let hex_key = "0".repeat(64); // 32 zero bytes, hex-encoded
+        let config = EncryptConfig {
+            enabled: true,
+            keys: vec![],
+            key: Some(hex_key),
+        };
+        let key = get_or_create_key(&config);
+        assert_eq!(key, vec![0u8; 32]);
+    }
+
+    #[test]
+    fn base64_round_trip() {
+        let data = b"the quick brown fox jumps over the lazy dog";
+        let encoded = base64_encode(data);
+        let decoded = base64_decode(&encoded);
+        assert_eq!(decoded, data);
+    }
 }

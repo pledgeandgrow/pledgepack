@@ -60,7 +60,7 @@ fn walk_for_assets(dir: &Path, glob_set: &globset::GlobSet, results: &mut Vec<st
                 walk_for_assets(&path, glob_set, results);
             } else if path.is_file() {
                 let rel = path.strip_prefix(dir).unwrap_or(&path);
-                let rel_str = rel.to_string_lossy().replace('\\', "/");
+                let rel_str = crate::normalize_path(rel);
                 if glob_set.is_match(&rel_str) {
                     results.push(path);
                 }
@@ -350,6 +350,37 @@ impl GraphQLOperation {
     }
 }
 
+/// Returns true when `keyword` at byte offset `pos` sits on a definition
+/// boundary — i.e. it is a standalone keyword at the start of a line or block,
+/// not part of an identifier (`myquery`, `queryBuilder`) and not inside a
+/// `#` line comment.
+fn is_at_definition_boundary(source: &str, keyword: &str, pos: usize) -> bool {
+    // Check the character before the keyword
+    let before_ok = pos == 0 || {
+        let before = source.as_bytes()[pos - 1] as char;
+        before == '\n' || before == '{' || before.is_whitespace()
+    };
+
+    // Check the character after the keyword
+    let after_pos = pos + keyword.len();
+    let after_ok = after_pos >= source.len() || {
+        let after = source.as_bytes()[after_pos] as char;
+        after.is_whitespace() || after == '{' || after == '('
+    };
+
+    if !(before_ok && after_ok) {
+        return false;
+    }
+
+    // Reject matches inside a `#` line comment (a `#` earlier on the same line)
+    let line_start = source[..pos].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    if source[line_start..pos].contains('#') {
+        return false;
+    }
+
+    true
+}
+
 /// Parse a GraphQL document and extract operations
 pub fn parse_graphql(source: &str) -> GraphQLDocument {
     let mut doc = GraphQLDocument {
@@ -367,6 +398,14 @@ pub fn parse_graphql(source: &str) -> GraphQLDocument {
         let mut search_pos = 0;
         while let Some(pos) = source[search_pos..].find(keyword) {
             let abs_pos = search_pos + pos;
+
+            // Skip matches that aren't standalone keywords at a definition
+            // boundary (identifiers, comments, etc.)
+            if !is_at_definition_boundary(source, keyword, abs_pos) {
+                search_pos = abs_pos + keyword.len();
+                continue;
+            }
+
             let after = &source[abs_pos + keyword.len()..];
 
             // Extract operation name
@@ -513,16 +552,45 @@ pub fn transform_yaml(source: &str) -> String {
     code
 }
 
+/// Parse a single CSV line, honoring quoted fields.
+/// Handles commas inside quotes and `""` escaped quotes.
+fn parse_csv_line(line: &str) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut field = String::new();
+    let mut in_quotes = false;
+    let mut chars = line.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        match c {
+            '"' if in_quotes => {
+                // Check for escaped quote
+                if chars.peek() == Some(&'"') {
+                    field.push('"');
+                    chars.next();
+                } else {
+                    in_quotes = false;
+                }
+            }
+            '"' => {
+                in_quotes = true;
+            }
+            ',' if !in_quotes => {
+                fields.push(field.trim().to_string());
+                field.clear();
+            }
+            _ => field.push(c),
+        }
+    }
+    fields.push(field.trim().to_string());
+    fields
+}
+
 /// Transform CSV to ES module with named exports
 pub fn transform_csv(source: &str) -> String {
     let rows: Vec<Vec<String>> = source
         .lines()
         .filter(|l| !l.is_empty())
-        .map(|line| {
-            line.split(',')
-                .map(|cell| cell.trim().trim_matches('"').to_string())
-                .collect()
-        })
+        .map(parse_csv_line)
         .collect();
 
     if rows.is_empty() {
@@ -689,7 +757,7 @@ pub fn transform_audio_asset(file_path: &str, is_inline: bool, source: &[u8]) ->
         let mime = guess_mime(file_path);
         format!("export default \"data:{};base64,{}\";", mime, b64)
     } else {
-        let url = format!("/{}", file_path.replace('\\', "/"));
+        let url = format!("/{}", crate::normalize_path_str(file_path));
         format!("export default \"{}\";", url)
     }
 }
@@ -703,13 +771,12 @@ pub fn transform_video_asset(file_path: &str, is_inline: bool, source: &[u8]) ->
         let mime = guess_mime(file_path);
         format!("export default \"data:{};base64,{}\";", mime, b64)
     } else {
-        let url = format!("/{}", file_path.replace('\\', "/"));
+        let url = format!("/{}", crate::normalize_path_str(file_path));
         // #78: Generate poster frame URL alongside video URL
         // Poster is extracted as first frame and saved as .jpg next to video
         let poster_url = format!(
             "/{}.poster.jpg",
-            file_path
-                .replace('\\', "/")
+            crate::normalize_path_str(file_path)
                 .trim_end_matches(".mp4")
                 .trim_end_matches(".webm")
                 .trim_end_matches(".mov")
@@ -735,7 +802,7 @@ pub fn transform_pdf_asset(file_path: &str, is_inline: bool, source: &[u8]) -> S
         let b64 = base64::engine::general_purpose::STANDARD.encode(source);
         format!("export default \"data:application/pdf;base64,{}\";", b64)
     } else {
-        let url = format!("/{}", file_path.replace('\\', "/"));
+        let url = format!("/{}", crate::normalize_path_str(file_path));
         format!("export default \"{}\";", url)
     }
 }
@@ -854,6 +921,7 @@ fn guess_mime(path: &str) -> &'static str {
         "avi" => "video/x-msvideo",
         "mkv" => "video/x-matroska",
         "pdf" => "application/pdf",
+        "svg" => "image/svg+xml",
         _ => "application/octet-stream",
     }
 }

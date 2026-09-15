@@ -8,11 +8,39 @@
 //   42. Plugin parallel execution via rayon
 
 use dashmap::DashMap;
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
+
+// ─── Hook capability matrix ────────────────────────────────────────────
+//
+// The single source of truth for "which hooks does the plugin ABI define,
+// by name" — both `pledgepack-wasm-plugin-host` and
+// `pledgepack-js-plugin-host` reference this (rather than each hardcoding
+// their own copy of the hook name list) so their `host_supports_hook`
+// capability-matrix functions can't drift out of sync with each other or
+// with `wit/world.wit`, and so a plugin author or PledgePack itself can
+// discover "does this host actually run this hook" instead of it silently
+// no-op'ing — which is exactly what happened to `buildStart`/`buildEnd`/
+// `generateBundle` in the JS host before that was fixed (see
+// PRODUCTION-READINESS-100.md goals 42, 45-46). This list must be kept in
+// sync with `wit/world.wit`'s hook exports by hand — there's no automated
+// generation from the WIT file today.
+pub const PLUGIN_HOOK_NAMES: &[&str] = &[
+    "resolveId",
+    "load",
+    "transform",
+    "transformIndexHtml",
+    "renderChunk",
+    "handleHotUpdate",
+    "buildStart",
+    "buildEnd",
+    "generateBundle",
+    "configureServer",
+];
 
 // ─── Feature 38: Plugin hot reload ────────────────────────────────────
 
@@ -1056,8 +1084,13 @@ impl PluginSigningVerifier {
 
     /// Verify a plugin signature.
     ///
-    /// In a real implementation, this would use the `ed25519-dalek` crate
-    /// to verify the Ed25519 signature against the WASM hash.
+    /// Checks that the signer is a trusted identity/key pair, then
+    /// cryptographically verifies the Ed25519 signature over the plugin's
+    /// blake3 WASM hash — mirroring the real (not stubbed) verification in
+    /// `pledgepack_cache::advanced::verify_cache_entry`. Any failure to
+    /// trust, decode, or verify returns `false`; nothing here panics on
+    /// malformed input, since `sig` comes from a plugin manifest an attacker
+    /// could control.
     pub fn verify(&self, sig: &PluginSignature) -> bool {
         // Check if the signer's key is trusted
         let is_trusted = self.trusted_keys.iter().any(|(identity, key)| {
@@ -1068,13 +1101,26 @@ impl PluginSigningVerifier {
             return false;
         }
 
-        // In a real implementation, verify the Ed25519 signature:
-        // let pubkey = ed25519_dalek::PublicKey::from_bytes(&hex::decode(&sig.signer_public_key));
-        // let sig_bytes = ed25519_dalek::Signature::from_bytes(&hex::decode(&sig.signature));
-        // pubkey.verify(sig.wasm_hash.as_bytes(), &sig_bytes).is_ok()
+        let Ok(pubkey_bytes) = hex::decode(&sig.signer_public_key) else {
+            return false;
+        };
+        let Ok(pubkey_bytes) = <[u8; 32]>::try_from(pubkey_bytes.as_slice()) else {
+            return false;
+        };
+        let Ok(verifying_key) = VerifyingKey::from_bytes(&pubkey_bytes) else {
+            return false;
+        };
 
-        // For now, just check that the fields are non-empty
-        !sig.wasm_hash.is_empty() && !sig.signature.is_empty() && !sig.signer_public_key.is_empty()
+        let Ok(sig_bytes) = hex::decode(&sig.signature) else {
+            return false;
+        };
+        let Ok(signature) = Signature::from_slice(&sig_bytes) else {
+            return false;
+        };
+
+        verifying_key
+            .verify(sig.wasm_hash.as_bytes(), &signature)
+            .is_ok()
     }
 
     /// Verify and return a signed plugin signature.
@@ -1292,17 +1338,29 @@ mod g12_tests {
         assert!(error.fixes[0].description.contains("lodash-es"));
     }
 
+    /// Deterministic ed25519 keypair for tests — not for production use.
+    fn test_keypair() -> (ed25519_dalek::SigningKey, ed25519_dalek::VerifyingKey) {
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let verifying_key = signing_key.verifying_key();
+        (signing_key, verifying_key)
+    }
+
     #[test]
     fn g12_35_plugin_signing_verifier() {
+        use ed25519_dalek::Signer;
+        let (signing_key, verifying_key) = test_keypair();
+        let wasm_hash = "hash123";
+        let signature = signing_key.sign(wasm_hash.as_bytes());
+
         let mut verifier = PluginSigningVerifier::new();
-        verifier.trust_key("@pledgelabs", "abc123publickey");
+        verifier.trust_key("@pledgelabs", &hex::encode(verifying_key.to_bytes()));
 
         let sig = PluginSignature {
             plugin_name: "@pledge/css".to_string(),
             version: "1.0.0".to_string(),
-            wasm_hash: "hash123".to_string(),
-            signer_public_key: "abc123publickey".to_string(),
-            signature: "sig456".to_string(),
+            wasm_hash: wasm_hash.to_string(),
+            signer_public_key: hex::encode(verifying_key.to_bytes()),
+            signature: hex::encode(signature.to_bytes()),
             signer_identity: "@pledgelabs".to_string(),
             timestamp: 1234567890,
             verified: false,
@@ -1322,6 +1380,57 @@ mod g12_tests {
             signer_public_key: "unknownkey".to_string(),
             signature: "sig456".to_string(),
             signer_identity: "@unknown".to_string(),
+            timestamp: 0,
+            verified: false,
+        };
+
+        assert!(!verifier.verify(&sig));
+    }
+
+    #[test]
+    fn g12_35_plugin_signing_rejects_forged_signature_from_trusted_identity() {
+        // Regression test for the original bug (PRODUCTION-READINESS-100.md
+        // goal 11): `verify()` used to accept ANY non-empty signature string
+        // as long as the identity+pubkey pair was trusted, without checking
+        // the signature bytes cryptographically at all. A malicious or
+        // corrupted plugin claiming a trusted identity+pubkey must still
+        // fail verification if its signature doesn't actually check out.
+        let (_signing_key, verifying_key) = test_keypair();
+
+        let mut verifier = PluginSigningVerifier::new();
+        verifier.trust_key("@pledgelabs", &hex::encode(verifying_key.to_bytes()));
+
+        let sig = PluginSignature {
+            plugin_name: "evil-plugin".to_string(),
+            version: "1.0.0".to_string(),
+            wasm_hash: "hash123".to_string(),
+            signer_public_key: hex::encode(verifying_key.to_bytes()),
+            // Well-formed hex of the right length, but not a real signature
+            // over "hash123" produced by this key.
+            signature: hex::encode([0u8; 64]),
+            signer_identity: "@pledgelabs".to_string(),
+            timestamp: 0,
+            verified: false,
+        };
+
+        assert!(!verifier.verify(&sig));
+    }
+
+    #[test]
+    fn g12_35_plugin_signing_rejects_malformed_hex() {
+        // The old code's fallback was "non-empty string" — garbage hex must
+        // now fail cleanly (no panic) rather than accidentally pass.
+        let (_signing_key, verifying_key) = test_keypair();
+        let mut verifier = PluginSigningVerifier::new();
+        verifier.trust_key("@pledgelabs", &hex::encode(verifying_key.to_bytes()));
+
+        let sig = PluginSignature {
+            plugin_name: "@pledge/css".to_string(),
+            version: "1.0.0".to_string(),
+            wasm_hash: "hash123".to_string(),
+            signer_public_key: hex::encode(verifying_key.to_bytes()),
+            signature: "not-valid-hex!!".to_string(),
+            signer_identity: "@pledgelabs".to_string(),
             timestamp: 0,
             verified: false,
         };

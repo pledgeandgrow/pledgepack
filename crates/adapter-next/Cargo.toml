@@ -3,6 +3,11 @@ name = "pledgepack-adapter-next"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish.workspace = true
+description = "Next.js adapter for PledgePack"
+repository = "https://github.com/pledgeandgrow/pledgepack"
+keywords = ["bundler", "build", "rust"]
+categories = ["web-programming", "compilers"]
 
 [dependencies]
 anyhow = { workspace = true }

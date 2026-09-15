@@ -111,18 +111,37 @@ pub fn reassemble_data(chunks: &[Chunk], chunk_data: &HashMap<String, Vec<u8>>) 
 
 // ─── G9.6: Parallel remote fetch ─────────────────────────────────────
 
-/// G9.6: Fetch multiple cache entries in parallel using rayon-style parallelism.
+/// G9.6: Fetch multiple cache entries in parallel using scoped OS threads.
 /// Returns results in the same order as the input keys.
+///
+/// Each key is fetched on its own scoped thread (the remote cache backends
+/// are blocking I/O — HTTP via reqwest::blocking, S3/GCS via CLI subprocesses —
+/// so threads are the right primitive here; rayon is not a dependency of this
+/// crate). `std::thread::scope` guarantees all threads are joined before this
+/// function returns, and results preserve input order.
 pub fn parallel_fetch(
     cache: &crate::remote::RemoteCache,
     keys: &[String],
 ) -> Vec<Option<crate::remote::RemoteCacheEntry>> {
-    // Use std threads for parallel fetch since we don't have rayon in cache crate
-    let results: Vec<Option<crate::remote::RemoteCacheEntry>> = keys
+    let results: Vec<std::sync::Mutex<Option<crate::remote::RemoteCacheEntry>>> = keys
         .iter()
-        .map(|key| cache.get(key).unwrap_or(None))
+        .map(|_| std::sync::Mutex::new(None))
         .collect();
+
+    std::thread::scope(|scope| {
+        for (i, key) in keys.iter().enumerate() {
+            let result_ref = &results[i];
+            scope.spawn(move || {
+                let value = cache.get(key).unwrap_or(None);
+                *result_ref.lock().unwrap() = value;
+            });
+        }
+    });
+
     results
+        .into_iter()
+        .map(|m| m.into_inner().unwrap())
+        .collect()
 }
 
 // ─── G9.7: Remote cache prefetching ──────────────────────────────────
@@ -323,6 +342,43 @@ impl DedupCache {
             },
         }
     }
+
+    /// Persist dedup metadata to disk so it survives restarts.
+    /// Writes `dedup-meta.json` inside `cache_dir`.
+    pub fn persist(&self, cache_dir: &Path) -> Result<()> {
+        let meta_path = cache_dir.join("dedup-meta.json");
+        let meta = DedupMeta {
+            content_to_path: self.content_to_path.clone(),
+            key_to_content: self.key_to_content.clone(),
+            ref_counts: self.ref_counts.clone(),
+        };
+        std::fs::write(&meta_path, serde_json::to_string_pretty(&meta)?)?;
+        Ok(())
+    }
+
+    /// Load dedup metadata from disk.
+    /// Returns an empty cache when no `dedup-meta.json` exists yet.
+    pub fn load(cache_dir: &Path) -> Result<Self> {
+        let meta_path = cache_dir.join("dedup-meta.json");
+        if !meta_path.exists() {
+            return Ok(Self::new());
+        }
+        let content = std::fs::read_to_string(&meta_path)?;
+        let meta: DedupMeta = serde_json::from_str(&content)?;
+        Ok(Self {
+            content_to_path: meta.content_to_path,
+            key_to_content: meta.key_to_content,
+            ref_counts: meta.ref_counts,
+        })
+    }
+}
+
+/// Serializable form of [`DedupCache`] metadata for disk persistence.
+#[derive(Debug, Serialize, Deserialize)]
+struct DedupMeta {
+    content_to_path: HashMap<String, std::path::PathBuf>,
+    key_to_content: HashMap<String, String>,
+    ref_counts: HashMap<String, u32>,
 }
 
 #[derive(Debug)]
@@ -368,10 +424,28 @@ pub struct SignedCacheEntry {
     pub public_key: Vec<u8>,
 }
 
-/// G9.13: Generate a new ed25519 key pair for cache signing
+/// G9.13: Generate a new ed25519 key pair for cache signing.
+///
+/// NOTE: This uses OS randomness, so the keypair — and therefore cache
+/// signatures produced with it — is intentionally non-reproducible across
+/// calls. Use [`derive_signing_keypair`] when a deterministic, reproducible
+/// keypair is required (e.g. reproducible builds / tests).
 pub fn generate_signing_keypair() -> (SigningKey, VerifyingKey) {
     let mut rng = OsRng;
     let signing_key = SigningKey::generate(&mut rng);
+    let verifying_key = signing_key.verifying_key();
+    (signing_key, verifying_key)
+}
+
+/// G9.13: Derive a deterministic ed25519 key pair from a seed.
+///
+/// Uses BLAKE3 as a KDF: the same seed always produces the same keypair,
+/// making cache signatures reproducible across runs and machines. The seed
+/// must still be kept secret — anyone with the seed can forge signatures.
+pub fn derive_signing_keypair(seed: &[u8]) -> (SigningKey, VerifyingKey) {
+    // BLAKE3 KDF for deterministic key derivation
+    let hash = blake3::hash(seed);
+    let signing_key = SigningKey::from_bytes(hash.as_bytes());
     let verifying_key = signing_key.verifying_key();
     (signing_key, verifying_key)
 }
@@ -569,6 +643,7 @@ impl CacheWarmer {
                         source_map: entry.source_map,
                         deps: entry.deps,
                         created_at: entry.created_at,
+                        version: crate::CACHE_FORMAT_VERSION,
                     };
                     local_cache.set(cache_key, local_entry);
                     stats.fetched += 1;

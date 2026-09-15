@@ -3,6 +3,11 @@ name = "pledgepack-task-system"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish.workspace = true
+description = "Task system for PledgePack"
+repository = "https://github.com/pledgeandgrow/pledgepack"
+keywords = ["bundler", "build", "rust"]
+categories = ["web-programming", "compilers"]
 
 [dependencies]
 # Core: hashing, serialization, async
@@ -25,7 +30,7 @@ pledgepack-task-system-macros = { path = "../task-system-macros" }
 pledgepack-cache = { path = "../cache" }
 
 # FFI to Zig native library (arena-allocated task graph)
-pledgepack-native-sys = { path = "../../native-sys" }
+pledgepack-native-sys = { path = "../../native-sys", optional = true }
 
 # Memory-mapped I/O for graph persistence
 memmap2 = { workspace = true }
@@ -37,3 +42,4 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"
 [features]
 default = []
 task-trace = []
+zig-graph = ["pledgepack-native-sys"]

@@ -10,7 +10,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Serializable representation of a single module in the graph
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,24 +95,84 @@ impl SerializableModuleGraph {
         );
     }
 
-    /// Add a static dependency edge
+    /// Add a static dependency edge.
+    ///
+    /// Detects potential circular dependencies: if `to` can already reach `from`
+    /// through the existing dependency graph, adding this edge would create a
+    /// cycle. The edge is still added (some frameworks intentionally use
+    /// circular imports), but a warning is logged so the issue is visible.
     pub fn add_dependency(&mut self, from: ModuleId, to: ModuleId) {
+        if from != to && self.can_reach(to, from) {
+            warn!(
+                "Circular dependency detected: {:?} -> {:?}",
+                from,
+                to
+            );
+        }
         if let Some(module) = self.modules.get_mut(&from)
             && !module.dependencies.contains(&to)
         {
             module.dependencies.push(to);
         }
-        self.reverse_deps.entry(to).or_default().push(from);
+        // Dedup the reverse edge too — the forward edge is deduped above,
+        // but add_dependency can be called with the same (from, to) pair
+        // multiple times (e.g. re-resolution during incremental rebuilds),
+        // which would otherwise leave duplicate entries in reverse_deps.
+        let reverse = self.reverse_deps.entry(to).or_default();
+        if !reverse.contains(&from) {
+            reverse.push(from);
+        }
     }
 
-    /// Add a dynamic import edge
+    /// Add a dynamic import edge.
+    ///
+    /// Like `add_dependency`, this checks for cycles before adding the edge.
+    /// Dynamic import cycles are less problematic (they resolve at runtime),
+    /// but are still logged for visibility.
     pub fn add_dynamic_dependency(&mut self, from: ModuleId, to: ModuleId) {
+        if from != to && self.can_reach(to, from) {
+            warn!(
+                "Circular dynamic dependency detected: {:?} -> {:?}",
+                from,
+                to
+            );
+        }
         if let Some(module) = self.modules.get_mut(&from)
             && !module.dynamic_dependencies.contains(&to)
         {
             module.dynamic_dependencies.push(to);
         }
-        self.reverse_deps.entry(to).or_default().push(from);
+        // Dedup the reverse edge (see add_dependency).
+        let reverse = self.reverse_deps.entry(to).or_default();
+        if !reverse.contains(&from) {
+            reverse.push(from);
+        }
+    }
+
+    /// Check whether `from` can reach `to` by following dependency edges.
+    ///
+    /// Traverses both static and dynamic dependency edges — a cycle formed
+    /// through a dynamic import is still a cycle worth reporting. Uses an
+    /// iterative DFS with a visited set to avoid infinite loops on graphs
+    /// that already contain cycles. Returns `true` if a path exists.
+    fn can_reach(&self, from: ModuleId, to: ModuleId) -> bool {
+        let mut visited = HashSet::new();
+        let mut stack = vec![from];
+        while let Some(current) = stack.pop() {
+            if current == to {
+                return true;
+            }
+            if !visited.insert(current) {
+                continue;
+            }
+            if let Some(module) = self.modules.get(&current) {
+                stack.extend(module.dependencies.iter().copied());
+                // Also follow dynamic dependencies — a static+dynamic
+                // mixed cycle is still a cycle.
+                stack.extend(module.dynamic_dependencies.iter().copied());
+            }
+        }
+        false
     }
 
     /// Set entry modules

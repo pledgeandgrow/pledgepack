@@ -1,15 +1,19 @@
-use regex::Regex;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 
-/// Compile test include/exclude patterns into a GlobSet for efficient matching
+/// Compile test include/exclude patterns into a GlobSet for efficient matching.
+/// Invalid glob patterns are logged as warnings rather than silently ignored.
 pub fn compile_test_globset(patterns: &[String]) -> globset::GlobSet {
     let mut builder = globset::GlobSetBuilder::new();
     for pattern in patterns {
-        if let Ok(glob) = globset::Glob::new(pattern) {
-            builder.add(glob);
+        match globset::Glob::new(pattern) {
+            Ok(glob) => {
+                builder.add(glob);
+            }
+            Err(e) => {
+                tracing::warn!("Invalid glob pattern '{}': {}", pattern, e);
+            }
         }
     }
     builder.build().unwrap_or_default()
@@ -453,6 +457,26 @@ pub struct BuildConfig {
     /// Set to a specific number to limit concurrency and prevent OOM on large projects (#120)
     #[serde(default)]
     pub parallel: Option<usize>,
+
+    /// JavaScript compilation target for syntax lowering (default: none — modern ES output)
+    /// Accepts esbuild-style targets ("es2020", "chrome90", "node18", "esnext")
+    /// or a browserslist query ("last 2 versions", "> 0.5%, not dead").
+    /// Falls back to the project's .browserslistrc / package.json browserslist
+    /// for browser builds when unset.
+    #[serde(default)]
+    pub target: Option<String>,
+
+    /// Enable TypeScript legacy ("experimental") decorators (default: false)
+    /// Mirrors tsconfig `compilerOptions.experimentalDecorators`; also
+    /// auto-detected from tsconfig.json when not enabled here.
+    #[serde(default)]
+    pub experimental_decorators: bool,
+
+    /// Emit decorator metadata for legacy decorators (default: false)
+    /// Mirrors tsconfig `compilerOptions.emitDecoratorMetadata`.
+    /// Only takes effect when legacy decorators are enabled.
+    #[serde(default)]
+    pub emit_decorator_metadata: bool,
 }
 
 /// CSS preprocessor configuration for multi-preprocessor support
@@ -536,6 +560,9 @@ impl Default for BuildConfig {
             incremental_output: true,
             wasm_simd: "auto".to_string(),
             parallel: None,
+            target: None,
+            experimental_decorators: false,
+            emit_decorator_metadata: false,
         }
     }
 }
@@ -552,7 +579,7 @@ pub enum BuildMode {
 #[serde(rename_all = "lowercase")]
 pub enum Framework {
     #[default]
-    PledgeStack,
+    Pledge,
     React,
     Vue,
     Svelte,
@@ -686,6 +713,41 @@ pub struct DevServerConfig {
     /// Middleware functions to apply to the dev server (JS source code)
     #[serde(default)]
     pub middleware: Vec<String>,
+    /// Unix domain socket path to listen on instead of TCP host:port
+    /// (Unix platforms only, default: none)
+    #[serde(default)]
+    pub unix_socket: Option<String>,
+    /// CORS policy (default: same-origin). Previously the dev server sent
+    /// `Access-Control-Allow-Origin: *` unconditionally on every route,
+    /// including the raw-filesystem `/@fs/*` handler — any webpage open in
+    /// the same browser could read project files cross-origin. See
+    /// PRODUCTION-READINESS-100.md goal 16.
+    #[serde(default)]
+    pub cors: DevServerCors,
+    /// Access token required (as `?token=` or an `X-Pledge-Token` header) to
+    /// reach any dev-server route. If unset and `host` is bound to a
+    /// non-loopback address, one is auto-generated and printed at startup —
+    /// mirroring how e.g. Jupyter protects LAN-exposed sessions. Set to an
+    /// empty string to explicitly disable (loopback binds never require a
+    /// token regardless of this setting). See goal 18.
+    #[serde(default)]
+    pub access_token: Option<String>,
+}
+
+/// CORS policy for the dev server. See [`DevServerConfig::cors`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum DevServerCors {
+    /// No `Access-Control-*` headers beyond the browser's own same-origin
+    /// default. Safe default — nothing outside the dev server's own origin
+    /// can read its responses.
+    #[default]
+    SameOrigin,
+    /// Allow any origin to read any response (the previous, unconditional
+    /// behavior). Opt in only if something outside the dev server's own
+    /// origin genuinely needs to fetch it (e.g. a separately-hosted devtools
+    /// page).
+    Any,
 }
 
 fn default_dev_port() -> u16 {
@@ -694,6 +756,20 @@ fn default_dev_port() -> u16 {
 
 fn default_dev_host() -> String {
     "localhost".to_string()
+}
+
+/// Whether `host` is a loopback-only address ("localhost", "127.0.0.1",
+/// "::1", or any address `IpAddr::is_loopback()` agrees with) — i.e. only
+/// reachable from this machine — vs. something that exposes the dev server
+/// to the network (`0.0.0.0`, a LAN IP, a hostname). Used to decide whether
+/// to warn (goal 17) and whether to require an access token (goal 18).
+pub fn is_loopback_host(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
 }
 
 fn default_public_dir() -> String {
@@ -710,6 +786,9 @@ impl Default for DevServerConfig {
             https: false,
             public_dir: "public".to_string(),
             middleware: Vec::new(),
+            unix_socket: None,
+            cors: DevServerCors::default(),
+            access_token: None,
         }
     }
 }
@@ -833,6 +912,9 @@ pub struct WebhookConfig {
     /// Additional headers to send
     #[serde(default)]
     pub headers: std::collections::HashMap<String, String>,
+    /// Optional HMAC-SHA256 secret for signing webhook payloads
+    #[serde(default)]
+    pub secret: Option<String>,
 }
 
 /// i18n configuration for locale-aware bundling (#106)
@@ -1006,7 +1088,7 @@ impl Default for PledgeConfig {
                 .iter()
                 .find(|p| p.exists())
                 .and_then(|p| p.strip_prefix(&cwd).ok())
-                .map(|p| p.to_string_lossy().replace('\\', "/"))
+                .map(|p| crate::normalize_path(p))
                 .unwrap_or_else(|| "src/index.tsx".to_string())
         };
         Self {
@@ -1014,7 +1096,7 @@ impl Default for PledgeConfig {
             out_dir: PathBuf::from(".pledge"),
             root: PathBuf::from("."),
             mode: BuildMode::Development,
-            framework: Framework::PledgeStack,
+            framework: Framework::Pledge,
             alias: vec![],
             extensions: vec![
                 ".tsx".to_string(),
@@ -1307,218 +1389,34 @@ impl PledgeConfig {
     }
 
     /// Convert JavaScript/TypeScript object literal syntax to valid JSON.
-    /// Uses regex for comment stripping and trailing comma removal, with a
-    /// string-aware state machine for quote conversion and unquoted key quoting.
+    ///
+    /// Uses the `json5` crate, which natively handles JS/TS object literal
+    /// syntax that standard JSON does not allow:
+    ///   - `//` and `/* */` comments
+    ///   - Trailing commas
+    ///   - Unquoted object keys
+    ///   - Single-quoted strings
+    ///
+    /// The input is parsed into a `serde_json::Value` and re-serialized as
+    /// canonical JSON so the downstream `serde_json::from_str` deserializer
+    /// receives strict JSON.
     fn js_object_to_json(input: &str) -> String {
-        static SINGLE_LINE_COMMENT_RE: OnceLock<Regex> = OnceLock::new();
-        static MULTI_LINE_COMMENT_RE: OnceLock<Regex> = OnceLock::new();
-        static TRAILING_COMMA_RE: OnceLock<Regex> = OnceLock::new();
-        static UNQUOTED_KEY_RE: OnceLock<Regex> = OnceLock::new();
-
-        // Step 1: Remove comments using regex (string-aware — we use a state machine
-        // to protect string literals from comment-like sequences inside them)
-        let single_line_re =
-            SINGLE_LINE_COMMENT_RE.get_or_init(|| Regex::new(r"//[^\n]*").unwrap());
-        let multi_line_re =
-            MULTI_LINE_COMMENT_RE.get_or_init(|| Regex::new(r"/\*[\s\S]*?\*/").unwrap());
-
-        // First strip multi-line comments, then single-line comments
-        // We need to be careful not to strip // inside strings, so we do
-        // a string-aware pass first
-        let stripped = strip_comments_string_aware(input);
-        let _ = (single_line_re, multi_line_re); // regexes available for future use
-
-        // Step 2: Remove trailing commas using regex
-        let trailing_comma_re =
-            TRAILING_COMMA_RE.get_or_init(|| Regex::new(r",(\s*[\}\]])").unwrap());
-        let no_trailing = trailing_comma_re.replace_all(&stripped, "$1");
-
-        // Step 3: Quote unquoted keys using regex
-        let unquoted_key_re = UNQUOTED_KEY_RE
-            .get_or_init(|| Regex::new(r"([\{,]\s*)([A-Za-z_$][A-Za-z0-9_$]*)(\s*:)").unwrap());
-        let quoted_keys = unquoted_key_re.replace_all(&no_trailing, r#"$1"$2"$3"#);
-
-        // Step 4: Convert single quotes/backtick strings to double-quoted strings
-        // using the state machine (handles escape sequences properly)
-        convert_quotes_string_aware(&quoted_keys)
+        match json5::from_str::<serde_json::Value>(input) {
+            Ok(value) => value.to_string(),
+            Err(e) => {
+                tracing::warn!("Failed to parse config object as JSON5: {}", e);
+                // Fall back to the raw input — serde_json::from_str will then
+                // produce a precise error pointing at the offending syntax.
+                input.to_string()
+            }
+        }
     }
 }
 
-/// Strip JS comments (// and /* */) while respecting string literals
-fn strip_comments_string_aware(input: &str) -> String {
-    let mut result = String::with_capacity(input.len());
-    let bytes = input.as_bytes();
-    let mut i = 0;
-    let mut in_string = false;
-    let mut string_char = b' ';
-    let mut escaped = false;
-
-    while i < bytes.len() {
-        let b = bytes[i];
-
-        if escaped {
-            result.push(b as char);
-            escaped = false;
-            i += 1;
-            continue;
-        }
-
-        if b == b'\\' && in_string {
-            result.push('\\');
-            escaped = true;
-            i += 1;
-            continue;
-        }
-
-        if in_string {
-            if b == string_char {
-                result.push(b as char);
-                in_string = false;
-            } else if b == b'\r' {
-                // Skip \r inside strings
-            } else {
-                result.push(b as char);
-            }
-            i += 1;
-            continue;
-        }
-
-        // Skip \r outside strings
-        if b == b'\r' {
-            i += 1;
-            continue;
-        }
-
-        // Single-line comment
-        if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
-            while i < bytes.len() && bytes[i] != b'\n' {
-                i += 1;
-            }
-            continue;
-        }
-
-        // Multi-line comment
-        if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
-            i += 2;
-            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
-                i += 1;
-            }
-            i += 2;
-            continue;
-        }
-
-        if b == b'"' || b == b'\'' || b == b'`' {
-            in_string = true;
-            string_char = b;
-            result.push(b as char);
-            i += 1;
-            continue;
-        }
-
-        result.push(b as char);
-        i += 1;
-    }
-
-    result
-}
-
-/// Convert single-quoted and backtick strings to double-quoted strings,
-/// escaping inner double quotes. Handles escape sequences properly.
-fn convert_quotes_string_aware(input: &str) -> String {
-    let mut result = String::with_capacity(input.len());
-    let bytes = input.as_bytes();
-    let mut i = 0;
-    let mut escaped = false;
-
-    while i < bytes.len() {
-        let b = bytes[i];
-
-        if escaped {
-            result.push(b as char);
-            escaped = false;
-            i += 1;
-            continue;
-        }
-
-        if b == b'\\' {
-            result.push('\\');
-            escaped = true;
-            i += 1;
-            continue;
-        }
-
-        if b == b'\r' {
-            i += 1;
-            continue;
-        }
-
-        if b == b'\'' || b == b'`' {
-            // Replace opening quote with "
-            result.push('"');
-            i += 1;
-            // Copy string contents until matching closing quote
-            while i < bytes.len() {
-                let c = bytes[i];
-                if c == b'\\' {
-                    result.push('\\');
-                    escaped = true;
-                    i += 1;
-                    continue;
-                }
-                if c == b'\r' {
-                    i += 1;
-                    continue;
-                }
-                if c == b'"' {
-                    // Escape inner double quotes
-                    result.push('\\');
-                    result.push('"');
-                    i += 1;
-                    continue;
-                }
-                if c == b {
-                    // Closing quote — replace with "
-                    result.push('"');
-                    i += 1;
-                    break;
-                }
-                result.push(c as char);
-                i += 1;
-            }
-            continue;
-        }
-
-        if b == b'"' {
-            result.push('"');
-            i += 1;
-            // Copy double-quoted string contents as-is
-            while i < bytes.len() {
-                let c = bytes[i];
-                if c == b'\\' {
-                    result.push('\\');
-                    escaped = true;
-                    i += 1;
-                    continue;
-                }
-                if c == b'\r' {
-                    i += 1;
-                    continue;
-                }
-                result.push(c as char);
-                i += 1;
-                if c == b'"' {
-                    break;
-                }
-            }
-            continue;
-        }
-
-        result.push(b as char);
-        i += 1;
-    }
-
-    result
-}
+// PRODUCTION-READINESS-100.md goal 91: `strip_comments_string_aware` and
+// `convert_quotes_string_aware` were removed from here — both were
+// hand-written JS-comment/quote normalizers superseded by the `json5` crate
+// (see `js_object_to_json` above) and had zero remaining call sites.
 
 // ─── Feature 116: GraphQL code generation config ──────────────────────
 

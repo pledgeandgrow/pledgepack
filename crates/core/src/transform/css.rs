@@ -31,21 +31,32 @@ pub(super) fn transform_css(
         }
     };
 
+    // Resolve browser targets from browserslist (package.json or .browserslistrc),
+    // falling back to modern-browser defaults. Targets drive autoprefixing and
+    // lowering of modern CSS features (e.g. nesting) at print time — note that
+    // ParserOptions has no `targets` field in lightningcss; targets are applied
+    // via MinifyOptions and PrinterOptions instead.
+    let browsers = crate::postcss::BrowserslistConfig::from_root(&config.root);
+    let targets = lightningcss::targets::Targets {
+        browsers: Some(browsers.browser_targets()),
+        ..Default::default()
+    };
+
     let mut stylesheet = StyleSheet::parse(&processed_source, ParserOptions::default())
         .map_err(|e| anyhow::anyhow!("CSS parse error in {}: {}", file_path, e))?;
 
     if is_production {
         stylesheet
-            .minify(lightningcss::stylesheet::MinifyOptions::default())
+            .minify(lightningcss::stylesheet::MinifyOptions {
+                targets,
+                ..Default::default()
+            })
             .map_err(|e| anyhow::anyhow!("CSS minify error in {}: {}", file_path, e))?;
-    } else {
-        stylesheet
-            .minify(lightningcss::stylesheet::MinifyOptions::default())
-            .map_err(|e| anyhow::anyhow!("CSS nesting transpile error in {}: {}", file_path, e))?;
     }
 
     let printer_options = PrinterOptions {
         minify: is_production,
+        targets,
         ..Default::default()
     };
 
@@ -54,7 +65,11 @@ pub(super) fn transform_css(
         .map_err(|e| anyhow::anyhow!("CSS serialize error in {}: {}", file_path, e))?;
 
     let css_code = if !is_production {
-        crate::css_features::polyfill_container_queries(&result.code)
+        // Dev mode: minify isn't run, so explicitly transpile native `&` nesting
+        // (targets above already lower it at print time; this is a safety net)
+        // and polyfill container queries.
+        let polyfilled = crate::css_features::polyfill_container_queries(&result.code);
+        crate::css_advanced::polyfill_nesting(&polyfilled)
     } else {
         result.code
     };
@@ -94,7 +109,7 @@ pub(super) fn transform_css(
         css_code
     };
 
-    let source_map = if !is_production && config.source_maps {
+    let source_map = if config.source_maps {
         Some(crate::css_features::generate_css_source_map(
             file_path, source, &css_code,
         ))
@@ -118,30 +133,113 @@ pub(super) fn transform_css(
 /// Each class name gets a scoped name: `original` → `_original_hash6`.
 fn generate_css_module_map(css: &str, file_path: &str) -> Vec<(String, String)> {
     let mut mappings = Vec::new();
-
     let mut seen = std::collections::HashSet::new();
-    let mut search_pos = 0;
-    while let Some(pos) = css[search_pos..].find('.') {
-        let abs_pos = search_pos + pos + 1;
-        let rest = &css[abs_pos..];
+    let chars: Vec<char> = css.chars().collect();
+    let mut i = 0;
 
-        let end = rest
-            .find(|c: char| !c.is_alphanumeric() && c != '-' && c != '_')
-            .unwrap_or(rest.len());
-        let class_name = &rest[..end];
-
-        if !class_name.is_empty() && !seen.contains(class_name) {
-            seen.insert(class_name.to_string());
-
-            let hash_input = format!("{}:{}", file_path, class_name);
-            let hash = blake3::hash(hash_input.as_bytes());
-            let hash_hex = &hash.to_hex()[..6];
-            let scoped = format!("_{}_{}", class_name, hash_hex);
-
-            mappings.push((class_name.to_string(), scoped));
+    while i < chars.len() {
+        // Skip url() content
+        if i + 3 < chars.len() && chars[i..i + 3].iter().collect::<String>() == "url" {
+            while i < chars.len() && chars[i] != ')' {
+                i += 1;
+            }
+            if i < chars.len() {
+                i += 1;
+            }
+            continue;
         }
 
-        search_pos = abs_pos;
+        // Skip string literals (content: "...")
+        if chars[i] == '"' || chars[i] == '\'' {
+            let quote = chars[i];
+            i += 1;
+            while i < chars.len() && chars[i] != quote {
+                i += 1;
+            }
+            if i < chars.len() {
+                i += 1;
+            }
+            continue;
+        }
+
+        // Check for class selector: . preceded by selector boundary
+        if chars[i] == '.' {
+            let prev = if i > 0 { chars[i - 1] } else { '\n' };
+            let is_selector_start = prev == '{' || prev == '}' || prev == ','
+                || prev == ' ' || prev == '\n' || prev == '\t' || prev == '>'
+                || prev == '+' || prev == '~' || i == 0;
+
+            if is_selector_start {
+                let start = i + 1;
+                let mut end = start;
+                while end < chars.len() {
+                    let c = chars[end];
+                    // Handle escaped characters in class names: .\& or .\31 00.
+                    // A backslash escapes either a single character or up to 6
+                    // hex digits followed by an optional whitespace terminator.
+                    if c == '\\' && end + 1 < chars.len() {
+                        end += 1;
+                        let mut hex_digits = 0;
+                        while end < chars.len()
+                            && chars[end].is_ascii_hexdigit()
+                            && hex_digits < 6
+                        {
+                            end += 1;
+                            hex_digits += 1;
+                        }
+                        if hex_digits == 0 {
+                            // Single escaped character (e.g. \&, \:, \()
+                            end += 1;
+                        } else if end < chars.len() && chars[end].is_whitespace() {
+                            // Optional whitespace after a hex escape
+                            end += 1;
+                        }
+                        continue;
+                    }
+                    if c == ':' || c == '[' || c == '{' || c == ' ' || c == '\n'
+                        || c == '\t' || c == '>' || c == '+' || c == '~' || c == ','
+                    {
+                        break;
+                    }
+                    end += 1;
+                }
+                // A hex escape may leave a trailing whitespace terminator in the
+                // captured range — it isn't part of the class name.
+                let class_name: String =
+                    chars[start..end].iter().collect::<String>().trim_end().to_string();
+                // Validate: every char must be alphanumeric/-/_ or escaped
+                // (either a backslash itself or the char it escapes).
+                let mut escaped = false;
+                let is_valid_name = class_name.chars().all(|c| {
+                    if escaped {
+                        escaped = false;
+                        return true;
+                    }
+                    if c == '\\' {
+                        escaped = true;
+                        return true;
+                    }
+                    c.is_alphanumeric() || c == '-' || c == '_'
+                });
+                if !class_name.is_empty() && is_valid_name && !seen.contains(&class_name) {
+                    seen.insert(class_name.clone());
+                    let hash_input = format!("{}:{}", file_path, class_name);
+                    let hash = blake3::hash(hash_input.as_bytes());
+                    let hash_hex = &hash.to_hex()[..6];
+                    // Strip backslashes so the scoped name stays a bare identifier.
+                    let scoped_base: String = class_name
+                        .chars()
+                        .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
+                        .collect();
+                    let scoped = format!("_{}_{}", scoped_base, hash_hex);
+                    mappings.push((class_name, scoped));
+                }
+                i = end;
+                continue;
+            }
+        }
+
+        i += 1;
     }
 
     mappings
@@ -431,7 +529,7 @@ pub(super) fn transform_sass(
         None
     };
 
-    let source_map = if !is_production && config.source_maps {
+    let source_map = if config.source_maps {
         Some(crate::css_features::generate_css_source_map(
             file_path, source, &css,
         ))

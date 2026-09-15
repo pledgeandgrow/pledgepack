@@ -107,7 +107,17 @@ impl Environment {
             Environment::Edge => "edge",
             Environment::Worker => "worker",
             Environment::Shared => "shared",
-            Environment::Custom(_) => "custom",
+            Environment::Custom(id) => {
+                // Look up the registered name. Leak the string to make it
+                // 'static so we can keep the &'static str return type (the
+                // registry stores owned Strings). Falls back to "custom" if
+                // the environment was never registered.
+                let registry = registry().read().unwrap();
+                match registry.get(id) {
+                    Some(name) => Box::leak(name.clone().into_boxed_str()) as &'static str,
+                    None => "custom",
+                }
+            }
         }
     }
 
@@ -134,11 +144,18 @@ impl Environment {
     pub fn register_custom(name: &str) -> Environment {
         let hash = blake3::hash(name.as_bytes());
         let id = u64::from_be_bytes(hash.as_bytes()[..8].try_into().unwrap());
-        registry()
-            .write()
-            .unwrap()
-            .entry(id)
-            .or_insert_with(|| name.to_string());
+        let mut registry = registry().write().unwrap();
+        if let Some(existing) = registry.get(&id) {
+            if existing != name {
+                tracing::error!(
+                    "Environment hash collision: '{}' and '{}' both hash to {}",
+                    existing, name, id
+                );
+                // Still use the existing entry to avoid corruption
+            }
+        } else {
+            registry.insert(id, name.to_string());
+        }
         Environment::Custom(id)
     }
 

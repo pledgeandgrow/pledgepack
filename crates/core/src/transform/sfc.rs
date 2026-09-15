@@ -137,9 +137,11 @@ if (import.meta.hot) {
         );
     }
 
+    let source_map = Some(super::utils::generate_source_map(file_path, source, &code));
+
     Ok(TransformOutput {
         code,
-        source_map: None,
+        source_map,
         css_modules: None,
         is_css: false,
         extracted_css,
@@ -151,15 +153,139 @@ if (import.meta.hot) {
 
 /// Extract a named block from an SFC (Vue/Svelte)
 /// e.g., extract_sfc_block(source, "template") returns content between <template> and </template>
+///
+/// This implementation tracks nesting depth so that nested tags of the same name
+/// (e.g. `<template>` inside `<template>`) and tags with attributes
+/// (e.g. `<template lang="pug">`) are handled correctly. It returns the first
+/// matching block. Use [`extract_sfc_blocks`] to retrieve *all* blocks of a
+/// given type (e.g. multiple `<style>` blocks).
 fn extract_sfc_block(source: &str, tag: &str) -> Option<String> {
-    let open_tag = format!("<{}", tag);
+    extract_sfc_blocks(source, tag)
+        .into_iter()
+        .next()
+        .map(|(_, content)| content)
+}
+
+/// Extract *all* named blocks of a given tag from an SFC source.
+///
+/// Each entry is `(lang, content)` where `lang` is the value of the optional
+/// `lang="..."` attribute on the opening tag (e.g. `"ts"`, `"pug"`).
+fn extract_sfc_blocks(source: &str, tag: &str) -> Vec<(Option<String>, String)> {
+    let mut blocks = Vec::new();
+    let open_prefix = format!("<{}", tag);
     let close_tag = format!("</{}>", tag);
 
-    let start = source.find(&open_tag)?;
-    let content_start = source[start..].find('>')? + start + 1;
-    let end = source[content_start..].find(&close_tag)? + content_start;
+    let mut search_from = 0;
+    while let Some((_open_start, content_start, is_self_closing, lang)) =
+        find_open_tag(source, search_from, &open_prefix)
+    {
+        // Self-closing tags (e.g. `<style />`) have no content; skip them.
+        if is_self_closing {
+            search_from = content_start;
+            continue;
+        }
 
-    Some(source[content_start..end].trim().to_string())
+        // Find the matching closing tag, tracking nesting depth for tags of
+        // the same name so that nested occurrences don't terminate the block
+        // prematurely.
+        let mut depth: isize = 1;
+        let mut pos = content_start;
+        let mut found_close = None;
+        while depth > 0 && pos < source.len() {
+            let next_open = find_open_tag(source, pos, &open_prefix)
+                .map(|(s, cs, sc, _)| (s, cs, sc));
+            let next_close = source[pos..].find(&close_tag).map(|p| pos + p);
+            match (next_open, next_close) {
+                (Some((op, cs, sc)), Some(cl)) if op < cl => {
+                    if sc {
+                        // Self-closing nested tag: doesn't affect depth.
+                        pos = cs;
+                    } else {
+                        depth += 1;
+                        pos = op + open_prefix.len();
+                    }
+                }
+                (Some((op, cs, sc)), None) => {
+                    if sc {
+                        pos = cs;
+                    } else {
+                        depth += 1;
+                        pos = op + open_prefix.len();
+                    }
+                }
+                (_, Some(cl)) => {
+                    depth -= 1;
+                    if depth == 0 {
+                        found_close = Some(cl);
+                        break;
+                    } else {
+                        pos = cl + close_tag.len();
+                    }
+                }
+                (None, None) => break,
+            }
+        }
+
+        if let Some(cl) = found_close {
+            let content = &source[content_start..cl];
+            blocks.push((lang, content.trim().to_string()));
+            search_from = cl + close_tag.len();
+        } else {
+            // No matching close tag found; stop scanning.
+            break;
+        }
+    }
+    blocks
+}
+
+/// Find the next opening tag matching `open_prefix` (e.g. `<template`) starting
+/// from `from`. Returns `(open_start, content_start, is_self_closing, lang)`
+/// where `content_start` is the index just after the closing `>` of the opening
+/// tag. Skips false matches where the prefix is part of a longer tag name
+/// (e.g. `<templatex>`).
+fn find_open_tag(
+    source: &str,
+    from: usize,
+    open_prefix: &str,
+) -> Option<(usize, usize, bool, Option<String>)> {
+    let mut search = from;
+    loop {
+        let rel = source[search..].find(open_prefix)?;
+        let abs = search + rel;
+        // Boundary check: the character right after the prefix must not be
+        // alphanumeric, otherwise this is a different tag (e.g. `<templatex>`).
+        let after = &source[abs + open_prefix.len()..];
+        if let Some(c) = after.chars().next() {
+            if c.is_alphanumeric() {
+                search = abs + open_prefix.len();
+                continue;
+            }
+        }
+        // Find the end of the opening tag (the next `>`).
+        let gt = source[abs..].find('>')?;
+        let tag_end = abs + gt + 1;
+        let tag_str = &source[abs..tag_end];
+        let is_self_closing = tag_str.ends_with("/>");
+        let lang = extract_lang_attr(tag_str);
+        return Some((abs, tag_end, is_self_closing, lang));
+    }
+}
+
+/// Extract the `lang="..."` attribute value from an opening tag string.
+fn extract_lang_attr(tag: &str) -> Option<String> {
+    if let Some(idx) = tag.find("lang=\"") {
+        let after = &tag[idx + "lang=\"".len()..];
+        if let Some(end) = after.find('"') {
+            return Some(after[..end].to_string());
+        }
+    }
+    if let Some(idx) = tag.find("lang='") {
+        let after = &tag[idx + "lang='".len()..];
+        if let Some(end) = after.find('\'') {
+            return Some(after[..end].to_string());
+        }
+    }
+    None
 }
 
 /// Compile a Vue template string to a render function using h() calls.
@@ -398,20 +524,67 @@ impl<'a> HtmlParser<'a> {
     }
 }
 
-/// Convert parsed HTML nodes to Vue h() render calls
+/// Convert parsed HTML nodes to Vue h() render calls.
+///
+/// Handles `v-if` / `v-else` pairs at the sibling level by emitting ternary
+/// expressions (`cond ? trueBranch : falseBranch`).
 fn nodes_to_render_calls(nodes: &[HtmlNode], depth: usize) -> String {
     if nodes.len() == 1 {
-        return node_to_render_call(&nodes[0], depth);
+        return node_to_render_call_opts(&nodes[0], depth, false);
     }
-    let items: Vec<String> = nodes
-        .iter()
-        .map(|n| node_to_render_call(n, depth + 1))
-        .collect();
+    let mut items: Vec<String> = vec![];
+    let mut i = 0;
+    while i < nodes.len() {
+        let node = &nodes[i];
+        if let HtmlNode::Element { attrs, .. } = node {
+            if has_directive(attrs, "v-if") {
+                let cond = get_directive(attrs, "v-if").unwrap_or_default();
+                // Look ahead for a `v-else` sibling to form an else branch.
+                if i + 1 < nodes.len() {
+                    if let HtmlNode::Element {
+                        attrs: next_attrs, ..
+                    } = &nodes[i + 1]
+                    {
+                        if has_directive(next_attrs, "v-else") {
+                            // Render the true branch without re-applying its own
+                            // v-if ternary (the pair forms the ternary here).
+                            let true_expr = node_to_render_call_opts(node, depth + 1, true);
+                            let false_expr =
+                                node_to_render_call_opts(&nodes[i + 1], depth + 1, false);
+                            items
+                                .push(format!("({}) ? {} : {}", cond, true_expr, false_expr));
+                            i += 2;
+                            continue;
+                        }
+                    }
+                }
+                // No v-else sibling: render with a `null` else branch.
+                let true_expr = node_to_render_call_opts(node, depth + 1, false);
+                items.push(format!("({}) ? {} : null", cond, true_expr));
+                i += 1;
+                continue;
+            }
+        }
+        items.push(node_to_render_call_opts(node, depth + 1, false));
+        i += 1;
+    }
     format!("[{}]", items.join(", "))
 }
 
-/// Convert a single HTML node to a Vue h() call
-fn node_to_render_call(node: &HtmlNode, depth: usize) -> String {
+// PRODUCTION-READINESS-100.md goal 91: `node_to_render_call`, a thin
+// zero-call-site wrapper around `node_to_render_call_opts`, was removed —
+// every real call site already calls `node_to_render_call_opts` directly.
+
+/// Convert a single HTML node to a Vue h() call.
+///
+/// `skip_vif` is used when the caller is already building a v-if/v-else ternary
+/// and wants to suppress the node's own `? ... : null` wrapping for the true
+/// branch.
+///
+/// Directives handled here:
+/// - `v-if`: wraps the h() call in `(cond) ? h(...) : null`.
+/// - `v-for`: wraps the h() call in `list.map(item => h(...))`.
+fn node_to_render_call_opts(node: &HtmlNode, depth: usize, skip_vif: bool) -> String {
     let indent = "  ".repeat(depth);
     match node {
         HtmlNode::Text(text) => {
@@ -438,45 +611,94 @@ fn node_to_render_call(node: &HtmlNode, depth: usize) -> String {
                 format!("'{}'", tag)
             };
 
-            let props = attrs_to_props(attrs, &indent);
+            let props = attrs_to_props(attrs, tag, &indent);
             let children_expr = if children.is_empty() {
                 String::new()
             } else {
-                let child_calls: Vec<String> = children
-                    .iter()
-                    .map(|c| node_to_render_call(c, depth + 1))
-                    .collect();
-                format!(", {}", child_calls.join(", "))
+                format!(", {}", nodes_to_render_calls(children, depth + 1))
             };
 
-            format!("h({}, {}{})", tag_expr, props, children_expr)
+            let base = format!("h({}, {}{})", tag_expr, props, children_expr);
+
+            let vif = get_directive(attrs, "v-if");
+            let vfor = get_directive(attrs, "v-for");
+
+            let mut result = base;
+            // v-if wraps the element in a ternary (unless the caller is
+            // already forming a v-if/v-else pair).
+            if !skip_vif {
+                if let Some(cond) = &vif {
+                    result = format!("({}) ? {} : null", cond, result);
+                }
+            }
+            // v-for wraps the (possibly v-if'd) element in a `.map()` call so
+            // each item is rendered: `list.map(item => ...)`.
+            if let Some(vfor_val) = &vfor {
+                let (binding, list_expr) = parse_v_for(vfor_val);
+                result = format!("{}.map({} => {})", list_expr, binding, result);
+            }
+            result
         }
     }
 }
 
-/// Convert HTML attributes to Vue props object
-fn attrs_to_props(attrs: &[(String, String)], _indent: &str) -> String {
+/// Return the value of a directive attribute, if present.
+fn get_directive(attrs: &[(String, String)], name: &str) -> Option<String> {
+    attrs
+        .iter()
+        .find(|(n, _)| n == name)
+        .map(|(_, v)| v.clone())
+}
+
+/// Whether a directive attribute is present.
+fn has_directive(attrs: &[(String, String)], name: &str) -> bool {
+    attrs.iter().any(|(n, _)| n == name)
+}
+
+/// Parse a `v-for` value into `(item_binding, list_expr)`.
+///
+/// Supports the common forms:
+/// - `"item in items"`
+/// - `"(item, index) in items"`
+/// - `"item, index in items"`
+fn parse_v_for(value: &str) -> (String, String) {
+    let trimmed = value.trim();
+    if let Some(idx) = trimmed.find(" in ") {
+        let lhs = trimmed[..idx].trim();
+        let rhs = trimmed[idx + 4..].trim();
+        let binding = if lhs.starts_with('(') && lhs.ends_with(')') {
+            lhs[1..lhs.len() - 1].trim().to_string()
+        } else {
+            lhs.to_string()
+        };
+        (binding, rhs.to_string())
+    } else {
+        // Fallback: treat the whole expression as the item binding with an
+        // empty list so output still type-checks.
+        (trimmed.to_string(), "[]".to_string())
+    }
+}
+
+/// Convert HTML attributes to Vue props object.
+///
+/// `tag` is the element tag name, used to branch `v-model` behavior across
+/// input types (checkbox, select, component, default text input).
+fn attrs_to_props(attrs: &[(String, String)], tag: &str, _indent: &str) -> String {
     let mut props: Vec<String> = vec![];
-    let mut directives: Vec<String> = vec![];
 
     for (name, value) in attrs {
-        if name == "v-if" {
-            directives.push(format!("// v-if: {}", value));
-        } else if name == "v-else" {
-            directives.push("// v-else".to_string());
-        } else if name == "v-for" {
-            directives.push(format!("// v-for: {}", value));
+        // Structural directives are handled in `node_to_render_call_opts`;
+        // skip them here so they don't leak into the props object.
+        if name == "v-if" || name == "v-else" || name == "v-for" {
+            continue;
         } else if name == "v-show" {
-            directives.push(format!("style: {{ display: ({} ? '' : 'none') }}", value));
+            props.push(format!("style: {{ display: ({} ? '' : 'none') }}", value));
         } else if name == "v-text" {
             props.push(format!("textContent: {}", value));
         } else if name == "v-html" {
             props.push(format!("innerHTML: {}", value));
-        } else if name == "v-model" {
-            props.push(format!(
-                "value: {}, onInput: (e) => {{ {} = e.target.value }}",
-                value, value
-            ));
+        } else if name == "v-model" || name.starts_with("v-model.") {
+            push_v_model_props(&mut props, name, value, tag, attrs);
         } else if name.starts_with(':') || name.starts_with("v-bind:") {
             let prop_name = name.trim_start_matches(':').trim_start_matches("v-bind:");
             if prop_name == "class" {
@@ -512,11 +734,80 @@ fn attrs_to_props(attrs: &[(String, String)], _indent: &str) -> String {
         }
     }
 
-    if props.is_empty() && directives.is_empty() {
+    if props.is_empty() {
         return "{}".to_string();
     }
 
     format!("{{ {} }}", props.join(", "))
+}
+
+/// Push props for a `v-model` directive, branching on element type and
+/// modifiers.
+///
+/// Element types:
+/// - Component (PascalCase tag): `modelValue` + `onUpdate:modelValue`.
+/// - `<input type="checkbox">`: `checked` + `onChange` (e.target.checked).
+/// - `<select>`: `value` + `onChange` (e.target.value).
+/// - Default (text input / textarea): `value` + `onInput` (e.target.value).
+///
+/// Modifiers:
+/// - `.number`: coerce with `Number(...)`.
+/// - `.trim`: coerce with `.trim()`.
+/// - `.lazy`: use `onChange` instead of `onInput`.
+fn push_v_model_props(
+    props: &mut Vec<String>,
+    name: &str,
+    value: &str,
+    tag: &str,
+    attrs: &[(String, String)],
+) {
+    let modifiers_str = name.strip_prefix("v-model").unwrap_or("");
+    let modifiers: Vec<&str> = modifiers_str
+        .trim_start_matches('.')
+        .split('.')
+        .filter(|s| !s.is_empty())
+        .collect();
+    let is_number = modifiers.contains(&"number");
+    let is_trim = modifiers.contains(&"trim");
+    let is_lazy = modifiers.contains(&"lazy");
+
+    let event_name = if is_lazy { "onChange" } else { "onInput" };
+    let mut val_expr = "e.target.value".to_string();
+    if is_trim {
+        val_expr = format!("{}.trim()", val_expr);
+    }
+    if is_number {
+        val_expr = format!("Number({})", val_expr);
+    }
+
+    let is_component = tag.chars().next().map(|c| c.is_uppercase()).unwrap_or(false);
+    let is_checkbox = tag == "input"
+        && attrs
+            .iter()
+            .any(|(n, v)| n == "type" && v == "checkbox");
+    let is_select = tag == "select";
+
+    if is_component {
+        props.push(format!(
+            "modelValue: {}, 'onUpdate:modelValue': (v) => {{ {} = v }}",
+            value, value
+        ));
+    } else if is_checkbox {
+        props.push(format!(
+            "checked: {}, onChange: (e) => {{ {} = e.target.checked }}",
+            value, value
+        ));
+    } else if is_select {
+        props.push(format!(
+            "value: {}, onChange: (e) => {{ {} = {} }}",
+            value, value, val_expr
+        ));
+    } else {
+        props.push(format!(
+            "value: {}, {}: (e) => {{ {} = {} }}",
+            value, event_name, value, val_expr
+        ));
+    }
 }
 
 /// Handle Vue mustache interpolation {{ expr }}
@@ -650,6 +941,11 @@ pub(super) fn transform_svelte(
         } else {
             script_content.clone()
         };
+        // TODO: Svelte script-level reactivity is passed through untransformed.
+        // The following are not yet compiled and rely on a runtime shim:
+        // - `$:` reactive statements (should be collected into an update fn)
+        // - `$store` auto-subscription (should lower to `store.subscribe()`)
+        // - `onMount` / `onDestroy` / lifecycle hooks (passed through as-is)
         code.push_str(&transformed_script);
         code.push('\n');
     }
@@ -720,9 +1016,11 @@ if (import.meta.hot) {
         );
     }
 
+    let source_map = Some(super::utils::generate_source_map(file_path, source, &code));
+
     Ok(TransformOutput {
         code,
-        source_map: None,
+        source_map,
         css_modules: None,
         is_css: false,
         extracted_css,
@@ -732,7 +1030,23 @@ if (import.meta.hot) {
     })
 }
 
-/// Convert parsed HTML nodes to Svelte DOM construction code
+/// Convert parsed HTML nodes to Svelte DOM construction code.
+///
+/// Supports Svelte control-flow blocks that survive the HTML parser as text
+/// nodes (the parser treats `{#if ...}`, `{:else}`, `{/if}`, `{#each ...}`,
+/// `{/each}` as text between elements):
+/// - `{#if cond}` ... `{:else}` ... `{/if}` → `if (cond) { ... } else { ... }`
+/// - `{#each items as item}` ... `{/each}` → `items.forEach(item => { ... })`
+///
+/// TODO(unsupported Svelte features):
+/// - `$:` reactive statements (in `<script>`) — not yet compiled to a reactive
+///   update function.
+/// - `$store` auto-subscription syntax — not yet lowered to
+///   `store.subscribe()`.
+/// - `{#await}` / `{:then}` / `{:catch}` / `{/await}` blocks.
+/// - `onMount` / `onDestroy` / other lifecycle hooks (passed through as-is).
+/// - Nested control flow inside `{#if}`/`{#each}` (only one level deep is
+///   rendered; deeper nesting is skipped with a placeholder).
 fn nodes_to_svelte_render(nodes: &[HtmlNode], depth: usize) -> String {
     let indent = "  ".repeat(depth);
     let mut code = String::new();
@@ -747,18 +1061,207 @@ fn nodes_to_svelte_render(nodes: &[HtmlNode], depth: usize) -> String {
 
     if nodes.len() == 1 {
         code.push_str(&node_to_svelte_dom(&nodes[0], "root", depth));
-    } else {
-        code.push_str(&format!(
-            "{}root = document.createDocumentFragment();\n",
-            indent
-        ));
-        for (i, node) in nodes.iter().enumerate() {
-            let var = format!("child_{}", i);
-            code.push_str(&node_to_svelte_dom(node, &var, depth));
-            code.push_str(&format!("{}root.appendChild({});\n", indent, var));
-        }
+        return code;
     }
 
+    code.push_str(&format!(
+        "{}root = document.createDocumentFragment();\n",
+        indent
+    ));
+    let mut i = 0;
+    let mut child_idx = 0usize;
+    while i < nodes.len() {
+        let node = &nodes[i];
+        // Detect Svelte control-flow markers (parsed as text nodes).
+        if let HtmlNode::Text(t) = node {
+            let trimmed = t.trim();
+            if let Some(cond) = parse_svelte_if_open(trimmed) {
+                let (end_idx, else_idx) = find_svelte_if_block(nodes, i);
+                if let Some(end) = end_idx {
+                    let true_nodes = &nodes[i + 1..else_idx.unwrap_or(end)];
+                    let false_nodes = if let Some(ei) = else_idx {
+                        &nodes[ei + 1..end]
+                    } else {
+                        &[]
+                    };
+                    let frag_var = format!("__svelte_if_{}_{}", depth, i);
+                    code.push_str(&format!(
+                        "{}const {} = document.createDocumentFragment();\n",
+                        indent, frag_var
+                    ));
+                    code.push_str(&format!("{}if ({}) {{\n", indent, cond));
+                    code.push_str(&render_svelte_nodes_into(
+                        true_nodes,
+                        &frag_var,
+                        depth + 2,
+                        &format!("{}_t", frag_var),
+                    ));
+                    if !false_nodes.is_empty() {
+                        code.push_str(&format!("{}}} else {{\n", indent));
+                        code.push_str(&render_svelte_nodes_into(
+                            false_nodes,
+                            &frag_var,
+                            depth + 2,
+                            &format!("{}_f", frag_var),
+                        ));
+                    }
+                    code.push_str(&format!("{}}}\n", indent));
+                    code.push_str(&format!("{}root.appendChild({});\n", indent, frag_var));
+                    i = end + 1;
+                    continue;
+                }
+                // No matching close: fall through and render as ordinary text.
+            } else if let Some((list_expr, binding)) = parse_svelte_each_open(trimmed) {
+                if let Some(end) = find_svelte_each_block(nodes, i) {
+                    let each_nodes = &nodes[i + 1..end];
+                    let frag_var = format!("__svelte_each_{}_{}", depth, i);
+                    code.push_str(&format!(
+                        "{}const {} = document.createDocumentFragment();\n",
+                        indent, frag_var
+                    ));
+                    code.push_str(&format!(
+                        "{}({} || []).forEach(({}) => {{\n",
+                        indent, list_expr, binding
+                    ));
+                    code.push_str(&render_svelte_nodes_into(
+                        each_nodes,
+                        &frag_var,
+                        depth + 2,
+                        &format!("{}_n", frag_var),
+                    ));
+                    code.push_str(&format!("{}}});\n", indent));
+                    code.push_str(&format!("{}root.appendChild({});\n", indent, frag_var));
+                    i = end + 1;
+                    continue;
+                }
+            } else if trimmed.starts_with("{:else")
+                || trimmed.starts_with("{/if}")
+                || trimmed.starts_with("{/each}")
+            {
+                // Stray marker (e.g. from a malformed block); skip it.
+                i += 1;
+                continue;
+            }
+        }
+        let var = format!("child_{}", child_idx);
+        code.push_str(&node_to_svelte_dom(node, &var, depth));
+        code.push_str(&format!("{}root.appendChild({});\n", indent, var));
+        child_idx += 1;
+        i += 1;
+    }
+
+    code
+}
+
+/// Parse a `{#if cond}` marker, returning the condition expression.
+fn parse_svelte_if_open(text: &str) -> Option<String> {
+    let t = text.trim();
+    if t.starts_with("{#if ") && t.ends_with('}') {
+        Some(t[5..t.len() - 1].trim().to_string())
+    } else {
+        None
+    }
+}
+
+/// Parse a `{#each items as item}` marker, returning `(list_expr, binding)`.
+fn parse_svelte_each_open(text: &str) -> Option<(String, String)> {
+    let t = text.trim();
+    if t.starts_with("{#each ") && t.ends_with('}') {
+        let body = t[7..t.len() - 1].trim();
+        if let Some(idx) = body.find(" as ") {
+            let list = body[..idx].trim().to_string();
+            let binding = body[idx + 4..].trim().to_string();
+            return Some((list, binding));
+        }
+    }
+    None
+}
+
+/// Find the extent of a `{#if}` block starting at `start`.
+///
+/// Returns `(end_idx, else_idx)` where `end_idx` is the index of the matching
+/// `{/if}` marker and `else_idx` is the index of the `{:else}` marker (if any).
+fn find_svelte_if_block(nodes: &[HtmlNode], start: usize) -> (Option<usize>, Option<usize>) {
+    let mut depth: isize = 1;
+    let mut j = start + 1;
+    let mut else_idx = None;
+    let mut end_idx = None;
+    while j < nodes.len() {
+        if let HtmlNode::Text(t) = &nodes[j] {
+            let trimmed = t.trim();
+            if trimmed.starts_with("{#if") {
+                depth += 1;
+            } else if trimmed.starts_with("{:else if") || trimmed.starts_with("{:else}") {
+                // TODO: full `{:else if}` chains; for now the first else-family
+                // marker at depth 1 acts as the else boundary.
+                if depth == 1 && else_idx.is_none() {
+                    else_idx = Some(j);
+                }
+            } else if trimmed.starts_with("{/if}") {
+                depth -= 1;
+                if depth == 0 {
+                    end_idx = Some(j);
+                    break;
+                }
+            }
+        }
+        j += 1;
+    }
+    (end_idx, else_idx)
+}
+
+/// Find the matching `{/each}` for a `{#each}` block starting at `start`.
+fn find_svelte_each_block(nodes: &[HtmlNode], start: usize) -> Option<usize> {
+    let mut depth: isize = 1;
+    let mut j = start + 1;
+    while j < nodes.len() {
+        if let HtmlNode::Text(t) = &nodes[j] {
+            let trimmed = t.trim();
+            if trimmed.starts_with("{#each") {
+                depth += 1;
+            } else if trimmed.starts_with("{/each}") {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(j);
+                }
+            }
+        }
+        j += 1;
+    }
+    None
+}
+
+/// Render a slice of nodes into a container fragment variable.
+///
+/// Each node is created with a uniquely-prefixed variable name and appended to
+/// `container`. Svelte control-flow markers are skipped here (only one level
+/// of nesting is supported by `nodes_to_svelte_render`; deeper nesting is a
+/// TODO).
+fn render_svelte_nodes_into(
+    nodes: &[HtmlNode],
+    container: &str,
+    depth: usize,
+    prefix: &str,
+) -> String {
+    let indent = "  ".repeat(depth);
+    let mut code = String::new();
+    let mut idx = 0usize;
+    for node in nodes.iter() {
+        if let HtmlNode::Text(t) = node {
+            let trimmed = t.trim();
+            if trimmed.starts_with("{#")
+                || trimmed.starts_with("{:")
+                || trimmed.starts_with("{/")
+            {
+                // TODO: nested control flow inside {#if}/{#each}.
+                continue;
+            }
+        }
+        let var = format!("{}_{}", prefix, idx);
+        code.push_str(&node_to_svelte_dom(node, &var, depth));
+        code.push_str(&format!("{}{}.appendChild({});\n", indent, container, var));
+        idx += 1;
+    }
     code
 }
 
@@ -940,9 +1443,11 @@ export default {{
         code.push_str("\n// Astro HMR\nif (import.meta.hot) {\n  import.meta.hot.accept();\n}\n");
     }
 
+    let source_map = Some(super::utils::generate_source_map(file_path, source, &code));
+
     Ok(TransformOutput {
         code,
-        source_map: None,
+        source_map,
         css_modules: None,
         is_css: false,
         extracted_css,

@@ -328,6 +328,9 @@ pub struct AggregationGraph {
     nodes: DashMap<TaskId, AggregationNode>,
     /// G3.10: Set of tasks that have been queried — only these subtrees get aggregation nodes.
     queried: Mutex<HashSet<TaskId>>,
+    /// Whether a cycle has been detected in the dependency graph. Once set,
+    /// aggregation counts may be inaccurate for tasks involved in the cycle.
+    has_cycle: std::sync::atomic::AtomicBool,
 }
 
 impl AggregationGraph {
@@ -335,6 +338,7 @@ impl AggregationGraph {
         AggregationGraph {
             nodes: DashMap::new(),
             queried: Mutex::new(HashSet::new()),
+            has_cycle: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -425,6 +429,16 @@ impl AggregationGraph {
             remaining = next_remaining;
         }
 
+        // Cycle detection: if tasks remain unprocessed, a cycle exists in the
+        // queried subtree. Aggregation counts for these tasks will be stale.
+        if !remaining.is_empty() {
+            self.has_cycle.store(true, std::sync::atomic::Ordering::Relaxed);
+            tracing::error!(
+                "Cycle detected in aggregation graph (query_subtree): {} tasks remain unprocessed",
+                remaining.len()
+            );
+        }
+
         self.nodes.get(&task).map(|r| r.value().clone())
     }
 
@@ -436,6 +450,15 @@ impl AggregationGraph {
     /// G3.10: Returns true if a task has been queried (its subtree is materialized).
     pub fn is_queried(&self, task: &TaskId) -> bool {
         self.queried.lock().unwrap().contains(task)
+    }
+
+    /// Returns true if a cycle has been detected in the dependency graph.
+    ///
+    /// When a cycle is detected, aggregation counts for tasks involved in the
+    /// cycle may be inaccurate. The flag is set once and never cleared — if a
+    /// cycle was ever encountered, this will return true.
+    pub fn has_cycle(&self) -> bool {
+        self.has_cycle.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// G3.9: Incrementally rebuild only the affected aggregation nodes.
@@ -499,6 +522,16 @@ impl AggregationGraph {
             }
             remaining = next_remaining;
         }
+
+        // Cycle detection: if tasks remain unprocessed, a cycle exists among
+        // the affected tasks. Aggregation counts for these tasks will be stale.
+        if !remaining.is_empty() {
+            self.has_cycle.store(true, std::sync::atomic::Ordering::Relaxed);
+            tracing::error!(
+                "Cycle detected in aggregation graph (incremental_rebuild): {} tasks remain unprocessed",
+                remaining.len()
+            );
+        }
     }
 
     /// Recompute aggregation counts from the dependency graph.
@@ -531,6 +564,16 @@ impl AggregationGraph {
                 }
             }
             remaining = next_remaining;
+        }
+
+        // Cycle detection: if tasks remain unprocessed, a cycle exists in the
+        // dependency graph. Aggregation counts for these tasks will be stale.
+        if !remaining.is_empty() {
+            self.has_cycle.store(true, std::sync::atomic::Ordering::Relaxed);
+            tracing::error!(
+                "Cycle detected in aggregation graph: {} tasks remain unprocessed",
+                remaining.len()
+            );
         }
     }
 

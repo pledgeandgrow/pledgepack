@@ -61,7 +61,7 @@ fn route_path_from_file(path: &Path, base: &str) -> String {
     let parent = path.parent().and_then(|p| p.to_str()).unwrap_or("");
 
     // Normalize backslashes to forward slashes, then strip base prefix
-    let parent_normalized = parent.replace('\\', "/");
+    let parent_normalized = crate::normalize_path_str(parent);
     let route_segment = parent_normalized
         .strip_prefix(base)
         .unwrap_or(&parent_normalized)

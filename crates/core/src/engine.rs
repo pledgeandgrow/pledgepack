@@ -8,12 +8,14 @@ use crate::config::PledgeConfig;
 use crate::module::{ModuleId, ResolvedModule};
 use crate::module_graph::SerializableModuleGraph;
 use anyhow::{Result, bail};
+use dashmap::DashMap;
 use pledgepack_native_sys::Graph;
 use rayon::prelude::*;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tracing::{debug, info, warn};
 
 /// Read a file as a string, using memory-mapped I/O for large files (>64KB).
@@ -30,16 +32,122 @@ fn read_file_mmap(path: &std::path::Path) -> Result<String> {
     }
 }
 
-/// Read a file as bytes, using memory-mapped I/O for large files (>64KB).
-#[allow(dead_code)]
-fn read_file_bytes_mmap(path: &std::path::Path) -> Result<Vec<u8>> {
-    let file = std::fs::File::open(path)?;
-    let metadata = file.metadata()?;
-    if metadata.len() > 65536 {
-        let mmap = unsafe { memmap2::Mmap::map(&file)? };
-        Ok(mmap.as_ref().to_vec())
-    } else {
-        Ok(std::fs::read(path)?)
+/// Remove `<script ... src="{entry}">...</script>` tags from an HTML
+/// template for each of `entries` (matched with or without a leading `/`,
+/// since `entries` come from `config.entry` — typically written without one,
+/// e.g. `"src/index.tsx"` — while the template's own markup conventionally
+/// uses an absolute path, e.g. `src="/src/index.tsx"`).
+///
+/// Production HTML generation (see `emit()`) inserts a new `<script>` tag
+/// pointing at the built, hashed chunk for each entry; without this, the
+/// template's original dev-mode entry tag (loading the raw, untransformed
+/// source file) is left in place alongside it, producing a page that 404s
+/// trying to load a source path the production output never serves.
+fn remove_entry_script_tags(html: &str, entries: &[String]) -> String {
+    let mut html = html.to_string();
+    for entry in entries {
+        let trimmed = entry.trim_start_matches("./").trim_start_matches('/');
+        // Matches a self-closed-content `<script ...src="{entry}"...></script>`
+        // tag regardless of attribute order or whether the leading `/` is
+        // present in the markup.
+        let pattern = format!(
+            r#"(?s)<script\b[^>]*\bsrc\s*=\s*["']/?{}["'][^>]*>\s*</script>\s*\n?"#,
+            regex::escape(trimmed)
+        );
+        if let Ok(re) = Regex::new(&pattern) {
+            html = re.replace_all(&html, "").into_owned();
+        }
+    }
+    html
+}
+
+/// Maximum number of modules the engine will hold before bailing.
+/// Protects against unbounded memory growth on pathological builds.
+const MAX_MODULES: usize = 50_000;
+
+/// Module count at which we start warning about memory usage.
+const WARN_MODULES: usize = 10_000;
+
+// PRODUCTION-READINESS-100.md goal 91: `read_file_bytes_mmap` was removed
+// from here — zero call sites; `module_graph.rs` and `asset_pipeline.rs`
+// each have their own mmap-based readers already wired into real call paths.
+
+/// File-based lock guarding the output directory against concurrent builds.
+///
+/// Two `pledge build` processes writing to the same `out_dir` can corrupt
+/// each other's output (both wipe and recreate the directory). The lock
+/// file lives NEXT TO the output directory — not inside it — because emit()
+/// deletes and recreates `out_dir`, which would remove a lock placed within.
+///
+/// Acquisition is atomic via `create_new`, a lock older than
+/// [`OutputLock::STALE_AFTER`] is treated as abandoned (crashed build) and
+/// reclaimed, and the file is removed when the guard drops.
+struct OutputLock {
+    path: PathBuf,
+}
+
+impl OutputLock {
+    /// How old a lock must be before it is considered stale. A live build
+    /// finishes well within this window; a lock older than it was left
+    /// behind by a crashed or killed process.
+    const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(300);
+
+    /// Acquire the output lock for `out_dir`, or bail if another build
+    /// holds a fresh lock.
+    fn acquire(out_dir: &Path) -> Result<Self> {
+        let dir_name = out_dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "out".to_string());
+        let lock_path = out_dir
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(format!(".{}.pledge.lock", dir_name));
+
+        if let Some(parent) = lock_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        for attempt in 0..2 {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&lock_path)
+            {
+                Ok(mut file) => {
+                    use std::io::Write;
+                    let _ = writeln!(file, "pid {}", std::process::id());
+                    return Ok(Self { path: lock_path });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // A lock whose mtime is in the future (clock skew) is
+                    // treated as fresh — safer to bail than to corrupt a
+                    // concurrent build's output.
+                    let is_stale = std::fs::metadata(&lock_path)
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| t.elapsed().ok())
+                        .is_some_and(|age| age >= Self::STALE_AFTER);
+                    if is_stale && attempt == 0 {
+                        let _ = std::fs::remove_file(&lock_path);
+                        continue;
+                    }
+                    bail!(
+                        "Another build process appears to be running (lock file {}). \
+                         Delete it to force.",
+                        lock_path.display()
+                    );
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        unreachable!("lock retry loop always returns")
+    }
+}
+
+impl Drop for OutputLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
     }
 }
 
@@ -60,15 +168,34 @@ pub struct ManifestEntry {
     pub css: Option<String>,
 }
 
+/// A chunk of modules produced by the optimizer that should be emitted as a
+/// single output file. This mirrors `pledgepack_optimizer::Chunk` but lives in
+/// core to avoid a cyclic dependency (optimizer depends on core, not vice
+/// versa). The CLI converts optimizer chunks into this representation before
+/// passing them to `BuildEngine::emit_with_chunks`.
+#[derive(Debug, Clone)]
+pub struct EmitChunk {
+    /// Chunk identifier (e.g., "entry-0", "vendor", "shared")
+    pub id: String,
+    /// Module IDs that belong to this chunk
+    pub modules: Vec<ModuleId>,
+    /// Whether this is an entry chunk (vs. vendor/shared/async)
+    pub is_entry: bool,
+}
+
 pub struct BuildEngine {
     config: Arc<PledgeConfig>,
-    graph: Graph,
+    /// Zig-backed dependency graph. Wrapped in `Mutex` because `Graph` is
+    /// `Send` but not `Sync` — the mutex makes `BuildEngine` `Sync`.
+    graph: Mutex<Graph>,
     /// Map from file path to module ID
     path_to_id: HashMap<PathBuf, ModuleId>,
     /// Cached resolved modules
     modules: HashMap<ModuleId, ResolvedModule>,
-    /// Function-level cache (content hash → cached output)
-    function_cache: HashMap<u64, CachedOutput>,
+    /// Function-level cache (content hash → cached output).
+    /// `DashMap` provides interior mutability so readers don't need `&mut self`
+    /// and the map is safe to share across threads (`Sync`).
+    function_cache: DashMap<u64, CachedOutput>,
     /// Persistent function-level cache (disk-backed)
     persistent_cache: Option<pledgepack_cache::FunctionCache>,
     /// Remote cache for sharing across machines
@@ -161,12 +288,16 @@ impl BuildEngine {
 
         let is_incremental = previous_graph.is_some();
 
+        // Initialize the stack canary with a random value before any Zig
+        // native code (which uses stack protection) runs.
+        pledgepack_native_sys::init_stack_canary();
+
         Self {
             config,
-            graph: Graph::new(),
+            graph: Mutex::new(Graph::new()),
             path_to_id: HashMap::new(),
             modules: HashMap::new(),
-            function_cache: HashMap::new(),
+            function_cache: DashMap::new(),
             persistent_cache,
             remote_cache,
             module_graph: SerializableModuleGraph::new(),
@@ -247,7 +378,7 @@ document.addEventListener("click", function(e) {
                     std::fs::write(&entry_path, entry_code)?;
 
                     // Use the virtual entry as the build entry point
-                    let entry_str = entry_path.to_string_lossy().replace('\\', "/");
+                    let entry_str = crate::normalize_path(&entry_path);
                     auto_entries.push(entry_str);
 
                     tracing::info!(
@@ -392,10 +523,20 @@ document.addEventListener("click", function(e) {
         let mut modules_cached = 0usize;
         let mut pending_transforms: Vec<(ModuleId, ResolvedModule)> = Vec::new();
 
+        // Sort the initial queue by ModuleId for deterministic build ordering.
+        // Using FIFO (remove(0)) instead of LIFO (pop) ensures modules are
+        // processed in a stable, reproducible order across builds, which is
+        // critical for reproducible output hashes and cache keys.
         let mut queue: Vec<ModuleId> = self.path_to_id.values().copied().collect();
+        queue.sort_unstable();
+        queue.dedup();
         let mut processed = HashSet::new();
 
-        while let Some(module_id) = queue.pop() {
+        while !queue.is_empty() {
+            // Sort to maintain deterministic order after new deps are pushed.
+            queue.sort_unstable();
+            queue.dedup();
+            let module_id = queue.remove(0); // FIFO for deterministic ordering
             if processed.contains(&module_id) {
                 continue;
             }
@@ -418,7 +559,11 @@ document.addEventListener("click", function(e) {
             // Skip if already loaded from incremental cache
             if skip_set.contains(&module_id) {
                 modules_cached += 1;
-                if let Some(cached) = self.function_cache.get(&module.content_hash).cloned() {
+                if let Some(cached) = self
+                    .function_cache
+                    .get(&module.content_hash)
+                    .map(|r| r.value().clone())
+                {
                     for dep_path in &cached.deps {
                         let dep_id = self.resolve_and_add(dep_path, Some(&module.path))?;
                         queue.push(dep_id);
@@ -428,7 +573,11 @@ document.addEventListener("click", function(e) {
             }
 
             // Check function-level cache (memory first, then disk, then remote)
-            if let Some(cached) = self.function_cache.get(&cache_key).cloned() {
+            if let Some(cached) = self
+                .function_cache
+                .get(&cache_key)
+                .map(|r| r.value().clone())
+            {
                 modules_cached += 1;
                 for dep_path in &cached.deps {
                     let dep_id = self.resolve_and_add(dep_path, Some(&module.path))?;
@@ -495,6 +644,7 @@ document.addEventListener("click", function(e) {
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .unwrap_or_default()
                                     .as_secs(),
+                                version: pledgepack_cache::CACHE_FORMAT_VERSION,
                             },
                         );
                         for dep_path in &cached.deps {
@@ -526,7 +676,10 @@ document.addEventListener("click", function(e) {
 
             // Phase 3c: Populate caches from parallel results
             for (module_id, output) in parallel_results {
-                let module = self.modules.get(&module_id).unwrap();
+                let Some(module) = self.modules.get(&module_id) else {
+                    warn!("Module {:?} vanished between transform and cache write", module_id);
+                    continue;
+                };
                 let cache_key = module.content_hash;
 
                 if let Some(ref pc) = self.persistent_cache {
@@ -545,6 +698,7 @@ document.addEventListener("click", function(e) {
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or_default()
                                 .as_secs(),
+                            version: pledgepack_cache::CACHE_FORMAT_VERSION,
                         },
                     );
                 }
@@ -555,7 +709,7 @@ document.addEventListener("click", function(e) {
                         "transform",
                         module.path.to_string_lossy().as_ref(),
                     );
-                    let _ = rc.set(
+                    if let Err(e) = rc.set(
                         &rkey,
                         &pledgepack_cache::remote::RemoteCacheEntry {
                             code: output.code.clone(),
@@ -566,7 +720,9 @@ document.addEventListener("click", function(e) {
                                 .unwrap_or_default()
                                 .as_secs(),
                         },
-                    );
+                    ) {
+                        tracing::debug!("Remote cache store failed: {}", e);
+                    }
                 }
 
                 self.function_cache.insert(cache_key, output);
@@ -580,7 +736,10 @@ document.addEventListener("click", function(e) {
                     if let Ok(dep_path_resolved) = self.resolve(dep_path, Some(&module.path))
                         && let Some(&dep_id) = self.path_to_id.get(&dep_path_resolved)
                     {
-                        self.graph.add_dependency(module_id, dep_id);
+                        self.graph
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .add_dependency(module_id, dep_id);
                         self.module_graph.add_dependency(module_id, dep_id);
                     }
                 }
@@ -665,7 +824,11 @@ document.addEventListener("click", function(e) {
             return Ok(id);
         }
 
-        let id = self.graph.add_module(path.to_str().unwrap_or(""));
+        let id = self
+            .graph
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .add_module(path.to_str().unwrap_or(""));
         self.path_to_id.insert(path.clone(), id);
 
         // Read source via Zig I/O layer
@@ -689,6 +852,27 @@ document.addEventListener("click", function(e) {
         };
 
         self.modules.insert(id, module);
+
+        // Guard against unbounded memory growth: every resolved module's
+        // full source is kept in `self.modules` for the rest of the build.
+        let module_count = self.modules.len();
+        if module_count > MAX_MODULES {
+            bail!(
+                "Module count exceeded maximum ({}). This likely indicates a bug in module resolution.",
+                MAX_MODULES
+            );
+        }
+        // Warn on threshold crossings rather than every insertion past the
+        // limit, to avoid flooding the log on large builds.
+        if module_count == WARN_MODULES + 1
+            || (module_count > WARN_MODULES && module_count % WARN_MODULES == 0)
+        {
+            warn!(
+                "Large module count ({}). Consider increasing memory limits or splitting the build.",
+                module_count
+            );
+        }
+
         Ok(id)
     }
 
@@ -957,71 +1141,10 @@ document.addEventListener("click", function(e) {
         anyhow::bail!("Cannot resolve module: {}", specifier)
     }
 
-    /// Transform a single module (parse + compile)
-    #[allow(dead_code)]
-    async fn transform_module(&mut self, module: &ResolvedModule) -> Result<CachedOutput> {
-        let source_str = String::from_utf8_lossy(&module.source).to_string();
-
-        // Use SIMD scanning to find imports/exports
-        let import_offsets = pledgepack_native_sys::find_imports(&module.source);
-
-        // Extract dependency specifiers from import statements
-        let mut deps = Vec::new();
-        for offset in import_offsets {
-            // Find the string literal after 'import'
-            let rest = &source_str[offset..];
-            if let Some(dep) = extract_module_specifier(rest) {
-                deps.push(dep);
-            }
-        }
-
-        // Transform using Oxc (JSX → JS, TS type stripping, minification)
-        let is_production = self.config.mode == crate::config::BuildMode::Production;
-        let file_path = module.path.to_str().unwrap_or("");
-        let transform_output = crate::transform::transform(
-            &source_str,
-            module.kind,
-            file_path,
-            is_production,
-            &self.config,
-        )?;
-
-        // i18n-aware bundling: transform locale imports (#106)
-        let code = if self.config.i18n.enabled {
-            crate::i18n::transform_i18n_imports(&transform_output.code, &self.config.i18n)
-        } else {
-            transform_output.code
-        };
-
-        // i18n key extraction (#13): extract t('key') calls from TSX/TS/JSX
-        if self.config.i18n.enabled && self.config.i18n.extract {
-            let extraction = crate::i18n::extract_i18n_keys(&source_str, file_path);
-            for key in extraction.keys {
-                let key_str = key.key.clone();
-                self.i18n_catalog.keys.entry(key_str).or_default().push(key);
-            }
-        }
-
-        // Build-time string encryption (#109)
-        let code = if self.config.encrypt.enabled {
-            crate::encrypt::encrypt_strings(&code, &self.config.encrypt)
-                .map(|(c, _)| c)
-                .unwrap_or(code)
-        } else {
-            code
-        };
-
-        Ok(CachedOutput {
-            code,
-            source_map: transform_output.source_map,
-            deps,
-            is_css: transform_output.is_css,
-            css_modules: transform_output.css_modules,
-            extracted_css: transform_output.extracted_css,
-            is_worker: transform_output.is_worker,
-            dynamic_imports: transform_output.dynamic_imports,
-        })
-    }
+    // PRODUCTION-READINESS-100.md goal 91: the single-module `transform_module`
+    // async method was removed from here — zero call sites, fully superseded
+    // by `transform_modules_parallel` below (same transform/i18n/encrypt
+    // pipeline, run across all modules via rayon instead of one at a time).
 
     /// Transform multiple modules in parallel using rayon.
     /// Returns transformed outputs keyed by module ID.
@@ -1042,7 +1165,13 @@ document.addEventListener("click", function(e) {
                 rayon::ThreadPoolBuilder::new()
                     .num_threads(4)
                     .build()
-                    .unwrap()
+                    .unwrap_or_else(|_| {
+                        // Last resort: single-threaded pool — always works
+                        rayon::ThreadPoolBuilder::new()
+                            .num_threads(1)
+                            .build()
+                            .expect("single-threaded rayon pool must succeed")
+                    })
             });
 
         let results: Vec<
@@ -1138,9 +1267,10 @@ document.addEventListener("click", function(e) {
         Ok(outputs)
     }
 
-    /// Get the module graph (for dev server / HMR)
-    pub fn graph(&self) -> &Graph {
-        &self.graph
+    /// Get a locked reference to the module graph (for dev server / HMR).
+    /// Returns a `MutexGuard` — the lock is held for the guard's lifetime.
+    pub fn graph(&self) -> std::sync::MutexGuard<'_, Graph> {
+        self.graph.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Get all resolved modules
@@ -1188,13 +1318,364 @@ document.addEventListener("click", function(e) {
     }
 
     /// Get the function-level cache (transformed outputs)
-    pub fn function_cache(&self) -> &HashMap<u64, CachedOutput> {
+    pub fn function_cache(&self) -> &DashMap<u64, CachedOutput> {
         &self.function_cache
     }
 
     /// Get the extracted i18n translation catalog (#13)
     pub fn i18n_catalog(&self) -> &crate::i18n::TranslationCatalog {
         &self.i18n_catalog
+    }
+
+    /// Emit production build artifacts using optimizer-produced chunk groupings.
+    ///
+    /// Instead of writing each module as a separate file (the default `emit`
+    /// behavior), this method concatenates all modules in each chunk into a
+    /// single output file. This ensures the optimizer's code-splitting decisions
+    /// (vendor chunks, shared chunks, entry chunks) are reflected in the output.
+    ///
+    /// Falls back to per-module `emit()` when `chunks` is empty, preserving
+    /// backward compatibility for callers that don't use the optimizer.
+    pub fn emit_with_chunks(&self, chunks: &[EmitChunk]) -> Result<()> {
+        if chunks.is_empty() {
+            return self.emit();
+        }
+
+        let out_dir = &self.config.out_dir;
+        // Safety check: never delete the project root or source directories
+        if out_dir == &self.config.root {
+            anyhow::bail!("Output directory cannot be the same as project root");
+        }
+        // Acquire the output lock BEFORE wiping out_dir — two concurrent
+        // builds writing to the same directory would corrupt each other.
+        let _output_lock = OutputLock::acquire(out_dir)?;
+        if out_dir.exists() {
+            let canonical = out_dir.canonicalize().unwrap_or(out_dir.to_path_buf());
+            if canonical.parent().is_none() {
+                anyhow::bail!(
+                    "Refusing to delete unsafe output directory: {}",
+                    canonical.display()
+                );
+            }
+            std::fs::remove_dir_all(out_dir)?;
+        }
+        std::fs::create_dir_all(out_dir)?;
+
+        let mut css_files: Vec<String> = Vec::new();
+        let mut js_files: Vec<String> = Vec::new();
+        let mut async_chunks: Vec<String> = Vec::new();
+        let mut manifest_entries: std::collections::HashMap<String, ManifestEntry> =
+            std::collections::HashMap::new();
+        let mut entry_chunks: Vec<(String, String)> = Vec::new();
+
+        // Determine entry modules from config or auto-discovered entries
+        let entries: Vec<String> = if !self.auto_entries.is_empty() {
+            self.auto_entries.clone()
+        } else {
+            self.config.entry.clone()
+        };
+
+        // Emit each chunk as a single concatenated file
+        for chunk in chunks {
+            let mut chunk_content = String::new();
+            let mut chunk_css = String::new();
+            let mut has_css = false;
+            let mut chunk_dynamic_imports: Vec<String> = Vec::new();
+
+            for &module_id in &chunk.modules {
+                let module = match self.modules.get(&module_id) {
+                    Some(m) => m,
+                    None => continue,
+                };
+                if let Some(cached) = self.function_cache.get(&module.content_hash) {
+                    if cached.is_css {
+                        chunk_css.push_str(&cached.code);
+                        chunk_css.push('\n');
+                        has_css = true;
+                    } else {
+                        chunk_content.push_str(&cached.code);
+                        chunk_content.push('\n');
+                        // Collect dynamic imports for manifest
+                        for di in &cached.dynamic_imports {
+                            if !chunk_dynamic_imports.contains(di) {
+                                chunk_dynamic_imports.push(di.clone());
+                            }
+                        }
+                        // Extract CSS from JS modules
+                        if let Some(ref extracted_css) = cached.extracted_css {
+                            chunk_css.push_str(extracted_css);
+                            chunk_css.push('\n');
+                            has_css = true;
+                        }
+                    }
+                }
+            }
+
+            // Compute content hash for the chunk filename
+            let hash = blake3::hash(chunk_content.as_bytes());
+            let hash_hex = &hash.to_hex()[..8];
+            let chunk_filename = format!("{}.{}.js", chunk.id, hash_hex);
+            let chunk_path = out_dir.join(&chunk_filename);
+            let chunk_rel = crate::normalize_path_str(&chunk_filename);
+
+            // Create parent directories
+            if let Some(parent) = chunk_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+
+            // Write the chunk file
+            write_output_file(&chunk_path, &chunk_content)?;
+            tracing::info!(
+                "Emitted chunk: {} ({} modules)",
+                chunk_path.display(),
+                chunk.modules.len()
+            );
+
+            // Write source map if present (use first module's source map)
+            if let Some(first_module_id) = chunk.modules.first()
+                && let Some(module) = self.modules.get(first_module_id)
+                && let Some(cached) = self.function_cache.get(&module.content_hash)
+                && let Some(ref source_map) = cached.source_map
+            {
+                let mode = &self.config.build.source_map_mode;
+                if mode != "hidden" {
+                    let map_path = chunk_path.with_extension("js.map");
+                    std::fs::write(&map_path, source_map)?;
+                }
+            }
+
+            // Write extracted CSS as a separate file if any
+            if has_css && !chunk_css.is_empty() {
+                let css_hash = blake3::hash(chunk_css.as_bytes());
+                let css_hash_hex = &css_hash.to_hex()[..8];
+                let css_filename = format!("{}.{}.css", chunk.id, css_hash_hex);
+                let css_path = out_dir.join(&css_filename);
+                let css_rel = crate::normalize_path_str(&css_filename);
+                std::fs::write(&css_path, &chunk_css)?;
+                css_files.push(css_rel.clone());
+                tracing::info!("Emitted chunk CSS: {}", css_path.display());
+            }
+
+            let is_entry = chunk.is_entry;
+            let is_async = !chunk_dynamic_imports.is_empty()
+                && !self.config.build.inline_dynamic_imports
+                && !is_entry;
+
+            if is_async {
+                async_chunks.push(chunk_rel.clone());
+            } else {
+                js_files.push(chunk_rel.clone());
+            }
+
+            if is_entry {
+                // Use chunk id as the entry name for HTML script tags
+                entry_chunks.push((chunk.id.clone(), chunk_rel.clone()));
+            }
+
+            manifest_entries.insert(
+                chunk.id.clone(),
+                ManifestEntry {
+                    file: chunk_rel.clone(),
+                    is_entry,
+                    is_css: false,
+                    is_async,
+                    imports: if !is_async {
+                        chunk_dynamic_imports.clone()
+                    } else {
+                        Vec::new()
+                    },
+                    css: if has_css {
+                        css_files.last().cloned()
+                    } else {
+                        None
+                    },
+                },
+            );
+        }
+
+        // Generate manifest.json with entry-to-chunk mapping
+        let manifest_json = serde_json::to_string_pretty(&manifest_entries)?;
+        std::fs::write(out_dir.join("manifest.json"), manifest_json)?;
+
+        // Write i18n translation catalog if enabled
+        if self.config.i18n.enabled && self.config.i18n.extract && !self.i18n_catalog.is_empty() {
+            let catalog_path = out_dir.join("i18n-catalog.json");
+            std::fs::write(&catalog_path, self.i18n_catalog.to_json())?;
+            info!(
+                "i18n: extracted {} translation keys → {}",
+                self.i18n_catalog.len(),
+                catalog_path.display()
+            );
+        }
+
+        // Generate index.html with CSS links and module script tags for entry chunks
+        let css_links: String = css_files
+            .iter()
+            .map(|css| {
+                format!(
+                    r#"    <link rel="stylesheet" href="{}" />"#,
+                    self.config.asset_url(css)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Module preload directives — strategy-based (#52)
+        let module_preloads: String = match self.config.build.preload_strategy.as_str() {
+            "manual" => String::new(),
+            "eager" => {
+                let mut chunks_to_preload: Vec<&String> = Vec::new();
+                for (_, hashed) in &entry_chunks {
+                    chunks_to_preload.push(hashed);
+                }
+                for chunk in &async_chunks {
+                    if !chunks_to_preload.contains(&chunk) {
+                        chunks_to_preload.push(chunk);
+                    }
+                }
+                if self.config.build.module_preload {
+                    chunks_to_preload
+                        .iter()
+                        .map(|chunk| {
+                            format!(
+                                r#"    <link rel="modulepreload" href="{}" />"#,
+                                self.config.asset_url(chunk)
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                } else {
+                    String::new()
+                }
+            }
+            _ => {
+                if self.config.build.module_preload {
+                    entry_chunks
+                        .iter()
+                        .map(|(_, hashed)| {
+                            format!(
+                                r#"    <link rel="modulepreload" href="{}" />"#,
+                                self.config.asset_url(hashed)
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                } else {
+                    String::new()
+                }
+            }
+        };
+
+        // Build script tags for entry chunks
+        let script_tags: String = if entry_chunks.is_empty() {
+            if entries.is_empty() {
+                tracing::warn!("No entry points configured — skipping script tag generation");
+                String::new()
+            } else {
+                let entry = &entries[0];
+                let entry_js = entry
+                    .replace(".tsx", ".js")
+                    .replace(".ts", ".js")
+                    .replace(".jsx", ".js");
+                let entry_hashed = manifest_entries
+                    .values()
+                    .find(|m| m.is_entry)
+                    .map(|m| m.file.clone())
+                    .unwrap_or(entry_js);
+                format!(
+                    r#"    <script type="module" src="{}"></script>"#,
+                    self.config.asset_url(&entry_hashed)
+                )
+            }
+        } else {
+            entry_chunks
+                .iter()
+                .map(|(_, hashed)| {
+                    format!(
+                        r#"    <script type="module" src="{}"></script>"#,
+                        self.config.asset_url(hashed)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        // Use project's index.html as template if it exists, otherwise generate default
+        let project_html_path = self.config.root.join("index.html");
+        let html = if project_html_path.exists() {
+            if let Ok(template) = std::fs::read_to_string(&project_html_path) {
+                // Strip the dev-mode entry `<script src="...">` tag(s) — the
+                // template's index.html references the raw source entry
+                // (e.g. `src="/src/index.tsx"`, transformed on the fly by
+                // the dev server) so it can't be left in a production build:
+                // the built output doesn't serve `/src/*` at all, and even
+                // if it did, unstripped TSX isn't valid browser JS. Without
+                // this, the emitted HTML below both this raw-source tag
+                // (untouched) *and* the new hashed chunk's script tag,
+                // producing a broken page that 404s trying to load the
+                // former.
+                let template = remove_entry_script_tags(&template, &entries);
+                let mut html = template;
+                let has_head = html.contains("</head>");
+                let has_body = html.contains("</body>");
+
+                if !css_links.is_empty() {
+                    let injection = format!("{}\n", css_links);
+                    if let Some(pos) = html.rfind("</head>") {
+                        html.insert_str(pos, &injection);
+                    } else if !has_head {
+                        html.push_str(&injection);
+                    }
+                }
+                if !module_preloads.is_empty() {
+                    let injection = format!("{}\n", module_preloads);
+                    if let Some(pos) = html.rfind("</head>") {
+                        html.insert_str(pos, &injection);
+                    } else if !has_head {
+                        html.push_str(&injection);
+                    }
+                }
+                if !script_tags.is_empty() {
+                    let injection = format!("{}\n", script_tags);
+                    if let Some(pos) = html.rfind("</body>") {
+                        html.insert_str(pos, &injection);
+                    } else if !has_body {
+                        html.push_str(&injection);
+                    }
+                }
+                html
+            } else {
+                Self::generate_default_html(&css_links, &module_preloads, &script_tags)
+            }
+        } else {
+            Self::generate_default_html(&css_links, &module_preloads, &script_tags)
+        };
+
+        let html_path = out_dir.join("index.html");
+        std::fs::write(&html_path, html)?;
+        info!("Generated: {}", html_path.display());
+
+        Ok(())
+    }
+
+    /// Generate a default index.html when the project doesn't have one.
+    fn generate_default_html(css_links: &str, module_preloads: &str, script_tags: &str) -> String {
+        let mut html = String::from("<!DOCTYPE html>\n<html>\n  <head>\n    <meta charset=\"utf-8\" />\n");
+        if !css_links.is_empty() {
+            html.push_str(css_links);
+            html.push('\n');
+        }
+        if !module_preloads.is_empty() {
+            html.push_str(module_preloads);
+            html.push('\n');
+        }
+        html.push_str("  </head>\n  <body>\n    <div id=\"root\"></div>\n");
+        if !script_tags.is_empty() {
+            html.push_str(script_tags);
+            html.push('\n');
+        }
+        html.push_str("  </body>\n</html>\n");
+        html
     }
 
     /// Emit production build artifacts to the output directory.
@@ -1208,6 +1689,8 @@ document.addEventListener("click", function(e) {
         if out_dir == &self.config.root {
             anyhow::bail!("Output directory cannot be the same as project root");
         }
+        // Acquire the output lock BEFORE wiping out_dir (see emit_with_chunks).
+        let _output_lock = OutputLock::acquire(out_dir)?;
         // Safety: refuse to delete root or filesystem root
         if out_dir.exists() {
             let canonical = out_dir.canonicalize().unwrap_or(out_dir.to_path_buf());
@@ -1257,11 +1740,7 @@ document.addEventListener("click", function(e) {
                         .unwrap_or("index");
                     let hashed_name = format!("{}.{}.css", stem, hash_hex);
                     let p = out_path.with_file_name(hashed_name);
-                    let rel = p
-                        .strip_prefix(out_dir)
-                        .unwrap_or(&p)
-                        .to_string_lossy()
-                        .replace('\\', "/");
+                    let rel = crate::normalize_path(p.strip_prefix(out_dir).unwrap_or(&p));
                     (p, rel, true)
                 } else {
                     let stem = out_path
@@ -1270,11 +1749,7 @@ document.addEventListener("click", function(e) {
                         .unwrap_or("index");
                     let hashed_name = format!("{}.{}.js", stem, hash_hex);
                     let p = out_path.with_file_name(hashed_name);
-                    let rel = p
-                        .strip_prefix(out_dir)
-                        .unwrap_or(&p)
-                        .to_string_lossy()
-                        .replace('\\', "/");
+                    let rel = crate::normalize_path(p.strip_prefix(out_dir).unwrap_or(&p));
                     (p, rel, false)
                 };
 
@@ -1284,9 +1759,9 @@ document.addEventListener("click", function(e) {
                 }
 
                 // Compute entry/async status early (needed for incremental output check)
-                let original_rel = rel.to_string_lossy().replace('\\', "/");
+                let original_rel = crate::normalize_path(rel);
                 let is_entry = entries.iter().any(|e| {
-                    let entry_normalized = e.replace('\\', "/");
+                    let entry_normalized = crate::normalize_path_str(e);
                     original_rel == *e
                         || original_rel == entry_normalized
                         || original_rel.ends_with(&entry_normalized)
@@ -1389,11 +1864,9 @@ document.addEventListener("click", function(e) {
                             .unwrap_or("index");
                         let css_name = format!("{}.{}.css", css_stem, css_hash_hex);
                         let css_out_path = out_path.with_file_name(css_name);
-                        let css_rel = css_out_path
-                            .strip_prefix(out_dir)
-                            .unwrap_or(&css_out_path)
-                            .to_string_lossy()
-                            .replace('\\', "/");
+                        let css_rel = crate::normalize_path(
+                            css_out_path.strip_prefix(out_dir).unwrap_or(&css_out_path),
+                        );
                         std::fs::write(&css_out_path, extracted_css)?;
                         css_files.push(css_rel.clone());
                         tracing::info!("Extracted CSS: {}", css_out_path.display());
@@ -1460,7 +1933,7 @@ document.addEventListener("click", function(e) {
                 let glob_set = glob_builder.build().unwrap_or_default();
                 for module in self.modules.values() {
                     if let Some(cached) = self.function_cache.get(&module.content_hash) {
-                        let path_str = module.path.to_string_lossy().replace('\\', "/");
+                        let path_str = crate::normalize_path(&module.path);
                         if glob_set.is_match(&path_str)
                             || module_patterns
                                 .iter()
@@ -1479,11 +1952,8 @@ document.addEventListener("click", function(e) {
                                 .unwrap_or("index");
                             let hashed_name = format!("{}.{}.js", stem, hash_hex);
                             let p = out_path.with_file_name(hashed_name);
-                            let hashed_rel = p
-                                .strip_prefix(out_dir)
-                                .unwrap_or(&p)
-                                .to_string_lossy()
-                                .replace('\\', "/");
+                            let hashed_rel =
+                                crate::normalize_path(p.strip_prefix(out_dir).unwrap_or(&p));
                             chunk_modules.push(hashed_rel);
                         }
                     }
@@ -1718,6 +2188,12 @@ document.addEventListener("click", function(e) {
         let project_html_path = self.config.root.join("index.html");
         let html = if project_html_path.exists() {
             if let Ok(template) = std::fs::read_to_string(&project_html_path) {
+                // Strip the dev-mode entry `<script src="...">` tag(s) before
+                // injecting the built, hashed chunk's — see the identical
+                // fix's doc comment on `remove_entry_script_tags` above for
+                // why this is necessary (PRODUCTION-READINESS-100.md: found
+                // via an actual end-to-end `pledge build` smoke test).
+                let template = remove_entry_script_tags(&template, &entries);
                 // Inject CSS links and script tags into the custom template
                 let mut html = template;
                 let has_head = html.contains("</head>");
@@ -1953,6 +2429,8 @@ document.addEventListener("click", function(e) {
         if out_dir == &self.config.root {
             anyhow::bail!("Output directory cannot be the same as project root");
         }
+        // Acquire the output lock BEFORE wiping out_dir (see emit_with_chunks).
+        let _output_lock = OutputLock::acquire(out_dir)?;
         if out_dir.exists() {
             // Safety: refuse to delete root, home, or empty paths
             let canonical = out_dir.canonicalize().unwrap_or(out_dir.to_path_buf());
@@ -2066,7 +2544,11 @@ document.addEventListener("click", function(e) {
     /// Invalidate modules that depend on a changed file
     pub fn invalidate(&mut self, changed_path: &PathBuf) -> Vec<ModuleId> {
         if let Some(&id) = self.path_to_id.get(changed_path) {
-            let dependents = self.graph.get_dependents(id, 256);
+            let dependents = self
+                .graph
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_all_dependents(id);
 
             // Remove from function cache
             if let Some(module) = self.modules.get(&id) {
@@ -2090,70 +2572,22 @@ document.addEventListener("click", function(e) {
     }
 }
 
-/// Write output file using memory-mapped I/O for large files.
-/// Falls back to standard buffered write for files below the mmap threshold.
+/// Write output file to disk.
 ///
-/// mmap threshold: 64KB — files smaller than this use std::fs::write
-/// which is faster for small files due to fewer syscalls.
+/// This previously used `MAP_SHARED` mmap for large files, but that path did
+/// not verify that dirty pages were flushed before the mapping was torn down
+/// (`munmap` does flush, but a `msync(MS_SYNC)` check was missing and error
+/// handling was incomplete). The simpler, safer approach — buffered
+/// `write_all` followed by `sync_all` — is used for all sizes. For typical
+/// bundle output sizes the kernel write-back cache makes this plenty fast,
+/// and it guarantees durability via `sync_all`.
 fn write_output_file(path: &std::path::Path, content: &str) -> Result<()> {
-    const MMAP_THRESHOLD: usize = 64 * 1024; // 64KB
+    use std::io::Write;
 
-    if content.len() < MMAP_THRESHOLD {
-        std::fs::write(path, content)?;
-        return Ok(());
-    }
-
-    // For large files: create the file, truncate to content size, then mmap + copy
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(path)?;
-
-    file.set_len(content.len() as u64)?;
-
-    // Use mmap to write directly — avoids an extra copy through the kernel buffer
-    #[cfg(unix)]
-    unsafe {
-        use std::os::unix::io::AsRawFd;
-        use std::ptr;
-        let ptr = libc::mmap(
-            ptr::null_mut(),
-            content.len(),
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_SHARED,
-            file.as_raw_fd(),
-            0,
-        );
-        if ptr == libc::MAP_FAILED {
-            // Fall back to standard write
-            drop(file);
-            std::fs::write(path, content)?;
-            return Ok(());
-        }
-        std::ptr::copy_nonoverlapping(content.as_ptr(), ptr as *mut u8, content.len());
-        libc::munmap(ptr, content.len());
-    }
-
-    #[cfg(windows)]
-    {
-        // On Windows, write to the already-opened file handle.
-        // A full mmap implementation would use CreateFileMapping + MapViewOfFile
-        // via the windows-sys crate, but buffered write is sufficient
-        // since the file is already created and truncated to the right size.
-        use std::io::Write;
-        let mut f = file;
-        f.write_all(content.as_bytes())?;
-        f.flush()?;
-    }
-
-    #[cfg(not(any(unix, windows)))]
-    {
-        drop(file);
-        std::fs::write(path, content)?;
-    }
-
+    let mut file = std::fs::File::create(path)?;
+    file.write_all(content.as_bytes())?;
+    file.flush()?;
+    file.sync_all()?;
     Ok(())
 }
 
@@ -2206,6 +2640,57 @@ mod tests {
         assert_eq!(
             extract_module_specifier("import('./lazy')"),
             Some("./lazy".to_string())
+        );
+    }
+
+    // Regression test for a real bug found via an end-to-end `pledge build`
+    // smoke test (2026-09-15, see PRODUCTION-READINESS-100.md): production
+    // HTML generation injected the built, hashed entry chunk's <script> tag
+    // but never removed the template's original dev-mode entry <script>
+    // (which points at the raw, untransformed source file) — producing a
+    // page with two script tags, one of which 404s / fails MIME-type
+    // checking in a real browser since production output never serves the
+    // raw source tree.
+    #[test]
+    fn remove_entry_script_tags_strips_the_dev_mode_entry_reference() {
+        let template = r#"<!DOCTYPE html>
+<html>
+<head><title>app</title></head>
+<body>
+    <div id="root"></div>
+    <script type="module" src="/src/index.tsx"></script>
+</body>
+</html>"#;
+        let entries = vec!["src/index.tsx".to_string()];
+        let result = remove_entry_script_tags(template, &entries);
+        assert!(
+            !result.contains("src/index.tsx"),
+            "the raw source entry script tag should be fully removed, got:\n{result}"
+        );
+        assert!(result.contains("<div id=\"root\"></div>"));
+    }
+
+    #[test]
+    fn remove_entry_script_tags_matches_with_and_without_leading_slash() {
+        let template =
+            r#"<body><script type="module" src="src/index.tsx"></script></body>"#;
+        let entries = vec!["/src/index.tsx".to_string()];
+        let result = remove_entry_script_tags(template, &entries);
+        assert!(!result.contains("script"));
+    }
+
+    #[test]
+    fn remove_entry_script_tags_leaves_unrelated_scripts_alone() {
+        let template = r#"<body>
+    <script type="module" src="/src/index.tsx"></script>
+    <script src="/analytics.js"></script>
+</body>"#;
+        let entries = vec!["src/index.tsx".to_string()];
+        let result = remove_entry_script_tags(template, &entries);
+        assert!(!result.contains("index.tsx"));
+        assert!(
+            result.contains("/analytics.js"),
+            "unrelated script tags must not be touched, got:\n{result}"
         );
     }
 }

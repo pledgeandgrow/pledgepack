@@ -428,10 +428,7 @@ fn find_file(dir: &Path, candidates: &[&str]) -> Option<PathBuf> {
 
 /// Get a path relative to the root, with forward slashes
 fn relative_path(root: &Path, path: &Path) -> String {
-    path.strip_prefix(root)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .replace('\\', "/")
+    crate::normalize_path(path.strip_prefix(root).unwrap_or(path))
 }
 
 impl RouteTable {

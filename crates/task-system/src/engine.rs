@@ -58,24 +58,29 @@ pub struct SchedulerCheckpoint {
 /// Uses `std::sync` primitives internally — works with any async runtime or
 /// no runtime at all (e.g., `poll_fn` + manual polling).
 ///
-/// Single-use semantics: `notified()` returns a future that completes when
-/// `notify_waiters()` is called. The Notify is typically discarded after one use.
+/// Multi-waker semantics: `notified()` returns a future that completes when
+/// `notify_waiters()` is called. Unlike the previous single-waker design,
+/// all waiters are woken, so multiple coroutines waiting on the same task
+/// are all notified when computation finishes. The Notify is typically
+/// discarded after one use.
 struct Notify {
     completed: AtomicBool,
-    waker: Mutex<Option<std::task::Waker>>,
+    wakers: Mutex<Vec<std::task::Waker>>,
 }
 
 impl Notify {
     fn new() -> Self {
         Notify {
             completed: AtomicBool::new(false),
-            waker: Mutex::new(None),
+            wakers: Mutex::new(Vec::new()),
         }
     }
 
     fn notify_waiters(&self) {
         self.completed.store(true, Ordering::Release);
-        if let Some(waker) = self.waker.lock().unwrap().take() {
+        // Wake all waiters, not just the last one registered.
+        let wakers = std::mem::take(&mut *self.wakers.lock().unwrap_or_else(|e| e.into_inner()));
+        for waker in wakers {
             waker.wake();
         }
     }
@@ -85,7 +90,8 @@ impl Notify {
             if self.completed.load(Ordering::Acquire) {
                 std::task::Poll::Ready(())
             } else {
-                *self.waker.lock().unwrap() = Some(cx.waker().clone());
+                // Register this waker alongside any other waiters.
+                self.wakers.lock().unwrap_or_else(|e| e.into_inner()).push(cx.waker().clone());
                 std::task::Poll::Pending
             }
         })
@@ -101,8 +107,10 @@ pub enum TaskError {
     ComputationFailed(String),
     #[error("Task output deserialization failed: {0}")]
     DeserializationFailed(String),
-    #[error("Task cycle detected: {0}")]
-    CycleDetected(String),
+    #[error("Task cycle detected among {tasks:?}")]
+    CycleDetected {
+        tasks: Vec<crate::task::TaskId>,
+    },
     #[error("Backend error: {0}")]
     BackendError(String),
     #[error("Determinism violation for task {task_id}:\n{diff}")]
@@ -369,7 +377,7 @@ impl TaskEngine {
         }
 
         // Restore active queries
-        let mut queries = self.active_queries.write().unwrap();
+        let mut queries = self.active_queries.write().unwrap_or_else(|e| e.into_inner());
         queries.clear();
         for (id, roots_hex) in &cp.active_queries {
             let roots: Vec<TaskId> = roots_hex
@@ -492,13 +500,13 @@ impl TaskEngine {
     pub fn register_query(&self, roots: Vec<TaskId>) -> u64 {
         let id = self.next_query_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let query = ActiveQuery { id, roots };
-        self.active_queries.write().unwrap().insert(id, query);
+        self.active_queries.write().unwrap_or_else(|e| e.into_inner()).insert(id, query);
         id
     }
 
     /// Unregister an active query.
     pub fn unregister_query(&self, query_id: u64) {
-        self.active_queries.write().unwrap().remove(&query_id);
+        self.active_queries.write().unwrap_or_else(|e| e.into_inner()).remove(&query_id);
     }
 
     /// Read a task's output, scheduling it (and its dependencies) if needed.
@@ -637,9 +645,9 @@ impl TaskEngine {
     async fn compute_task(&self, id: TaskId) -> Result<(), TaskError> {
         // Check if another coroutine is already computing this task
         let notify = {
-            let computing = self.computing.lock().unwrap();
+            let computing = self.computing.lock().unwrap_or_else(|e| e.into_inner());
             if computing.contains(&id) {
-                let notifies = self.task_notify.lock().unwrap();
+                let notifies = self.task_notify.lock().unwrap_or_else(|e| e.into_inner());
                 notifies.get(&id).cloned()
             } else {
                 None
@@ -652,15 +660,15 @@ impl TaskEngine {
 
         // Mark as computing
         let notify = {
-            let mut computing = self.computing.lock().unwrap();
+            let mut computing = self.computing.lock().unwrap_or_else(|e| e.into_inner());
             if computing.contains(&id) {
                 // Race: another coroutine started computing while we were waiting
-                let notifies = self.task_notify.lock().unwrap();
+                let notifies = self.task_notify.lock().unwrap_or_else(|e| e.into_inner());
                 notifies.get(&id).cloned()
             } else {
                 computing.insert(id);
                 let notify = Arc::new(Notify::new());
-                self.task_notify.lock().unwrap().insert(id, notify);
+                self.task_notify.lock().unwrap_or_else(|e| e.into_inner()).insert(id, notify);
                 None // We're the one computing — don't wait, proceed
             }
         };
@@ -696,8 +704,17 @@ impl TaskEngine {
         let mut output = result.await;
 
         // G11.4 + G11.5: Determinism verification — double-execute and compare.
-        if self.verify_determinism && output.is_ok() {
-            let first_output = output.as_ref().unwrap().clone();
+        //
+        // PRODUCTION-READINESS-100.md goal 22 flagged the `output.as_ref().unwrap()`
+        // this used to be as an unguarded assumption; it was actually safe (the
+        // surrounding `if` already checked `output.is_ok()`), but a
+        // pattern-matched `let` makes that guarantee structural instead of
+        // depending on the condition and the unwrap staying in sync across
+        // future edits.
+        if self.verify_determinism
+            && let Ok(ref first_ok) = output
+        {
+            let first_output = first_ok.clone();
             let result2 = environment::with_environment(Environment::Shared, || {
                 self.registry.execute(&id, self)
             });
@@ -740,7 +757,7 @@ impl TaskEngine {
 
             // Update the file read index for invalidation
             if !reads.is_empty() {
-                let mut index = self.read_index.write().unwrap();
+                let mut index = self.read_index.write().unwrap_or_else(|e| e.into_inner());
                 for path_str in &reads {
                     let path = PathBuf::from(path_str);
                     index.entry(path).or_default().insert(id);
@@ -796,8 +813,8 @@ impl TaskEngine {
 
         // Notify waiters
         {
-            self.computing.lock().unwrap().remove(&id);
-            let notify = self.task_notify.lock().unwrap().remove(&id);
+            self.computing.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
+            let notify = self.task_notify.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
             if let Some(notify) = notify {
                 notify.notify_waiters();
             }
@@ -829,7 +846,7 @@ impl TaskEngine {
     pub fn invalidate_file(&self, path: &std::path::Path) -> usize {
         let mut count = 0;
         let tasks_to_invalidate: Vec<TaskId> = {
-            let index = self.read_index.read().unwrap();
+            let index = self.read_index.read().unwrap_or_else(|e| e.into_inner());
             index.get(path).cloned().unwrap_or_default().into_iter().collect()
         };
 
@@ -864,7 +881,7 @@ impl TaskEngine {
 
     /// Get the file read index (for debugging/inspection).
     pub fn read_index(&self) -> HashMap<PathBuf, HashSet<TaskId>> {
-        self.read_index.read().unwrap().clone()
+        self.read_index.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// Get all dirty tasks that are covered by an active query.
@@ -872,7 +889,7 @@ impl TaskEngine {
     /// This is the demand-driven part: we only schedule tasks that are both
     /// dirty AND needed by an active query.
     pub fn dirty_tasks_for_active_queries(&self) -> HashSet<TaskId> {
-        let queries = self.active_queries.read().unwrap();
+        let queries = self.active_queries.read().unwrap_or_else(|e| e.into_inner());
         let mut needed: HashSet<TaskId> = HashSet::new();
 
         for query in queries.values() {
@@ -906,9 +923,9 @@ impl TaskEngine {
     /// This is a topological sort of the dirty tasks, grouped by "wave":
     /// - Wave 0: tasks with no dirty dependencies
     /// - Wave N: tasks whose dirty dependencies are all in waves 0..N-1
-    pub fn batch_schedule(&self, dirty_tasks: &HashSet<TaskId>) -> Vec<Vec<TaskId>> {
+    pub fn batch_schedule(&self, dirty_tasks: &HashSet<TaskId>) -> Result<Vec<Vec<TaskId>>, TaskError> {
         if dirty_tasks.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         let mut remaining: HashSet<TaskId> = dirty_tasks.iter().copied().collect();
@@ -933,14 +950,15 @@ impl TaskEngine {
                 .collect();
 
             if ready.is_empty() {
-                // Circular dependency among remaining dirty tasks
-                // Break the cycle by putting all remaining in one batch
-                tracing::warn!(
-                    "Cycle detected among {} dirty tasks, scheduling them together",
+                // Circular dependency among remaining dirty tasks — return an error
+                // instead of silently scheduling them together.
+                error!(
+                    "Cycle detected among {} dirty tasks",
                     remaining.len()
                 );
-                batches.push(remaining.iter().copied().collect());
-                break;
+                return Err(TaskError::CycleDetected {
+                    tasks: remaining.iter().copied().collect(),
+                });
             }
 
             for id in &ready {
@@ -949,7 +967,7 @@ impl TaskEngine {
             batches.push(ready);
         }
 
-        batches
+        Ok(batches)
     }
 
     /// G4.5: Priority scheduling — tasks closer to root first.
@@ -960,8 +978,8 @@ impl TaskEngine {
     /// closer to the final output, so errors are discovered sooner.
     ///
     /// Returns a flat Vec of task IDs in priority order (highest priority first).
-    pub fn priority_schedule(&self, dirty_tasks: &HashSet<TaskId>) -> Vec<TaskId> {
-        let batches = self.batch_schedule(dirty_tasks);
+    pub fn priority_schedule(&self, dirty_tasks: &HashSet<TaskId>) -> Result<Vec<TaskId>, TaskError> {
+        let batches = self.batch_schedule(dirty_tasks)?;
 
         // Compute depth for each task (distance from root).
         // Root tasks (no dependents) have depth 0.
@@ -981,7 +999,7 @@ impl TaskEngine {
             });
             result.extend(batch);
         }
-        result
+        Ok(result)
     }
 
     /// G4.5: Compute the depth of a task in the dependency graph.
@@ -1031,7 +1049,7 @@ impl TaskEngine {
         // Collect tasks near active query roots — these are likely to be needed
         let mut proximity_set: HashSet<TaskId> = HashSet::new();
         {
-            let queries = self.active_queries.read().unwrap();
+            let queries = self.active_queries.read().unwrap_or_else(|e| e.into_inner());
             for query in queries.values() {
                 for &root in &query.roots {
                     // Add the root and its transitive deps
@@ -1658,7 +1676,7 @@ mod tests {
         assert!(dirty.contains(&task_b));
         assert!(dirty.contains(&task_c));
 
-        let batches = engine.batch_schedule(&dirty);
+        let batches = engine.batch_schedule(&dirty).unwrap();
         // Batch 0 should contain A and B (independent)
         // Batch 1 should contain C (depends on A)
         assert_eq!(batches.len(), 2, "Should have 2 batches");
@@ -1672,7 +1690,7 @@ mod tests {
     fn batch_schedule_empty_returns_empty() {
         let registry = TaskRegistry::new();
         let engine = TaskEngine::new(registry, TaskBackend::new(MemoryBackend::new()));
-        let batches = engine.batch_schedule(&HashSet::new());
+        let batches = engine.batch_schedule(&HashSet::new()).unwrap();
         assert!(batches.is_empty());
     }
 
@@ -1713,7 +1731,7 @@ mod tests {
 
         // Mark all as dirty
         let dirty: HashSet<TaskId> = vec![root, mid, leaf1, leaf2].into_iter().collect();
-        let scheduled = engine.priority_schedule(&dirty);
+        let scheduled = engine.priority_schedule(&dirty).unwrap();
 
         // Root (depth 0) should come before mid (depth 1) should come before leaves (depth 2)
         // But actually in batch_schedule, leaves come first (they have no dirty deps).

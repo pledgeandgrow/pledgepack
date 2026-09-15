@@ -1060,7 +1060,7 @@ type CoverageData = Arc<Mutex<Vec<(String, usize, usize)>>>;
 
 /// Set up coverage tracking instrumentation
 fn setup_coverage_tracking(ctx: &Ctx, _coverage_data: &CoverageData, file_path: &Path) {
-    let file_str = file_path.to_string_lossy().replace('\\', "/");
+    let file_str = pledgepack_core::normalize_path(file_path);
     let coverage_code = format!(
         r#"
         globalThis.__pledge_coverage = {{

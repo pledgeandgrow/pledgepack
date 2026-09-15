@@ -13,6 +13,39 @@ use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
+/// Validate that a URL is safe to use (no shell metacharacters, must be http/https).
+/// This guards against command injection when URLs are passed to subprocesses
+/// (e.g. `aws s3 cp` / `gsutil cp`) and ensures only http(s) schemes reach the
+/// HTTP client.
+fn validate_url(url: &str) -> Result<()> {
+    // Reject shell metacharacters that could enable injection when the URL is
+    // forwarded to a CLI subprocess (S3/GCS backends).
+    check_no_shell_metachars(url)?;
+    // For the HTTP backend, require an explicit http(s) scheme.
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        bail!("URL must use http or https scheme: {}", url);
+    }
+    Ok(())
+}
+
+/// Validate an object-store URL (s3:// or gs://) for use with CLI subprocesses.
+fn validate_object_url(url: &str) -> Result<()> {
+    check_no_shell_metachars(url)?;
+    if !(url.starts_with("s3://") || url.starts_with("gs://")) {
+        bail!("Object URL must use s3 or gs scheme: {}", url);
+    }
+    Ok(())
+}
+
+fn check_no_shell_metachars(url: &str) -> Result<()> {
+    const SHELL_METACHARS: &[char] = &[';', '|', '&', '$', '`', '(', ')', '<', '>', '\n', '\r', '*',
+        '?', '[', ']', '{', '}', '!', '#', '~', '"', '\'', '\\', ' '];
+    if url.contains(SHELL_METACHARS) {
+        bail!("URL contains forbidden shell metacharacters: {}", url);
+    }
+    Ok(())
+}
+
 /// Configuration for the remote cache
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemoteCacheConfig {
@@ -123,22 +156,23 @@ impl RemoteCache {
 
     fn http_get(&self, key: &str) -> Result<Option<RemoteCacheEntry>> {
         let url = self.build_url(key);
+        validate_url(&url)?;
         debug!("Remote cache GET: {}", url);
 
-        let output = std::process::Command::new("curl")
-            .args([
-                "-s",
-                "-f",
-                "--max-time",
-                &self.config.timeout_secs.to_string(),
-                &url,
-            ])
-            .output();
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(self.config.timeout_secs))
+            .build()?;
 
-        match output {
-            Ok(result) if result.status.success() && !result.stdout.is_empty() => {
+        let resp = client.get(&url).send();
+        match resp {
+            Ok(response) if response.status().is_success() => {
+                let body = response.bytes()?;
+                if body.is_empty() {
+                    debug!("Remote cache miss (empty body): {}", key);
+                    return Ok(None);
+                }
                 match bincode::serde::decode_from_slice::<RemoteCacheEntry, _>(
-                    &result.stdout,
+                    &body,
                     bincode::config::standard(),
                 ) {
                     Ok((entry, _)) => {
@@ -151,8 +185,16 @@ impl RemoteCache {
                     }
                 }
             }
-            _ => {
-                debug!("Remote cache miss: {}", key);
+            Ok(response) => {
+                debug!(
+                    "Remote cache miss (status {}): {}",
+                    response.status(),
+                    key
+                );
+                Ok(None)
+            }
+            Err(e) => {
+                debug!("Remote cache GET error: {}: {}", key, e);
                 Ok(None)
             }
         }
@@ -160,41 +202,30 @@ impl RemoteCache {
 
     fn http_set(&self, key: &str, entry: &RemoteCacheEntry) -> Result<()> {
         let url = self.build_url(key);
+        validate_url(&url)?;
         let data = bincode::serde::encode_to_vec(entry, bincode::config::standard())?;
 
-        let temp_file = std::env::temp_dir().join(format!(
-            "pledgepack_remote_{}",
-            blake3::hash(&data).to_hex()
-        ));
-        std::fs::write(&temp_file, &data)?;
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(self.config.timeout_secs))
+            .build()?;
 
-        let output = std::process::Command::new("curl")
-            .args([
-                "-s",
-                "-f",
-                "--max-time",
-                &self.config.timeout_secs.to_string(),
-                "-X",
-                "PUT",
-                "-H",
-                "Content-Type: application/octet-stream",
-                "--data-binary",
-                &format!("@{}", temp_file.to_string_lossy()),
-                &url,
-            ])
-            .output();
+        let resp = client
+            .put(&url)
+            .header("Content-Type", "application/octet-stream")
+            .body(data)
+            .send();
 
-        let _ = std::fs::remove_file(&temp_file);
-
-        match output {
-            Ok(result) if result.status.success() => {
+        match resp {
+            Ok(response) if response.status().is_success() => {
                 debug!("Remote cache stored: {}", key);
                 Ok(())
             }
-            _ => {
-                warn!("Remote cache store failed: {}", key);
-                Ok(())
-            }
+            Ok(response) => Err(anyhow::anyhow!(
+                "Remote cache store failed (status {}): {}",
+                response.status(),
+                key
+            )),
+            Err(e) => Err(anyhow::anyhow!("Remote cache store failed: {}", e)),
         }
     }
 
@@ -207,12 +238,14 @@ impl RemoteCache {
         } else {
             format!("{}/{}", ns, key)
         };
+        let s3_url = format!("s3://{}/{}", bucket, object_key);
+        validate_object_url(&s3_url)?;
 
         let output = std::process::Command::new("aws")
             .args([
                 "s3",
                 "cp",
-                &format!("s3://{}/{}", bucket, object_key),
+                &s3_url,
                 "-",
                 "--region",
                 region,
@@ -251,6 +284,8 @@ impl RemoteCache {
         } else {
             format!("{}/{}", ns, key)
         };
+        let s3_url = format!("s3://{}/{}", bucket, object_key);
+        validate_object_url(&s3_url)?;
 
         let data = bincode::serde::encode_to_vec(entry, bincode::config::standard())?;
         let temp_file =
@@ -262,7 +297,7 @@ impl RemoteCache {
                 "s3",
                 "cp",
                 &temp_file.to_string_lossy(),
-                &format!("s3://{}/{}", bucket, object_key),
+                &s3_url,
                 "--region",
                 region,
             ])
@@ -275,10 +310,11 @@ impl RemoteCache {
                 debug!("S3 cache stored: {}/{}", bucket, object_key);
                 Ok(())
             }
-            _ => {
-                warn!("S3 cache store failed: {}/{}", bucket, object_key);
-                Ok(())
-            }
+            Ok(result) => Err(anyhow::anyhow!(
+                "S3 cache store failed: {}",
+                String::from_utf8_lossy(&result.stderr)
+            )),
+            Err(e) => Err(anyhow::anyhow!("S3 cache store failed: {}", e)),
         }
     }
 
@@ -290,9 +326,11 @@ impl RemoteCache {
         } else {
             format!("{}/{}", ns, key)
         };
+        let gs_url = format!("gs://{}/{}", bucket, object_key);
+        validate_object_url(&gs_url)?;
 
         let output = std::process::Command::new("gsutil")
-            .args(["cp", &format!("gs://{}/{}", bucket, object_key), "-"])
+            .args(["cp", &gs_url, "-"])
             .output();
 
         match output {
@@ -326,6 +364,8 @@ impl RemoteCache {
         } else {
             format!("{}/{}", ns, key)
         };
+        let gs_url = format!("gs://{}/{}", bucket, object_key);
+        validate_object_url(&gs_url)?;
 
         let data = bincode::serde::encode_to_vec(entry, bincode::config::standard())?;
         let temp_file =
@@ -336,7 +376,7 @@ impl RemoteCache {
             .args([
                 "cp",
                 &temp_file.to_string_lossy(),
-                &format!("gs://{}/{}", bucket, object_key),
+                &gs_url,
             ])
             .output();
 
@@ -347,10 +387,11 @@ impl RemoteCache {
                 debug!("GCS cache stored: {}/{}", bucket, object_key);
                 Ok(())
             }
-            _ => {
-                warn!("GCS cache store failed: {}/{}", bucket, object_key);
-                Ok(())
-            }
+            Ok(result) => Err(anyhow::anyhow!(
+                "GCS cache store failed: {}",
+                String::from_utf8_lossy(&result.stderr)
+            )),
+            Err(e) => Err(anyhow::anyhow!("GCS cache store failed: {}", e)),
         }
     }
 }

@@ -349,7 +349,7 @@ pub fn optimize_fonts(font_dir: &Path, config: &FontSubsetConfig) -> Result<Vec<
         let path = entry.path();
 
         if is_font(&path) {
-            let path_str = path.to_string_lossy().replace('\\', "/");
+            let path_str = crate::normalize_path(&path);
             let subsets = generate_subsets(&path_str, config);
             all_subsets.extend(subsets);
         }

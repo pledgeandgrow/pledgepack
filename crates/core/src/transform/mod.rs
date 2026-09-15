@@ -23,6 +23,7 @@ use crate::module::ModuleKind;
 use anyhow::Result;
 
 pub use js::detect_dynamic_imports_from_program;
+pub use env::generate_env_dts;
 
 /// Output of transforming a single module
 pub struct TransformOutput {
@@ -50,6 +51,17 @@ pub fn transform(
     is_production: bool,
     config: &PledgeConfig,
 ) -> Result<TransformOutput> {
+    // Normalize line endings: files read on Windows may contain CRLF (\r\n),
+    // which would skew parser spans, line/column info, and source maps.
+    // All parsers below see LF-only source.
+    let normalized;
+    let source = if source.contains('\r') {
+        normalized = source.replace("\r\n", "\n");
+        normalized.as_str()
+    } else {
+        source
+    };
+
     match kind {
         ModuleKind::TypeScript | ModuleKind::Tsx | ModuleKind::Jsx | ModuleKind::JavaScript => {
             js::transform_js(source, kind, file_path, is_production, config)
@@ -94,12 +106,12 @@ pub fn transform(
             })
         }
         ModuleKind::Mdx => data::transform_mdx(source, file_path),
-        ModuleKind::Graphql => data::transform_graphql(source),
-        ModuleKind::Yaml => data::transform_yaml(source),
-        ModuleKind::Csv => data::transform_csv(source),
-        ModuleKind::Tsv => data::transform_tsv(source),
+        ModuleKind::Graphql => data::transform_graphql(source, file_path),
+        ModuleKind::Yaml => data::transform_yaml(source, file_path),
+        ModuleKind::Csv => data::transform_csv(source, file_path),
+        ModuleKind::Tsv => data::transform_tsv(source, file_path),
         ModuleKind::Sass => css::transform_sass(source, file_path, is_production, config),
-        ModuleKind::Toml => data::transform_toml(source),
+        ModuleKind::Toml => data::transform_toml(source, file_path),
         ModuleKind::Shader => assets::transform_shader(source, file_path),
         _ => Ok(TransformOutput {
             code: source.to_string(),

@@ -138,7 +138,7 @@ pledgepack-cli
 opt-level = 3
 lto = "fat"
 codegen-units = 1
-panic = "abort"
+panic = "unwind"
 strip = true
 
 [profile.dev]
@@ -1359,6 +1359,12 @@ pledge schema --output schema.json  # Write to file
 
 ## PledgeStack Framework Adapter
 
+> **Boundary:** PledgePack is the bundler layer; PledgeStack is the framework
+> layer. PledgePack handles route discovery and manifest generation — it does
+> NOT handle SSR rendering, API route execution, middleware execution, or
+> `.psx` transpilation. See [CONNECTION.md](./CONNECTION.md) for the full
+> responsibility split.
+
 PledgeStack is a Next.js-like full-stack framework with React frontend and Rust backend:
 
 ```
@@ -1681,7 +1687,9 @@ For React components in development mode, the dev server injects Fast Refresh co
 // Injected by Pledge for React Fast Refresh
 if (import.meta.hot) {
     import.meta.hot.accept();
-    window.__pledge_fast_refresh = window.__pledge_fast_refresh || {};
+    window.__pledge_fast_refresh = window.__pledge_fast_refresh || function(name, reload) {
+        (window.__pledge_fast_refresh_registry = window.__pledge_fast_refresh_registry || {})[name] = reload;
+    };
     window.__pledge_fast_refresh[import.meta.url] = ['App', 'Header'];
 }
 ```

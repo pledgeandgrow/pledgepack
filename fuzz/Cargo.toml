@@ -1,0 +1,29 @@
+[package]
+name = "pledgepack-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+pledgepack-resolver = { path = "../crates/resolver" }
+tempfile = "3"
+
+[[bin]]
+name = "resolve_specifier"
+path = "fuzz_targets/resolve_specifier.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "package_json_exports"
+path = "fuzz_targets/package_json_exports.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

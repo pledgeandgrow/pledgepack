@@ -1,23 +1,23 @@
-// Dev server with HMR support
-//
-// Serves modules on-demand (lazy bundling like Turbopack):
-//   1. Browser requests / → serve index.html
-//   2. index.html loads /src/index.tsx → transform on-the-fly with Oxc
-//   3. Import specifiers rewritten to browser-compatible URLs
-//   4. File changes → notify watcher → WebSocket push → HMR update
+//! Dev server with HMR support
+//!
+//! Serves modules on-demand (lazy bundling like Turbopack):
+//!   1. Browser requests / → serve index.html
+//!   2. index.html loads /src/index.tsx → transform on-the-fly with Oxc
+//!   3. Import specifiers rewritten to browser-compatible URLs
+//!   4. File changes → notify watcher → WebSocket push → HMR update
 
 use anyhow::Result;
 use axum::{
     Router,
     extract::{Path, State, WebSocketUpgrade, ws::Message},
-    http::{StatusCode, header},
+    http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header},
     response::{Html, IntoResponse, Response},
     routing::get,
 };
 use futures_util::{SinkExt, StreamExt};
 use pledgepack_core::module::ModuleKind;
 use pledgepack_core::transform as pledge_transform;
-use pledgepack_core::{BuildEngine, PledgeConfig};
+use pledgepack_core::{BuildEngine, PledgeConfig, normalize_path, normalize_path_str};
 use pledgepack_js_plugin_host::JsPluginHost;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -30,6 +30,61 @@ mod lazy_pipeline;
 mod middleware;
 mod shell_generator;
 mod watcher;
+
+/// Maximum number of entries in the transformed-module cache before eviction.
+const MAX_MODULE_CACHE_SIZE: usize = 1000;
+/// Maximum number of entries in the HMR import graph before eviction.
+const MAX_IMPORT_GRAPH_SIZE: usize = 1000;
+/// Maximum response body size for files served by the dev server (100 MB).
+const MAX_RESPONSE_SIZE: usize = 100 * 1024 * 1024;
+
+/// Insert into a bounded `HashMap`, evicting an existing entry when at capacity.
+///
+/// This is an approximate (amortized) bound rather than a true LRU — `HashMap`
+/// keeps no insertion order and the `lru` crate is not a dependency, so we
+/// evict the first key yielded by the map's iterator. Existing keys are
+/// refreshed in place without counting against the limit.
+fn bounded_insert<V>(
+    map: &mut HashMap<String, V>,
+    key: String,
+    value: V,
+    max_entries: usize,
+) {
+    if !map.contains_key(&key) && map.len() >= max_entries {
+        // Evict an entry to make room (approximate eviction — see doc comment)
+        if let Some(evict_key) = map.keys().next().cloned() {
+            map.remove(&evict_key);
+        }
+    }
+    map.insert(key, value);
+}
+
+/// Returns true if `path` is within `base` after canonicalization.
+/// Handles `..` traversal attempts safely.
+fn is_path_within(path: &std::path::Path, base: &std::path::Path) -> bool {
+    // First, try canonicalization — this resolves symlinks, so a symlink inside
+    // the project root pointing outside it cannot bypass the check.
+    let canonical_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let canonical_base = std::fs::canonicalize(base).unwrap_or_else(|_| base.to_path_buf());
+
+    if canonical_path.starts_with(&canonical_base) {
+        return true;
+    }
+
+    // Fall back to lexical normalization for paths that don't exist yet
+    // (canonicalize fails on non-existent paths)
+    let mut normalized = std::path::PathBuf::new();
+    for component in canonical_path.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized.starts_with(&canonical_base)
+}
 
 /// A TLS listener that wraps a TCP listener with tokio-rustls
 struct TlsListener {
@@ -64,10 +119,74 @@ impl axum::serve::Listener for TlsListener {
     }
 }
 
+/// A Unix domain socket listener for the dev server (Unix platforms only).
+/// Mirrors `TlsListener` so `axum::serve` can accept connections on a
+/// `tokio::net::UnixListener`.
+#[cfg(unix)]
+struct UnixSocketListener {
+    listener: tokio::net::UnixListener,
+}
+
+#[cfg(unix)]
+impl axum::serve::Listener for UnixSocketListener {
+    type Io = tokio::net::UnixStream;
+    type Addr = tokio::net::unix::SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        loop {
+            match self.listener.accept().await {
+                Ok(pair) => return pair,
+                Err(e) => {
+                    tracing::warn!("Unix socket accept error: {}", e);
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            }
+        }
+    }
+
+    fn local_addr(&self) -> std::io::Result<Self::Addr> {
+        self.listener.local_addr()
+    }
+}
+
+/// Start the dev server on a Unix domain socket instead of TCP (Unix only).
+/// Removes a stale socket file before binding and cleans it up on shutdown.
+#[cfg(unix)]
+async fn start_unix_server(app: axum::Router, socket_path: &str) -> Result<()> {
+    // Remove a stale socket file left behind by a previous run, if any
+    if std::path::Path::new(socket_path).exists() {
+        std::fs::remove_file(socket_path)?;
+    }
+    let listener = tokio::net::UnixListener::bind(socket_path)?;
+    tracing::info!("Dev server listening on unix://{}", socket_path);
+    let shutdown = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("Failed to install Ctrl+C handler");
+        tracing::info!("Shutdown signal received, draining connections...");
+    };
+    axum::serve(UnixSocketListener { listener }, app)
+        .with_graceful_shutdown(shutdown)
+        .await?;
+    // Clean up the socket file on shutdown
+    let _ = std::fs::remove_file(socket_path);
+    Ok(())
+}
+
+/// Shared state for the dev server, held behind an `Arc` and passed to
+/// every axum route handler.
+///
+/// All mutable fields are behind `RwLock` so handlers can be serviced
+/// concurrently on the multi-threaded tokio runtime.
 pub struct DevServerState {
+    /// The build engine used to transform modules on demand.
     pub engine: RwLock<BuildEngine>,
+    /// The resolved PledgePack configuration for this server.
     pub config: Arc<PledgeConfig>,
+    /// Sender side of the HMR broadcast channel; file watcher events are
+    /// pushed here and forwarded to all connected browser clients.
     pub hmr_tx: mpsc::UnboundedSender<HmrUpdate>,
+    /// Per-client senders for each connected HMR WebSocket.
     pub hmr_clients: RwLock<Vec<mpsc::UnboundedSender<HmrUpdate>>>,
     /// Import graph: module path → set of modules that import it (dependents)
     pub import_graph: RwLock<std::collections::HashMap<String, Vec<String>>>,
@@ -94,25 +213,42 @@ pub struct EntryConfig {
     pub entry_module: String,
 }
 
+/// An HMR update message sent to browser clients over the
+/// `/__pledge_hmr` WebSocket.
+///
+/// Serialized as JSON; optional fields are omitted when absent so the
+/// payload stays small. The `update_type` discriminant (e.g.
+/// `"js-update"`, `"css-update"`, `"error"`, `"full-reload"`) tells the
+/// client runtime how to apply the update.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct HmrUpdate {
+    /// Update kind discriminator (serialized as `"type"`).
     #[serde(rename = "type")]
     pub update_type: String,
+    /// Project-relative path of the module that changed.
     pub path: String,
+    /// Human-readable message (used for error overlays).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// File where an error originated, if different from `path`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub file: Option<String>,
+    /// Replacement CSS payload for `css-update` messages.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub css: Option<String>,
+    /// Error stack trace for the overlay.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stack: Option<String>,
+    /// 1-based line number of an error.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub line: Option<u32>,
+    /// 1-based column number of an error.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub column: Option<u32>,
+    /// Modules that depend on the changed module (HMR boundary walk).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub deps: Vec<String>,
+    /// When true, instructs the client to reload the whole page.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub full_reload: Option<bool>,
     /// Partial update: line-level diff for HMR (feature 10)
@@ -121,6 +257,9 @@ pub struct HmrUpdate {
     /// Full module code for fallback when diff can't be applied
     #[serde(skip_serializing_if = "Option::is_none")]
     pub full_code: Option<String>,
+    /// CSS Modules class name mappings (original → scoped) for HMR remapping
+    #[serde(skip_serializing_if = "Option::is_none", rename = "moduleMap")]
+    pub module_map: Option<serde_json::Value>,
 }
 
 /// Install the ring crypto provider once for rustls/reqwest.
@@ -133,11 +272,100 @@ fn ensure_crypto_provider() {
     });
 }
 
+/// Build the dev server router as a standalone app (for testing and embedding).
+/// Returns a `Router` with all core routes and state configured.
+pub fn create_app(config: PledgeConfig) -> Router {
+    let (hmr_tx, _hmr_rx) = mpsc::unbounded_channel::<HmrUpdate>();
+
+    let engine = BuildEngine::new(Arc::new(config.clone()));
+
+    // Build middleware chain from config
+    let middleware_fns: Vec<middleware::MiddlewareFn> = config
+        .dev_server
+        .middleware
+        .iter()
+        .filter_map(|src| middleware::MiddlewareFn::from_source(src))
+        .collect();
+
+    let entries = detect_entries(&config);
+
+    let state = Arc::new(DevServerState {
+        engine: RwLock::new(engine),
+        config: config.clone().into(),
+        hmr_tx,
+        hmr_clients: RwLock::new(Vec::new()),
+        import_graph: RwLock::new(std::collections::HashMap::new()),
+        lazy_pipeline: RwLock::new(lazy_pipeline::LazyPipeline::new()),
+        module_cache: RwLock::new(std::collections::HashMap::new()),
+        import_patterns: RwLock::new(std::collections::HashMap::new()),
+        middleware_chain: RwLock::new(middleware_fns),
+        entries: RwLock::new(entries),
+    });
+
+    Router::new()
+        .route("/", get(index_handler))
+        .route("/__pledge_hmr", get(hmr_websocket_handler))
+        .route("/__pledge_error", get(error_overlay_handler))
+        .route("/__pledge_router", get(router_handler))
+        .route("/__pledge_entry", get(entry_module_handler))
+        .route("/__pledge_shell", get(shell_preview_handler))
+        .route("/@fs/{*path}", get(virtual_fs_handler))
+        .route("/@id/{*path}", get(virtual_id_handler))
+        .route("/__pledge_public/{*path}", get(public_dir_handler))
+        .route("/{*path}", get(app_route_handler))
+        .with_state(state)
+}
+
+/// Start the dev server and run until shutdown (Ctrl+C).
+///
+/// Builds the axum router, starts the native file watcher for HMR when
+/// `config.dev_server.hmr` is enabled, and binds on
+/// `config.dev_server.host`/`config.dev_server.port`. Supports HTTPS via
+/// `config.https` and Unix domain sockets via `config.dev_server.unix_socket`
+/// (Unix platforms only).
+///
+/// The `engine` is used for on-demand module transforms. This function
+/// only returns when the server shuts down or fails to bind.
 pub async fn serve(engine: BuildEngine, config: &PledgeConfig) -> Result<()> {
     ensure_crypto_provider();
     let start = std::time::Instant::now();
     let port = config.dev_server.port;
     let host = config.dev_server.host.clone();
+
+    // Non-loopback exposure: warn loudly, and require an access token unless
+    // the user explicitly opted out. See PRODUCTION-READINESS-100.md goals
+    // 17-18 — binding to e.g. `0.0.0.0` for LAN device testing previously
+    // gave zero indication that it also exposes `/@fs/*` (arbitrary
+    // read-within-project-root) to everyone on the network.
+    let is_loopback = pledgepack_core::config::is_loopback_host(&host);
+    let access_token: Option<String> = match &config.dev_server.access_token {
+        Some(t) if t.is_empty() => None, // explicit opt-out
+        Some(t) => Some(t.clone()),
+        None if !is_loopback => Some(pledgepack_core::security::generate_random_token(16)),
+        None => None,
+    };
+    if !is_loopback {
+        eprintln!();
+        eprintln!(
+            "  \x1b[33m⚠ pledge dev is bound to a non-loopback address ({}).\x1b[0m",
+            host
+        );
+        eprintln!(
+            "    This exposes your project's source files (via /@fs/*) to anyone who can reach"
+        );
+        eprintln!("    this host and port — e.g. others on the same network.");
+        if let Some(ref token) = access_token {
+            eprintln!(
+                "    An access token is required: connect with ?token={} (or the X-Pledge-Token header).",
+                token
+            );
+        } else {
+            eprintln!(
+                "    \x1b[31mAccess-token protection is disabled (dev_server.access_token set to \"\").\x1b[0m"
+            );
+        }
+        eprintln!();
+    }
 
     let (hmr_tx, hmr_rx) = mpsc::unbounded_channel::<HmrUpdate>();
 
@@ -225,13 +453,149 @@ pub async fn serve(engine: BuildEngine, config: &PledgeConfig) -> Result<()> {
         .route("/{*path}", get(app_route_handler))
         .with_state(state.clone());
 
-    // Apply HTTP compression middleware (feature 12: WebSocket compression via per-message deflate
-    // is handled at the WebSocket upgrade level; this handles HTTP response compression)
-    let mut app = app.layer(
-        tower_http::compression::CompressionLayer::new()
-            .gzip(true)
-            .quality(tower_http::CompressionLevel::Fastest),
-    );
+    // Apply HTTP middleware: compression, body limits, security headers, and CORS
+    // (feature 12: WebSocket per-message-deflate (RFC 7692) is NOT yet enabled —
+    // axum's built-in WebSocketUpgrade does not expose an API to negotiate the
+    // `permessage-deflate` extension during the handshake. This layer only
+    // handles HTTP response compression (gzip/deflate/br).
+    // TODO: Once axum adds per-message-deflate support (or via a custom
+    // WebSocket upgrade layer), enable it here to compress HMR payloads.)
+    // CORS: default to same-origin only (`CorsLayer::new()` with no
+    // `allow_origin` emits no `Access-Control-*` headers at all, so a
+    // browser's own same-origin policy applies). `DevServerCors::Any` opts
+    // back into the previous unconditional wildcard behavior. See goal 16 —
+    // this previously applied `Access-Control-Allow-Origin: *` to every
+    // route unconditionally, including the raw-filesystem `/@fs/*` handler.
+    let cors_layer = match config.dev_server.cors {
+        pledgepack_core::config::DevServerCors::Any => tower_http::cors::CorsLayer::new()
+            .allow_origin(tower_http::cors::Any)
+            .allow_methods(tower_http::cors::Any)
+            .allow_headers(tower_http::cors::Any),
+        pledgepack_core::config::DevServerCors::SameOrigin => tower_http::cors::CorsLayer::new(),
+    };
+
+    // CSP: wires the existing (previously build-report-only) CspGenerator
+    // into actual dev-server response headers (goal 19). Relaxed relative to
+    // a production CSP — `'unsafe-inline'`/`'unsafe-eval'` are required for
+    // the injected HMR client `<script>` and for HMR's dynamic
+    // module-replacement eval — appropriate for a local dev tool, not
+    // intended as the policy a production build should ship.
+    let dev_csp = {
+        let mut csp = pledgepack_core::security::CspGenerator::new();
+        csp.add_script_src("'unsafe-inline'");
+        csp.add_script_src("'unsafe-eval'");
+        csp.add_style_src("'unsafe-inline'");
+        csp.generate()
+    };
+    let csp_header_value = HeaderValue::from_str(&dev_csp)
+        .unwrap_or_else(|_| HeaderValue::from_static("default-src 'self'"));
+
+    let mut app = app
+        .layer(
+            tower_http::compression::CompressionLayer::new()
+                .gzip(true)
+                .br(true)
+                .quality(tower_http::CompressionLevel::Fastest),
+        )
+        .layer(tower_http::limit::RequestBodyLimitLayer::new(10 * 1024 * 1024))
+        .layer(tower_http::set_header::SetResponseHeaderLayer::if_not_present(
+            header::X_FRAME_OPTIONS,
+            HeaderValue::from_static("DENY"),
+        ))
+        .layer(tower_http::set_header::SetResponseHeaderLayer::if_not_present(
+            header::X_CONTENT_TYPE_OPTIONS,
+            HeaderValue::from_static("nosniff"),
+        ))
+        .layer(tower_http::set_header::SetResponseHeaderLayer::if_not_present(
+            HeaderName::from_static("referrer-policy"),
+            HeaderValue::from_static("strict-origin-when-cross-origin"),
+        ))
+        .layer(tower_http::set_header::SetResponseHeaderLayer::if_not_present(
+            header::CONTENT_SECURITY_POLICY,
+            csp_header_value,
+        ))
+        .layer(tower_http::set_header::SetResponseHeaderLayer::if_not_present(
+            HeaderName::from_static("x-pledgepack-schema-version"),
+            // PRODUCTION-READINESS-100.md goal 81: stamped on every
+            // response (not just `/__pledge_router`) so any consumer can
+            // check compatibility without depending on a specific route's
+            // response shape. `/__pledge_router` itself returns a
+            // JavaScript module, not JSON, so a body-embedded version
+            // field wasn't a good fit there — a header works regardless of
+            // content type. Computed from the same
+            // `pledgepack_core::PLEDGESTACK_MANIFEST_SCHEMA_VERSION`
+            // constant `RouteManifest::SCHEMA_VERSION` re-exports, so the
+            // two surfaces can't drift apart.
+            HeaderValue::from_str(&pledgepack_core::PLEDGESTACK_MANIFEST_SCHEMA_VERSION.to_string())
+                .unwrap_or_else(|_| HeaderValue::from_static("0")),
+        ))
+        .layer(cors_layer);
+
+    // Access-token gate (goal 18): only added when a token is actually
+    // required (explicitly configured, or auto-generated above because the
+    // server is bound to a non-loopback address). Loopback binds with no
+    // explicit token stay open, matching prior behavior for the common
+    // (safe) case.
+    if let Some(expected_token) = access_token.clone() {
+        let expected_token: Arc<str> = Arc::from(expected_token.as_str());
+        app = app.layer(axum::middleware::from_fn(move |req, next| {
+            let expected_token = expected_token.clone();
+            async move { require_access_token(expected_token, req, next).await }
+        }));
+    }
+
+    // Global rate limit: a generous cap (not per-client — `tower`'s
+    // RateLimitLayer has no client-identity concept) against a runaway HMR
+    // reconnect loop or a malicious local script hammering the server.
+    // Applied outermost (added last, so it wraps everything including the
+    // access-token check above — a token brute-force attempt is limited
+    // too) via `tower::util::BoxCloneSyncService`-compatible layering.
+    // `DEV_SERVER_RATE_LIMIT_PER_SEC` lets this be raised or disabled
+    // (`0` = disabled) for large projects with many legitimately concurrent
+    // requests, without needing a full config-schema field for what's meant
+    // as an escape hatch, not a tuning knob. See
+    // PRODUCTION-READINESS-100.md goal 74.
+    let rate_limit_per_sec: u64 = std::env::var("DEV_SERVER_RATE_LIMIT_PER_SEC")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(500);
+    if rate_limit_per_sec > 0 {
+        // `RateLimit<S>`'s inner state (the leaky-bucket counter) can't
+        // implement `Clone` in a way that shares that state across clones —
+        // a naive Clone would give every cloned instance its own
+        // independent counter, defeating the point. axum's `Router::layer`
+        // requires the layered service to be `Clone`, so this composes
+        // `BufferLayer` (moves the rate limiter onto a background worker
+        // task, handing out a `Clone`-able channel handle instead) and
+        // `RateLimitLayer` into ONE `tower::ServiceBuilder` stack applied
+        // via a single `.layer()` call — applying them as two separate
+        // `Router::layer()` calls doesn't work: axum erases each call's
+        // result back to a boxed `Route` before the next layer sees it, so
+        // `RateLimitLayer` ends up wrapping a fresh `Route` instead of the
+        // already-buffered (and thus Clone) service. `HandleErrorLayer`
+        // goes outermost in the stack (applied first, so it sees
+        // everything inside) to convert `Buffer`'s `BoxError` (surfaced
+        // only if the buffer's worker task itself dies) into a real
+        // response — axum requires the whole layered service's `Error`
+        // type to be `Infallible`, and `HandleErrorLayer` is what makes
+        // that true here.
+        let rate_limit_stack = tower::ServiceBuilder::new()
+            .layer(axum::error_handling::HandleErrorLayer::new(
+                |err: tower::BoxError| async move {
+                    tracing::error!("dev-server rate limiter failed: {err}");
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "rate limiter unavailable",
+                    )
+                },
+            ))
+            .layer(tower::buffer::BufferLayer::new(1024))
+            .layer(tower::limit::RateLimitLayer::new(
+                rate_limit_per_sec,
+                std::time::Duration::from_secs(1),
+            ));
+        app = app.layer(rate_limit_stack);
+    }
 
     // Execute configureServer hooks from JS plugins
     let plugins_dir = config.root.join("plugins");
@@ -340,6 +704,21 @@ pub async fn serve(engine: BuildEngine, config: &PledgeConfig) -> Result<()> {
         });
     }
 
+    // Unix domain socket support (Unix platforms only): when
+    // `dev_server.unix_socket` is configured, listen on the socket path
+    // instead of a TCP host:port.
+    #[cfg(unix)]
+    if let Some(ref socket_path) = config.dev_server.unix_socket {
+        println!("\n  \x1b[32mReady in {}ms\x1b[0m\n", elapsed_ms);
+        return start_unix_server(app, socket_path).await;
+    }
+    #[cfg(not(unix))]
+    if config.dev_server.unix_socket.is_some() {
+        tracing::warn!(
+            "dev_server.unix_socket is only supported on Unix platforms; falling back to TCP"
+        );
+    }
+
     // HTTPS support
     if let Some(ref https_config) = config.https {
         info!("Dev server running at https://{}", addr);
@@ -389,7 +768,15 @@ pub async fn serve(engine: BuildEngine, config: &PledgeConfig) -> Result<()> {
             listener,
             acceptor: tls_acceptor,
         };
-        axum::serve(tls_listener, app).await?;
+        let shutdown = async {
+            tokio::signal::ctrl_c()
+                .await
+                .expect("Failed to install Ctrl+C handler");
+            tracing::info!("Shutdown signal received, draining connections...");
+        };
+        axum::serve(tls_listener, app)
+            .with_graceful_shutdown(shutdown)
+            .await?;
     } else {
         println!("\n  \x1b[32mReady in {}ms\x1b[0m\n", elapsed_ms);
         info!("Dev server running at http://{}", addr);
@@ -397,10 +784,85 @@ pub async fn serve(engine: BuildEngine, config: &PledgeConfig) -> Result<()> {
             info!("  → Network: http://{}:{}", ip, port);
         }
         let listener = tokio::net::TcpListener::bind(&addr).await?;
-        axum::serve(listener, app).await?;
+        let shutdown = async {
+            tokio::signal::ctrl_c()
+                .await
+                .expect("Failed to install Ctrl+C handler");
+            tracing::info!("Shutdown signal received, draining connections...");
+        };
+        axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown)
+            .await?;
     }
 
     Ok(())
+}
+
+/// Cookie name used to remember a validated dev-server access token (see
+/// [`require_access_token`]) so the browser doesn't need to repeat
+/// `?token=...` on every request — notably including the HMR WebSocket
+/// handshake, which the injected client script opens with a fixed URL it
+/// doesn't know to append a token to. Browsers attach cookies to a WS
+/// handshake automatically (it's a plain HTTP GET with an Upgrade header),
+/// so this covers that case with no client-script changes needed.
+const ACCESS_TOKEN_COOKIE: &str = "pledge_token";
+
+fn token_from_query(uri: &axum::http::Uri) -> Option<String> {
+    uri.query()?.split('&').find_map(|pair| {
+        let (k, v) = pair.split_once('=')?;
+        (k == "token").then(|| v.to_string())
+    })
+}
+
+fn token_from_cookie(headers: &HeaderMap) -> Option<String> {
+    let cookie_header = headers.get(header::COOKIE)?.to_str().ok()?;
+    cookie_header.split(';').find_map(|kv| {
+        let (k, v) = kv.trim().split_once('=')?;
+        (k == ACCESS_TOKEN_COOKIE).then(|| v.to_string())
+    })
+}
+
+fn token_from_header(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-pledge-token")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+}
+
+/// Middleware gating every route behind `expected_token`, checked (in
+/// order) against `?token=`, the `X-Pledge-Token` header, and a
+/// `pledge_token` cookie. On success via query param, sets that cookie so
+/// subsequent requests (including the HMR WebSocket handshake) don't need
+/// to repeat it. See PRODUCTION-READINESS-100.md goal 18.
+async fn require_access_token(
+    expected_token: Arc<str>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let query_token = token_from_query(req.uri());
+    let authorized = query_token.as_deref() == Some(&*expected_token)
+        || token_from_header(req.headers()).as_deref() == Some(&*expected_token)
+        || token_from_cookie(req.headers()).as_deref() == Some(&*expected_token);
+
+    if !authorized {
+        return (
+            StatusCode::UNAUTHORIZED,
+            "pledge dev: this server requires an access token because it is bound to a \
+             non-loopback address.\nOpen the URL printed at startup (it includes ?token=...), \
+             or pass the token via the X-Pledge-Token header.",
+        )
+            .into_response();
+    }
+
+    let mut response = next.run(req).await;
+    if query_token.is_some() {
+        if let Ok(cookie) = HeaderValue::from_str(&format!(
+            "{ACCESS_TOKEN_COOKIE}={expected_token}; Path=/; HttpOnly; SameSite=Strict"
+        )) {
+            response.headers_mut().insert(header::SET_COOKIE, cookie);
+        }
+    }
+    response
 }
 
 /// Serve the virtual router module for file-based routing in dev mode
@@ -580,7 +1042,9 @@ async fn index_handler(State(state): State<Arc<DevServerState>>) -> impl IntoRes
         window.__pledge_vue_components = window.__pledge_vue_components || {};
         window.__pledge_svelte_components = window.__pledge_svelte_components || {};
         window.__pledge_solid_hmr = window.__pledge_solid_hmr || [];
-        window.__pledge_fast_refresh = window.__pledge_fast_refresh || {};
+        window.__pledge_fast_refresh = window.__pledge_fast_refresh || function(name, reload) {
+          (window.__pledge_fast_refresh_registry = window.__pledge_fast_refresh_registry || {})[name] = reload;
+        };
         // HMR module registry: path -> module hot data
         window.__pledge_hmr_modules = window.__pledge_hmr_modules || {};
 
@@ -592,7 +1056,7 @@ async fn index_handler(State(state): State<Arc<DevServerState>>) -> impl IntoRes
         let __pledge_ws_closed_by_user = false;
 
         function __pledge_connect_ws() {
-            const ws = new WebSocket('ws://' + location.host + '/__pledge_hmr');
+            const ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/__pledge_hmr');
             window.__pledge_ws = ws;
 
             ws.onmessage = (event) => {
@@ -603,8 +1067,17 @@ async fn index_handler(State(state): State<Arc<DevServerState>>) -> impl IntoRes
                     // Reset reconnection delay on successful message
                     __pledge_ws_current_delay = __pledge_ws_reconnect_delay;
                     if (data.path) {
-                        // CSS HMR: inject <style> tag without page reload
-                        if (data.path.endsWith('.css') || data.css) {
+                        // CSS Modules HMR: re-import to get updated class name mappings
+                        if (data.path.endsWith('.module.css') && data.moduleMap) {
+                            import(data.path + '?t=' + Date.now()).then(() => {
+                                console.log('[pledge] CSS Module HMR:', data.path);
+                                window.dispatchEvent(new CustomEvent('pledge:hmr-success'));
+                            }).catch((err) => {
+                                console.error('[pledge] CSS Module HMR failed:', err);
+                                location.reload();
+                            });
+                        } else if (data.path.endsWith('.css') || data.css) {
+                            // CSS HMR: inject <style> tag without page reload
                             if (data.css) {
                                 updatePledgeCSS(data.path, data.css);
                             } else {
@@ -621,14 +1094,30 @@ async fn index_handler(State(state): State<Arc<DevServerState>>) -> impl IntoRes
                                     location.reload();
                                 });
                             } else {
-                                // JS HMR: reload the changed script tag
-                                const links = document.querySelectorAll('script[src="' + data.path + '"]');
-                                links.forEach(link => {
-                                    const newLink = document.createElement('script');
-                                    newLink.type = 'module';
-                                    newLink.src = data.path + '?t=' + Date.now();
-                                    link.replaceWith(newLink);
-                                });
+                                // JS HMR: check for accept callbacks (true HMR) before falling back to script tag reload
+                                if (window.__pledge_hot_accept_callbacks && window.__pledge_hot_accept_callbacks[data.path] && window.__pledge_hot_accept_callbacks[data.path].length > 0) {
+                                    // Capture old callbacks before re-import (new module will overwrite the registry)
+                                    const oldCallbacks = window.__pledge_hot_accept_callbacks[data.path].slice();
+                                    import(data.path + '?t=' + Date.now()).then((newModule) => {
+                                        console.log('[pledge] HMR accept:', data.path);
+                                        oldCallbacks.forEach(cb => {
+                                            try { cb(newModule); } catch(e) { console.error('[pledge] HMR accept error:', e); }
+                                        });
+                                        window.dispatchEvent(new CustomEvent('pledge:hmr-success'));
+                                    }).catch((err) => {
+                                        console.error('[pledge] HMR accept failed, reloading:', err);
+                                        location.reload();
+                                    });
+                                } else {
+                                    // No accept callback — reload the changed script tag
+                                    const links = document.querySelectorAll('script[src="' + data.path + '"]');
+                                    links.forEach(link => {
+                                        const newLink = document.createElement('script');
+                                        newLink.type = 'module';
+                                        newLink.src = data.path + '?t=' + Date.now();
+                                        link.replaceWith(newLink);
+                                    });
+                                }
                             }
                         }
                         // Handle cascading updates for dependent modules
@@ -906,7 +1395,9 @@ async fn app_route_handler(
         window.__pledge_vue_components = window.__pledge_vue_components || {};
         window.__pledge_svelte_components = window.__pledge_svelte_components || {};
         window.__pledge_solid_hmr = window.__pledge_solid_hmr || [];
-        window.__pledge_fast_refresh = window.__pledge_fast_refresh || {};
+        window.__pledge_fast_refresh = window.__pledge_fast_refresh || function(name, reload) {
+          (window.__pledge_fast_refresh_registry = window.__pledge_fast_refresh_registry || {})[name] = reload;
+        };
         window.__pledge_hmr_modules = window.__pledge_hmr_modules || {};
         let __pledge_ws;
         let __pledge_ws_reconnect_delay = 1000;
@@ -914,7 +1405,7 @@ async fn app_route_handler(
         let __pledge_ws_current_delay = __pledge_ws_reconnect_delay;
         let __pledge_ws_closed_by_user = false;
         function __pledge_connect_ws() {
-            const ws = new WebSocket('ws://' + location.host + '/__pledge_hmr');
+            const ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/__pledge_hmr');
             window.__pledge_ws = ws;
             ws.onmessage = (event) => {
                 const data = JSON.parse(event.data);
@@ -923,17 +1414,41 @@ async fn app_route_handler(
                     clearPledgeError();
                     __pledge_ws_current_delay = __pledge_ws_reconnect_delay;
                     if (data.path) {
-                        if (data.path.endsWith('.css') || data.css) {
+                        if (data.path.endsWith('.module.css') && data.moduleMap) {
+                            // CSS Modules HMR: re-import to get updated class name mappings
+                            import(data.path + '?t=' + Date.now()).then(() => {
+                                console.log('[pledge] CSS Module HMR:', data.path);
+                                window.dispatchEvent(new CustomEvent('pledge:hmr-success'));
+                            }).catch((err) => {
+                                console.error('[pledge] CSS Module HMR failed:', err);
+                                location.reload();
+                            });
+                        } else if (data.path.endsWith('.css') || data.css) {
                             if (data.css) { updatePledgeCSS(data.path, data.css); }
                             else { fetchPledgeCSS(data.path); }
                         } else {
-                            const links = document.querySelectorAll('script[src="' + data.path + '"]');
-                            links.forEach(link => {
-                                const newLink = document.createElement('script');
-                                newLink.type = 'module';
-                                newLink.src = data.path + '?t=' + Date.now();
-                                link.replaceWith(newLink);
-                            });
+                            // JS HMR: check for accept callbacks (true HMR) before falling back to script tag reload
+                            if (window.__pledge_hot_accept_callbacks && window.__pledge_hot_accept_callbacks[data.path] && window.__pledge_hot_accept_callbacks[data.path].length > 0) {
+                                const oldCallbacks = window.__pledge_hot_accept_callbacks[data.path].slice();
+                                import(data.path + '?t=' + Date.now()).then((newModule) => {
+                                    console.log('[pledge] HMR accept:', data.path);
+                                    oldCallbacks.forEach(cb => {
+                                        try { cb(newModule); } catch(e) { console.error('[pledge] HMR accept error:', e); }
+                                    });
+                                    window.dispatchEvent(new CustomEvent('pledge:hmr-success'));
+                                }).catch((err) => {
+                                    console.error('[pledge] HMR accept failed, reloading:', err);
+                                    location.reload();
+                                });
+                            } else {
+                                const links = document.querySelectorAll('script[src="' + data.path + '"]');
+                                links.forEach(link => {
+                                    const newLink = document.createElement('script');
+                                    newLink.type = 'module';
+                                    newLink.src = data.path + '?t=' + Date.now();
+                                    link.replaceWith(newLink);
+                                });
+                            }
                         }
                         if (data.deps && data.deps.length > 0) {
                             data.deps.forEach((depPath) => {
@@ -1064,13 +1579,10 @@ fn generate_import_map(config: &PledgeConfig) -> String {
                                     .unwrap_or("index.js");
                                 imports.insert(
                                     pkg_name,
-                                    serde_json::Value::String(
-                                        format!(
-                                            "/node_modules/{}/{}/{}",
-                                            name, sub_name, entry_field
-                                        )
-                                        .replace('\\', "/"),
-                                    ),
+                                    serde_json::Value::String(normalize_path_str(&format!(
+                                        "/node_modules/{}/{}/{}",
+                                        name, sub_name, entry_field
+                                    ))),
                                 );
                             } else {
                                 // CJS-only: use esm.sh
@@ -1142,9 +1654,10 @@ fn generate_import_map(config: &PledgeConfig) -> String {
                         .unwrap_or("index.js");
                     imports.insert(
                         name.clone(),
-                        serde_json::Value::String(
-                            format!("/node_modules/{}/{}", name, entry_field).replace('\\', "/"),
-                        ),
+                        serde_json::Value::String(normalize_path_str(&format!(
+                            "/node_modules/{}/{}",
+                            name, entry_field
+                        ))),
                     );
 
                     // Add exports map entries
@@ -1171,14 +1684,11 @@ fn generate_import_map(config: &PledgeConfig) -> String {
                                     format!("{}/{}", name, export_key.trim_start_matches("./"));
                                 imports.insert(
                                     full_key,
-                                    serde_json::Value::String(
-                                        format!(
-                                            "/node_modules/{}/{}",
-                                            name,
-                                            resolved_path.trim_start_matches("./")
-                                        )
-                                        .replace('\\', "/"),
-                                    ),
+                                    serde_json::Value::String(normalize_path_str(&format!(
+                                        "/node_modules/{}/{}",
+                                        name,
+                                        resolved_path.trim_start_matches("./")
+                                    ))),
                                 );
                             }
                         }
@@ -1347,7 +1857,7 @@ fn build_import_map_scopes(
                     })
                     .unwrap_or_else(|| "index.js".to_string());
 
-                let full_path = format!("{}{}", nested_path, entry_field).replace('\\', "/");
+                let full_path = normalize_path_str(&format!("{}{}", nested_path, entry_field));
                 scope_obj.insert(pkg_name.clone(), serde_json::Value::String(full_path));
             }
         }
@@ -1378,15 +1888,29 @@ async fn module_handler(
     // First, try serving from the configured public directory (static assets)
     let public_dir = &state.config.dev_server.public_dir;
     let public_path = state.config.root.join(public_dir).join(&path);
+
+    // Security: prevent path traversal via `../` in the request path
+    if !is_path_within(&public_path, &state.config.root) {
+        return (StatusCode::FORBIDDEN, "Path traversal denied").into_response();
+    }
+
     if public_path.exists()
         && public_path.is_file()
         && let Ok(content) = tokio::fs::read(&public_path).await
     {
+        if content.len() > MAX_RESPONSE_SIZE {
+            return (StatusCode::PAYLOAD_TOO_LARGE, "Response too large").into_response();
+        }
         let content_type = guess_content_type(&path);
         return ([(header::CONTENT_TYPE, content_type)], content).into_response();
     }
 
     let full_path = state.config.root.join(&path);
+
+    // Security: prevent path traversal via `../` in the request path
+    if !is_path_within(&full_path, &state.config.root) {
+        return (StatusCode::FORBIDDEN, "Path traversal denied").into_response();
+    }
 
     // If the exact file doesn't exist, try alternative extensions
     // (e.g., /src/utils.js → /src/utils.ts, /src/index.js → /src/index.tsx)
@@ -1417,6 +1941,10 @@ async fn module_handler(
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to read").into_response(),
     };
 
+    if source.len() > MAX_RESPONSE_SIZE {
+        return (StatusCode::PAYLOAD_TOO_LARGE, "Response too large").into_response();
+    }
+
     let source_str = String::from_utf8_lossy(&source).to_string();
 
     // CJS → ESM conversion for node_modules files
@@ -1442,7 +1970,7 @@ async fn module_handler(
     // For CJS-wrapped node_modules, skip Oxc transform and serve directly
     if skip_transform {
         let rewritten = rewrite_imports(&source_str, &path, &state.config.resolve_alias);
-        return serve_js_module(&path, &rewritten, &state).await;
+        return serve_js_module(&path, &rewritten, None, &state).await;
     }
 
     // Determine module kind from extension
@@ -1477,6 +2005,7 @@ async fn module_handler(
                     full_reload: None,
                     diff: None,
                     full_code: None,
+                    module_map: None,
                 };
                 let _ = state.hmr_tx.send(error_update);
                 // Also return an error response with proper content type
@@ -1510,9 +2039,15 @@ async fn module_handler(
     }
 
     // Cache the transformed module for HMR diff computation (feature 10)
+    // Bounded to MAX_MODULE_CACHE_SIZE entries — evicts an entry when full.
     {
         let mut module_cache = state.module_cache.write().await;
-        module_cache.insert(path.clone(), transform_output.code.clone());
+        bounded_insert(
+            &mut module_cache,
+            path.clone(),
+            transform_output.code.clone(),
+            MAX_MODULE_CACHE_SIZE,
+        );
     }
 
     // CSS files: serve as JS module with style injection for dev mode HMR
@@ -1553,6 +2088,9 @@ export {{}};
                 "export default {};\nexport {};\n",
                 &format!("export default {{\n{}}};\n", exports),
             );
+            if js_module.len() > MAX_RESPONSE_SIZE {
+                return (StatusCode::PAYLOAD_TOO_LARGE, "Response too large").into_response();
+            }
             return (
                 [
                     (
@@ -1585,6 +2123,10 @@ if (import.meta.hot) {{
             serde_json::to_string(css_code).unwrap_or_else(|_| "\"\"".to_string()),
             serde_json::to_string(&path).unwrap_or_else(|_| "\"\"".to_string())
         );
+
+        if js_module.len() > MAX_RESPONSE_SIZE {
+            return (StatusCode::PAYLOAD_TOO_LARGE, "Response too large").into_response();
+        }
 
         return (
             [
@@ -1638,24 +2180,40 @@ __existing.textContent = __css;
             content_hash: None,
         };
         // Fall through to JS handling by re-running the logic below
-        return serve_js_module(&path, &transform_output.code, &state).await;
+        return serve_js_module(&path, &transform_output.code, None, &state).await;
     }
 
     // JS/TS files: rewrite imports and add HMR boundary
     let transformed = rewrite_imports(&transform_output.code, &path, &state.config.resolve_alias);
-    serve_js_module(&path, &transformed, &state).await
+    serve_js_module(&path, &transformed, transform_output.source_map.as_deref(), &state).await
 }
 
 /// Serve a JS module with HMR polyfill, dependency tracking, and source maps
-async fn serve_js_module(path: &str, transformed: &str, state: &Arc<DevServerState>) -> Response {
+async fn serve_js_module(
+    path: &str,
+    transformed: &str,
+    source_map: Option<&str>,
+    state: &Arc<DevServerState>,
+) -> Response {
     // Track imports in the dependency graph for cascading HMR updates
+    // Bounded to MAX_IMPORT_GRAPH_SIZE entries — evicts an entry when full.
     {
         let imports = extract_imports(transformed);
         if !imports.is_empty() {
             let mut graph = state.import_graph.write().await;
             for dep in &imports {
                 let normalized = normalize_module_path(dep, path);
-                graph.entry(normalized).or_default().push(path.to_string());
+                if !graph.contains_key(&normalized) && graph.len() >= MAX_IMPORT_GRAPH_SIZE {
+                    // Evict an entry to make room (approximate eviction —
+                    // HashMap keeps no insertion order)
+                    if let Some(evict_key) = graph.keys().next().cloned() {
+                        graph.remove(&evict_key);
+                    }
+                }
+                let dependents = graph.entry(normalized).or_default();
+                if !dependents.iter().any(|d| d == path) {
+                    dependents.push(path.to_string());
+                }
             }
         }
     }
@@ -1669,6 +2227,11 @@ if (!import.meta.hot) {{
   const __pledge_hot_data = {{}};
   const __pledge_hot_dispose_callbacks = [];
   const __pledge_hot_accept_callbacks = [];
+  // Register callbacks globally so the HMR update handler can find them by module path
+  window.__pledge_hot_accept_callbacks = window.__pledge_hot_accept_callbacks || {{}};
+  window.__pledge_hot_accept_callbacks[__pledge_hot_id] = __pledge_hot_accept_callbacks;
+  window.__pledge_hot_dispose_callbacks = window.__pledge_hot_dispose_callbacks || {{}};
+  window.__pledge_hot_dispose_callbacks[__pledge_hot_id] = __pledge_hot_dispose_callbacks;
   import.meta.hot = {{
     data: __pledge_hot_data,
     accept(cb) {{
@@ -1700,7 +2263,7 @@ if (!import.meta.hot) {{
     );
 
     // Add HMR boundary code for JS/TS files
-    let module_with_hmr = if path.ends_with(".tsx")
+    let mut module_with_hmr = if path.ends_with(".tsx")
         || path.ends_with(".jsx")
         || path.ends_with(".ts")
         || path.ends_with(".js")
@@ -1712,6 +2275,22 @@ if (!import.meta.hot) {{
     } else {
         format!("{}\n{}", hmr_polyfill, transformed)
     };
+
+    // Append sourceMappingURL comment for debuggable stack traces
+    if let Some(sm) = source_map
+        && !sm.is_empty()
+    {
+        use base64::Engine;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(sm.as_bytes());
+        module_with_hmr.push_str(&format!(
+            "\n//# sourceMappingURL=data:application/json;base64,{}\n",
+            encoded
+        ));
+    }
+
+    if module_with_hmr.len() > MAX_RESPONSE_SIZE {
+        return (StatusCode::PAYLOAD_TOO_LARGE, "Response too large").into_response();
+    }
 
     (
         [
@@ -1997,15 +2576,26 @@ async fn handle_hmr_connection(socket: axum::extract::ws::WebSocket, state: Arc<
     {
         let mut clients = state.hmr_clients.write().await;
         clients.push(client_tx);
+        // Goal 76: a "currently connected clients" diagnostic — logged on
+        // every connect/disconnect rather than only queryable on demand, so
+        // it shows up in the same terminal output a developer is already
+        // watching, without needing a separate endpoint to poll.
+        info!("HMR client connected ({} total)", clients.len());
     }
 
     // Spawn a task to forward HMR updates to this WebSocket client
     // Uses binary messages for larger payloads (compression benefit)
     let send_task = tokio::spawn(async move {
         while let Some(update) = client_rx.recv().await {
-            let json = serde_json::to_string(&update).unwrap_or_default();
+            let json = match serde_json::to_string(&update) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!("Failed to serialize HMR update: {}", e);
+                    continue; // Skip this update instead of sending garbage
+                }
+            };
             // For small messages, use text; for larger ones, use binary
-            // (WebSocket per-message deflate compresses both automatically)
+            // (per-message-deflate is not yet enabled — see TODO above)
             if json.len() < 4096 {
                 if socket_tx.send(Message::Text(json.into())).await.is_err() {
                     break;
@@ -2041,6 +2631,7 @@ async fn handle_hmr_connection(socket: axum::extract::ws::WebSocket, state: Arc<
     {
         let mut clients = state.hmr_clients.write().await;
         clients.retain(|tx| !tx.is_closed());
+        info!("HMR client disconnected ({} remaining)", clients.len());
     }
 }
 
@@ -2059,12 +2650,7 @@ fn start_native_file_watcher(
 
     // Process events from the native watcher and send HMR updates
     while let Ok(event) = rx.recv() {
-        let rel_path = event
-            .path
-            .strip_prefix(&root)
-            .unwrap_or(&event.path)
-            .to_string_lossy()
-            .replace('\\', "/");
+        let rel_path = normalize_path(event.path.strip_prefix(&root).unwrap_or(&event.path));
 
         let ext = event
             .path
@@ -2095,6 +2681,7 @@ fn start_native_file_watcher(
                 full_reload: None,
                 diff: None,
                 full_code: None,
+                module_map: None,
             };
             let _ = tx.send(reload_start);
 
@@ -2115,6 +2702,7 @@ fn start_native_file_watcher(
                 full_reload: None,
                 diff: None,
                 full_code: None,
+                module_map: None,
             };
             let _ = tx.send(reload_done);
             continue;
@@ -2140,6 +2728,7 @@ fn start_native_file_watcher(
             full_reload: None,
             diff: None,
             full_code: new_content,
+            module_map: None,
         };
         let _ = tx.send(update);
     }
@@ -2153,7 +2742,7 @@ fn compute_server_dirs(root: &std::path::Path, server_entry: &Option<String>) ->
         if let Some(parent) = std::path::Path::new(entry).parent()
             && !parent.as_os_str().is_empty()
         {
-            dirs.push(parent.to_string_lossy().replace('\\', "/"));
+            dirs.push(normalize_path(parent));
         }
     }
     // Common SSR/API directories
@@ -2316,7 +2905,9 @@ async fn entry_index_handler(
         window.__pledge_vue_components = window.__pledge_vue_components || {};
         window.__pledge_svelte_components = window.__pledge_svelte_components || {};
         window.__pledge_solid_hmr = window.__pledge_solid_hmr || [];
-        window.__pledge_fast_refresh = window.__pledge_fast_refresh || {};
+        window.__pledge_fast_refresh = window.__pledge_fast_refresh || function(name, reload) {
+          (window.__pledge_fast_refresh_registry = window.__pledge_fast_refresh_registry || {})[name] = reload;
+        };
         window.__pledge_hmr_modules = window.__pledge_hmr_modules || {};
         let __pledge_ws;
         let __pledge_ws_reconnect_delay = 1000;
@@ -2324,7 +2915,7 @@ async fn entry_index_handler(
         let __pledge_ws_current_delay = __pledge_ws_reconnect_delay;
         let __pledge_ws_closed_by_user = false;
         function __pledge_connect_ws() {
-            const ws = new WebSocket('ws://' + location.host + '/__pledge_hmr');
+            const ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/__pledge_hmr');
             window.__pledge_ws = ws;
             ws.onmessage = (event) => {
                 const data = JSON.parse(event.data);
@@ -2333,17 +2924,41 @@ async fn entry_index_handler(
                     clearPledgeError();
                     __pledge_ws_current_delay = __pledge_ws_reconnect_delay;
                     if (data.path) {
-                        if (data.path.endsWith('.css') || data.css) {
+                        if (data.path.endsWith('.module.css') && data.moduleMap) {
+                            // CSS Modules HMR: re-import to get updated class name mappings
+                            import(data.path + '?t=' + Date.now()).then(() => {
+                                console.log('[pledge] CSS Module HMR:', data.path);
+                                window.dispatchEvent(new CustomEvent('pledge:hmr-success'));
+                            }).catch((err) => {
+                                console.error('[pledge] CSS Module HMR failed:', err);
+                                location.reload();
+                            });
+                        } else if (data.path.endsWith('.css') || data.css) {
                             if (data.css) { updatePledgeCSS(data.path, data.css); }
                             else { fetchPledgeCSS(data.path); }
                         } else {
-                            const links = document.querySelectorAll('script[src="' + data.path + '"]');
-                            links.forEach(link => {
-                                const newLink = document.createElement('script');
-                                newLink.type = 'module';
-                                newLink.src = data.path + '?t=' + Date.now();
-                                link.replaceWith(newLink);
-                            });
+                            // JS HMR: check for accept callbacks (true HMR) before falling back to script tag reload
+                            if (window.__pledge_hot_accept_callbacks && window.__pledge_hot_accept_callbacks[data.path] && window.__pledge_hot_accept_callbacks[data.path].length > 0) {
+                                const oldCallbacks = window.__pledge_hot_accept_callbacks[data.path].slice();
+                                import(data.path + '?t=' + Date.now()).then((newModule) => {
+                                    console.log('[pledge] HMR accept:', data.path);
+                                    oldCallbacks.forEach(cb => {
+                                        try { cb(newModule); } catch(e) { console.error('[pledge] HMR accept error:', e); }
+                                    });
+                                    window.dispatchEvent(new CustomEvent('pledge:hmr-success'));
+                                }).catch((err) => {
+                                    console.error('[pledge] HMR accept failed, reloading:', err);
+                                    location.reload();
+                                });
+                            } else {
+                                const links = document.querySelectorAll('script[src="' + data.path + '"]');
+                                links.forEach(link => {
+                                    const newLink = document.createElement('script');
+                                    newLink.type = 'module';
+                                    newLink.src = data.path + '?t=' + Date.now();
+                                    link.replaceWith(newLink);
+                                });
+                            }
                         }
                         if (data.deps && data.deps.length > 0) {
                             data.deps.forEach((depPath) => {
@@ -2466,7 +3081,7 @@ async fn hmr_broadcast_loop(
             let module_cache = state.module_cache.read().await;
             if let Some(old_code) = module_cache.get(&update.path) {
                 let diff = hmr_diff::compute_diff(old_code, full_code);
-                if diff.is_small() {
+                if diff.is_small_default() {
                     update.diff = Some(diff);
                 } else {
                     update.diff = None;
@@ -2475,7 +3090,34 @@ async fn hmr_broadcast_loop(
             drop(module_cache);
 
             let mut module_cache = state.module_cache.write().await;
-            module_cache.insert(update.path.clone(), full_code.clone());
+            bounded_insert(
+                &mut module_cache,
+                update.path.clone(),
+                full_code.clone(),
+                MAX_MODULE_CACHE_SIZE,
+            );
+        }
+
+        // CSS Modules: compute class name mappings for HMR remapping
+        // When a .module.css changes, transform it to get the new scoped class names
+        // and include the mapping in the update so clients can re-import the module
+        if update.update_type == "update" && update.path.ends_with(".module.css") {
+            if let Some(ref full_code) = update.full_code {
+                let mut lazy_pipeline = state.lazy_pipeline.write().await;
+                lazy_pipeline.ensure_initialized();
+                let kind = ModuleKind::from_extension(".css");
+                if let Ok(css_output) =
+                    pledge_transform::transform(full_code, kind, &update.path, false, &state.config)
+                {
+                    if let Some(ref css_module_map) = css_output.css_modules {
+                        let map: serde_json::Map<String, serde_json::Value> = css_module_map
+                            .iter()
+                            .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+                            .collect();
+                        update.module_map = Some(serde_json::Value::Object(map));
+                    }
+                }
+            }
         }
 
         // Track import pattern changes for on-demand optimization (feature 15)
@@ -2630,9 +3272,13 @@ async fn proxy_handler(
     let req_method =
         reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap_or(reqwest::Method::GET);
 
-    let body_bytes = axum::body::to_bytes(body, usize::MAX)
-        .await
-        .unwrap_or_default();
+    const MAX_PROXY_BODY: usize = 100 * 1024 * 1024; // 100 MB
+    let body_bytes = match axum::body::to_bytes(body, MAX_PROXY_BODY).await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return (StatusCode::PAYLOAD_TOO_LARGE, "Body too large").into_response();
+        }
+    };
 
     let request = client.request(req_method, &target_url).body(body_bytes);
 
@@ -2789,12 +3435,15 @@ async fn virtual_fs_handler(
 
     // Allow access to project root and its node_modules
     let is_allowed = canonical.starts_with(&root_canonical)
-        || canonical.to_string_lossy().contains("node_modules");
+        || canonical.starts_with(root_canonical.join("node_modules"));
     if !is_allowed {
         return (StatusCode::FORBIDDEN, "Access denied").into_response();
     }
 
     if let Ok(content) = tokio::fs::read(&canonical).await {
+        if content.len() > MAX_RESPONSE_SIZE {
+            return (StatusCode::PAYLOAD_TOO_LARGE, "Response too large").into_response();
+        }
         let content_type = guess_content_type(&canonical.to_string_lossy());
         return (
             [
@@ -2815,12 +3464,30 @@ async fn virtual_id_handler(
     State(state): State<Arc<DevServerState>>,
     Path(path): Path<String>,
 ) -> Response {
-    // /@id/ resolves virtual module IDs to actual files
+    // /@id/ resolves virtual module IDs to actual files.
+    //
+    // SECURITY: every branch below joins `path` (attacker-controlled — it's
+    // the raw URL path segment) onto `state.config.root`. Unlike
+    // `virtual_fs_handler` above, this function previously never checked
+    // the joined path stayed within the project root before reading it —
+    // a request like `/@id/../../../../etc/passwd` (or its `..%2f`-encoded
+    // form, which axum's `Path` extractor already decodes before this
+    // function sees it) would `.join()` straight through the `..`
+    // components and read arbitrary files outside the project, served back
+    // to the requester. Fixed by checking `is_path_within` (the same guard
+    // `public_dir_handler` already uses below) before every read. See
+    // PRODUCTION-READINESS-100.md goal 77 — found while writing adversarial
+    // tests for this handler, not merely confirming an existing guard.
+    //
     // First try as a bare specifier in node_modules
     let node_modules_path = state.config.root.join("node_modules").join(&path);
     if node_modules_path.exists()
+        && is_path_within(&node_modules_path, &state.config.root)
         && let Ok(content) = tokio::fs::read(&node_modules_path).await
     {
+        if content.len() > MAX_RESPONSE_SIZE {
+            return (StatusCode::PAYLOAD_TOO_LARGE, "Response too large").into_response();
+        }
         let content_type = guess_content_type(&path);
         return (
             [
@@ -2836,8 +3503,12 @@ async fn virtual_id_handler(
     let root_path = state.config.root.join(&path);
     if root_path.exists()
         && root_path.is_file()
+        && is_path_within(&root_path, &state.config.root)
         && let Ok(content) = tokio::fs::read(&root_path).await
     {
+        if content.len() > MAX_RESPONSE_SIZE {
+            return (StatusCode::PAYLOAD_TOO_LARGE, "Response too large").into_response();
+        }
         let content_type = guess_content_type(&path);
         return (
             [
@@ -2857,6 +3528,7 @@ async fn virtual_id_handler(
         .join(&path)
         .join("package.json");
     if pkg_json.exists()
+        && is_path_within(&pkg_json, &state.config.root)
         && let Ok(content) = std::fs::read_to_string(&pkg_json)
         && let Ok(pkg) = serde_json::from_str::<serde_json::Value>(&content)
     {
@@ -2872,8 +3544,12 @@ async fn virtual_id_handler(
             .join(&path)
             .join(entry);
         if entry_path.exists()
+            && is_path_within(&entry_path, &state.config.root)
             && let Ok(entry_content) = tokio::fs::read(&entry_path).await
         {
+            if entry_content.len() > MAX_RESPONSE_SIZE {
+                return (StatusCode::PAYLOAD_TOO_LARGE, "Response too large").into_response();
+            }
             return (
                 [
                     (
@@ -2895,20 +3571,49 @@ async fn virtual_id_handler(
 async fn public_dir_handler(
     State(state): State<Arc<DevServerState>>,
     Path(path): Path<String>,
+    request_headers: HeaderMap,
 ) -> Response {
     let public_dir = &state.config.dev_server.public_dir;
     let public_path = state.config.root.join(public_dir).join(&path);
+
+    // Security: prevent path traversal via `../` in the request path
+    if !is_path_within(&public_path, &state.config.root) {
+        return (StatusCode::FORBIDDEN, "Path traversal denied").into_response();
+    }
 
     if !public_path.exists() || !public_path.is_file() {
         return (StatusCode::NOT_FOUND, "Static asset not found").into_response();
     }
 
     if let Ok(content) = tokio::fs::read(&public_path).await {
+        if content.len() > MAX_RESPONSE_SIZE {
+            return (StatusCode::PAYLOAD_TOO_LARGE, "Response too large").into_response();
+        }
         let content_type = guess_content_type(&path);
+
+        // Compute ETag from content hash for conditional requests
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut hasher = DefaultHasher::new();
+        content.hash(&mut hasher);
+        let etag = format!("\"{:x}\"", hasher.finish());
+
+        // Check If-None-Match for conditional request — return 304 if ETag matches
+        if let Some(if_none_match) = request_headers.get("if-none-match") {
+            if if_none_match == etag.as_bytes() {
+                return (
+                    StatusCode::NOT_MODIFIED,
+                    [(header::ETAG, etag.as_str())],
+                )
+                    .into_response();
+            }
+        }
+
         return (
             [
                 (header::CONTENT_TYPE, content_type),
                 (header::CACHE_CONTROL, "public, max-age=3600"),
+                (header::ETAG, etag.as_str()),
             ],
             content,
         )

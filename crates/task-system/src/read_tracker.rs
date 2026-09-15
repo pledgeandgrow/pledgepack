@@ -55,7 +55,11 @@ impl ReadTracker {
             } else {
                 std::env::current_dir().unwrap_or_default().join(path.as_ref())
             };
-            self.reads.insert(abs);
+            // Canonicalize to handle symlinks and relative paths consistently.
+            // Falls back to the non-canonical absolute path if canonicalization
+            // fails (e.g., the file doesn't exist yet).
+            let canonical = std::fs::canonicalize(&abs).unwrap_or(abs);
+            self.reads.insert(canonical);
         }
     }
 
@@ -251,7 +255,10 @@ mod tests {
             read_to_string(&file_path).unwrap()
         });
 
-        assert!(tracker.reads().contains(&file_path));
+        // record_read canonicalizes the path, so compare against the
+        // canonical version of the file path.
+        let canonical = std::fs::canonicalize(&file_path).unwrap_or(file_path);
+        assert!(tracker.reads().contains(&canonical));
     }
 
     #[test]

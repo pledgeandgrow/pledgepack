@@ -5,7 +5,7 @@
 ### PledgePack (Bundler / Build Tool)
 - **Role:** Framework-agnostic bundler, dev server, and build tool (like Turbopack/esbuild/SWC)
 - **Repository:** `https://github.com/pledgeandgrow/pledgepack`
-- **npm package:** `pledgepack` (currently `0.1.8`)
+- **npm package:** `pledgepack` (currently `0.3.2`)
 - **Binary:** Native Rust binary (`pledge.exe` / `pledge`) distributed via GitHub Releases + postinstall download
 - **Language:** Rust (Oxc parser, Lightning CSS, QuickJS JS runtime for plugin host and tests, wasmtime for WASM plugins)
 - **CLI:** `pledge dev`, `pledge build`, `pledge serve`, `pledge test`, `pledge analyze`, `pledge create`, `pledge migrate`, `pledge doctor`, `pledge bench`, `pledge cache`, `pledge generate-env-types`, `pledge completions`, `pledge config`
@@ -13,7 +13,7 @@
 ### PledgeStack (React Framework)
 - **Role:** Opinionated React framework with SSR/SSG/RSC, file-based routing, API routes (like Next.js is to Turbopack)
 - **Repository:** `https://github.com/pledgeandgrow/pledgestack` (monorepo)
-- **npm package:** `pledgestack` (published, currently `0.1.2`)
+- **npm package:** `pledgestack` (published, currently `0.1.12`)
 - **Language:** TypeScript/JavaScript (depends on pledgepack binary)
 - **CLI:** `pledge dev`, `pledge build`, `pledge start` (wraps `pledge` binary)
 
@@ -31,7 +31,7 @@ User installs pledgestack (framework)
 ```json
 {
   "dependencies": {
-    "pledgepack": "^0.1.8"
+    "pledgepack": "^0.3.2"
   }
 }
 ```
@@ -267,7 +267,7 @@ pledgepack/
 │   └── postinstall.js     # Downloads binary from GitHub Releases
 ├── pledgepack/
 │   └── index.js           # Programmatic API (runPledgepack, resolveBinary)
-├── package.json           # name: "pledgepack", version: "0.1.8"
+├── package.json           # name: "pledgepack", version: "0.3.2"
 ├── README.md
 └── LICENSE
 ```
@@ -283,7 +283,7 @@ pledgestack/
 │   │   │   ├── index.ts           # Re-exports all sub-packages
 │   │   │   └── ...
 │   │   ├── scripts/build.mjs      # esbuild bundler (bundles all sub-packages into dist/)
-│   │   ├── package.json           # name: "pledgestack", deps: { pledgepack: "^0.1.8" }
+│   │   ├── package.json           # name: "pledgestack", deps: { pledgepack: "^0.3.2" }
 │   │   └── README.md
 │   ├── shared/                    # Private — bundled into CLI via esbuild aliases
 │   ├── core/                      # Private — bundled into CLI
@@ -441,7 +441,7 @@ Inside each archive: a single binary named `pledge` (Unix) or `pledge.exe` (Wind
 - `crates/core/src/edge.rs` — Edge bundle generation
 - `bin/pledge.js` — JS shim that resolves and spawns native binary
 - `bin/postinstall.js` — Downloads binary from GitHub Releases
-- `package.json` — npm package definition (`pledgepack@0.1.8`)
+- `package.json` — npm package definition (`pledgepack@0.3.2`)
 
 ### PledgeStack (pledgeandgrow/pledgestack repo)
 - `packages/cli/` — Main framework package (published as `pledgestack` on npm)
@@ -461,9 +461,90 @@ Inside each archive: a single binary named `pledge` (Unix) or `pledge.exe` (Wind
 ## Versioning Strategy
 
 - **PledgePack** and **PledgeStack** version independently
-- PledgeStack `package.json` specifies `pledgepack: "^0.1.8"` (caret range)
+- PledgeStack `package.json` specifies `pledgepack: "^0.3.2"` (caret range)
 - Breaking changes in PledgePack require PledgeStack to update its dependency range
-- PledgeStack can pin PledgePack version for stability: `pledgepack: "0.1.8"` (exact)
+- PledgeStack can pin PledgePack version for stability: `pledgepack: "0.3.2"` (exact)
+
+---
+
+## Compatibility Matrix
+
+PRODUCTION-READINESS-100.md goal 86. This is the actual mechanism, and the
+actual verified-together versions as of this writing — **not** a claim that
+every listed PledgePack version has been tested against every listed
+PledgeStack version. There is no cross-repo CI yet enforcing this (see the
+"Cross-Repo CI" section below); until there is, treat this table as "these
+were the versions in each repo's `package.json` on the date shown," not as
+independently verified compatibility.
+
+| PledgePack | `bundler-pledgepack` | PledgeStack (`pledgestack` CLI) | Manifest schema version | Date | Verified together? |
+|---|---|---|---|---|---|
+| 0.3.2 | 0.1.4 | 0.1.12 | 1 (`RouteManifest::SCHEMA_VERSION`, added 2026-09-15) | 2026-09-15 | No — versions recorded, not cross-tested. See goal 87. |
+
+**How compatibility is actually checked at runtime** (goal 81, implemented
+2026-09-15): every PledgePack dev-server response carries an
+`X-Pledgepack-Schema-Version` header, and `__pledge_ps_manifest.json` carries
+a `schema_version` field, both sourced from the single
+`pledgepack_core::PLEDGESTACK_MANIFEST_SCHEMA_VERSION` constant. `bundler-pledgepack`
+checks both (`waitForServer` for the header, `loadManifest` for the manifest
+field — see `packages/bundler-pledgepack/src/index.ts`) and **warns**, rather
+than hard-fails, on a mismatch — an older PledgeStack talking to a newer
+PledgePack (or vice versa) keeps working as long as the fields it actually
+reads are still present; the warning is what tells you it might not be safe
+to assume so.
+
+To update this table: bump the row whenever you deliberately test a new
+PledgePack/PledgeStack pairing together (a real dev server run, not just
+"the versions happened to both be installed"), and bump
+`RouteManifest::SCHEMA_VERSION` / `PLEDGESTACK_MANIFEST_SCHEMA_VERSION`
+together (they're the same constant, re-exported) whenever `RouteManifest`'s
+shape changes in a way a consumer should know about.
+
+---
+
+## Integration Failure Modes
+
+PRODUCTION-READINESS-100.md goal 88. The exact, current user-facing
+behavior for each way this integration can fail — so failures are
+predictable and testable, not "whatever the stack trace happens to say."
+Message text below is quoted from the actual source as of 2026-09-15; if
+you change the code, keep this table in sync (nothing enforces that
+automatically — see goal 92's per-crate-test-count check for the closest
+existing analogue, which doesn't cover this specific kind of drift).
+
+| Failure | Where it's detected | User-facing message | Recovery |
+|---|---|---|---|
+| PledgePack binary not found/not built | `startDevServer`, before spawning | `PledgePack binary not found. Run "cargo build --release" in the pledgepack package.` | Build the binary, or reinstall the `pledgepack` npm package. |
+| `runPledgepack()` binary not found (build/transform path) | `binary-resolver.ts`'s `runPledgepack` | `pledgepack binary not found. The native binary may not have been downloaded. Try running "pnpm rebuild pledgepack" or install the platform-specific package.` | Same as above. |
+| Dev server port already in use | `checkPortAvailable`, before spawning (goal 80) | `Port {port} on {hostname} is already in use — is another dev server (or a previous PledgePack instance that didn't shut down cleanly) still running on it?` | Stop the other process, or pass a different `bundlerPort`. |
+| Spawn itself fails (binary exists but can't exec — wrong arch, corrupted download, permissions) | `proc.on('error', ...)` during startup (goal 78) | `Failed to launch the PledgePack dev server binary ({path}): {os error}` | Re-download/rebuild the binary; check it's executable and matches the host architecture. |
+| Process exits before ever responding | `proc.on('exit', ...)` during startup (goal 78) | `PledgePack dev server process exited before it started responding (code={code}, signal={signal}). Check its output above for the real cause.` | The binary's own stdout/stderr (inherited to the parent process) has the real error — read it. |
+| Dev server never becomes reachable within 5s, no process-exit signal (hung, or genuinely slow to bind) | `waitForServer` timeout (goal 79) | `PledgePack dev server did not start within 5000ms` + a reason suffix when the retry loop has a consistent error (`ECONNREFUSED`/`ECONNRESET` explained inline) | Check the binary's own output; a persistent `ECONNREFUSED` suffix means the process is alive but never opened the port. |
+| Dev server crashes *after* successfully starting | `attachCrashHandler`'s `exit` listener (goal 83) | Logged, not thrown: `[pledgepack] dev server crashed (code=..., signal=...) — restarting in {delay}ms (attempt N/5)`, then after 5 attempts: `...and has exceeded 5 restart attempts — giving up. Run "pledge dev" directly to see the underlying error.` | Automatic up to 5 attempts (exponential backoff, capped at 30s); after that, run `pledge dev` directly to see what's actually failing. |
+| `stop()` called but the process doesn't exit from SIGTERM | `stopProcessGracefully` (goal 84) | Logged: `[pledgepack] dev server did not exit within 5000ms of SIGTERM — sending SIGKILL` | Automatic — escalates to SIGKILL. |
+| Route manifest missing entirely | `loadManifest` | Silent — `resolveProductionPath` falls through to its other path-guessing strategies. This is intentional (the manifest not existing yet, e.g. before the first build, is a normal state, not an error). | Run `pledge build`. |
+| Route manifest present but malformed/unparseable | `loadManifest` (goal 82) | `[pledgepack] Route manifest at {path} is not valid JSON ({error}) — falling back to path-guessing. This usually means the manifest was read mid-write; if it persists, re-run "pledge build".` | Re-run the build; if it persists, the manifest generation itself may be broken (check the PledgePack binary's own output). |
+| Route manifest schema version mismatch | `loadManifest` / dev-server response header (goal 81/82) | `[pledgepack] Route manifest at {path} has schema_version {N}, {older,newer} than this adapter {expects,understands} ({M})...` | Upgrade whichever side is behind. Not fatal — proceeds with a warning either way. |
+| Production module genuinely not found after a real build | `resolveProductionPath`, all 4 strategies exhausted | `Production module not found: {sourcePath}\nExpected bundled output at: {directPath}\nTried alternatives: ...\nDid you run "pledge build" first?` | Run `pledge build`; if it still fails, the route/file may not exist or the build itself failed. |
+| Rust addon (`.psx`/`.ps`) compilation fails | `compileRustAddon` in `packages/server/src/transform.ts` | Mapped source-location errors when possible (goal #210's source-map mapping); otherwise `cargo exited with code {N}` | Read the (source-mapped, where possible) Rust compiler error. |
+| Rust addon compilation times out | `compileRustAddon`, `cargo`'s spawn `timeout` (goal 85) | `cargo build timed out after {N}ms` (previously the unhelpful `cargo exited with null`) | Increase `cargoConfig.timeout`, or investigate why the build is slow (cold cache, huge dependency tree). |
+
+---
+
+## Cross-Repo CI
+
+PRODUCTION-READINESS-100.md goal 87 — **not implemented.** Each repo's CI
+(`pledgepack/.github/workflows/ci.yml`, and pledgejs's own CI) tests itself
+in isolation; nothing runs PledgeStack's dev/build flow against a freshly
+built PledgePack binary (or vice versa) before either side ships. This is
+real, open work — the compatibility matrix above and the schema-version
+checks (goal 81) are the runtime safety net for a mismatch that already
+shipped; they're not a substitute for catching one before it ships. A
+reasonable shape for this (not yet built): a workflow in one repo that
+checks out the other at a pinned ref, builds it, and runs a real
+`pledge dev` + a PledgeStack page request against it — attempted; blocked
+on this pass by the same repo-in-flux constraints noted elsewhere in
+PRODUCTION-READINESS-100.md (Phase 3-4's verification notes).
 
 ---
 
@@ -471,9 +552,9 @@ Inside each archive: a single binary named `pledge` (Unix) or `pledge.exe` (Wind
 
 ```
 1. Build PledgePack binary:     cargo build --release
-2. Create GitHub Release:       gh release create v0.1.8 pledge-x86_64-pc-windows-msvc.zip
+2. Create GitHub Release:       gh release create v0.3.2 pledge-x86_64-pc-windows-msvc.zip
 3. Publish PledgePack to npm:   npm publish (from pledgepack repo)
-4. Update PledgeStack dependency:  pledgestack package.json → pledgepack: "^0.1.8"
+4. Update PledgeStack dependency:  pledgestack package.json → pledgepack: "^0.3.2"
 5. Publish PledgeStack to npm:     npm publish (from packages/cli directory)
 ```
 

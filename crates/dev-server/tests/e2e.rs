@@ -25,7 +25,7 @@ fn find_free_port() -> u16 {
 fn make_test_config(root: &std::path::Path, port: u16) -> PledgeConfig {
     PledgeConfig {
         root: root.to_path_buf(),
-        framework: Framework::PledgeStack,
+        framework: Framework::Pledge,
         mode: BuildMode::Development,
         dev_server: pledgepack_core::config::DevServerConfig {
             port,
@@ -46,7 +46,7 @@ fn make_test_config(root: &std::path::Path, port: u16) -> PledgeConfig {
 #[test]
 fn test_goal1_oxc_transform_produces_pledgejs_compatible_esm() {
     let config = PledgeConfig {
-        framework: Framework::PledgeStack,
+        framework: Framework::Pledge,
         mode: BuildMode::Development,
         ..Default::default()
     };
@@ -136,7 +136,7 @@ export const metadata = { title: "Counter" };
 #[test]
 fn test_goal1_oxc_transform_api_route_exports_preserved() {
     let config = PledgeConfig {
-        framework: Framework::PledgeStack,
+        framework: Framework::Pledge,
         ..Default::default()
     };
 
@@ -512,7 +512,7 @@ export default function App() {
         root: tmp.path().to_path_buf(),
         entry: vec!["src/index.tsx".to_string()],
         out_dir: out_dir.clone(),
-        framework: Framework::PledgeStack,
+        framework: Framework::Pledge,
         mode: BuildMode::Production,
         cache: pledgepack_core::config::CacheConfig {
             enabled: false,
@@ -1069,7 +1069,7 @@ async fn test_goal73_build_time_scaling() {
         root: tmp.path().to_path_buf(),
         entry: (0..10).map(|i| format!("src/page{}.tsx", i)).collect(),
         out_dir: out_dir.clone(),
-        framework: Framework::PledgeStack,
+        framework: Framework::Pledge,
         mode: BuildMode::Production,
         cache: pledgepack_core::config::CacheConfig {
             enabled: false,
@@ -1513,7 +1513,7 @@ async fn test_goal80_incremental_build_cache() {
         root: tmp.path().to_path_buf(),
         entry: (0..5).map(|i| format!("src/page{}.tsx", i)).collect(),
         out_dir: out_dir.clone(),
-        framework: Framework::PledgeStack,
+        framework: Framework::Pledge,
         mode: BuildMode::Production,
         cache: pledgepack_core::config::CacheConfig {
             enabled: true,
@@ -1541,4 +1541,201 @@ async fn test_goal80_incremental_build_cache() {
 
     // Verify cache directory path is valid
     assert!(cache_dir_valid, "Cache directory path should be valid");
+}
+
+// ── Security: Path traversal prevention ──
+
+#[tokio::test]
+async fn test_path_traversal_blocked() {
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().to_path_buf();
+
+    // Create a test app with the dev server router
+    let config = make_test_config(&root, find_free_port());
+    let app = pledgepack_dev_server::create_app(config);
+
+    // Attempt path traversal via `../` in the URI.
+    // The `.js` extension ensures the catch-all route dispatches to
+    // module_handler, which checks for path traversal.
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/../../etc/passwd.js")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    // The response must NOT be 200 OK — traversal should be denied
+    assert_ne!(
+        response.status(),
+        axum::http::StatusCode::OK,
+        "Path traversal should not return 200 OK, got {}",
+        response.status()
+    );
+}
+
+#[tokio::test]
+async fn test_fs_handler_node_modules_bypass_blocked() {
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().to_path_buf();
+
+    // Create a fake "node_modules" directory outside root
+    let outside = temp.path().parent().unwrap().join("evil_node_modules");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("secret.txt"), "secret").unwrap();
+
+    // Create a test app with the dev server router
+    let config = make_test_config(&root, find_free_port());
+    let app = pledgepack_dev_server::create_app(config);
+
+    // Attempt to access a file via a path containing "node_modules" but
+    // that actually resolves outside the project root.
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/@fs/../evil_node_modules/secret.txt")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_ne!(
+        response.status(),
+        axum::http::StatusCode::OK,
+        "node_modules string bypass should not return 200 OK"
+    );
+
+    // Clean up the outside directory so it doesn't interfere with other tests
+    let _ = std::fs::remove_dir_all(&outside);
+}
+
+// ─── Goal 77: adversarial tests for /@id, and the vulnerability they found ──
+//
+// Writing these against `virtual_id_handler` (the `/@id/*path` route)
+// surfaced a real, unpatched path-traversal bug: unlike `virtual_fs_handler`
+// above (which canonicalizes and checks containment via `is_path_within`
+// before every read), `virtual_id_handler` joined the attacker-controlled
+// path segment onto the project root and read the result with no
+// containment check at all, in any of its three resolution branches
+// (node_modules direct, root-relative, package.json main/module entry).
+// Fixed alongside these tests, not found by them after the fact — see
+// PRODUCTION-READINESS-100.md goal 77.
+
+#[tokio::test]
+async fn test_id_handler_root_relative_traversal_blocked() {
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().to_path_buf();
+
+    // A secret file that exists on disk, outside the project root, that a
+    // successful traversal would read.
+    let outside_dir = temp.path().parent().unwrap().join("id_handler_secret_dir");
+    std::fs::create_dir_all(&outside_dir).unwrap();
+    std::fs::write(outside_dir.join("secret.txt"), "top-secret-content").unwrap();
+
+    let config = make_test_config(&root, find_free_port());
+    let app = pledgepack_dev_server::create_app(config);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/@id/../{}/secret.txt",
+                    outside_dir.file_name().unwrap().to_str().unwrap()
+                ))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_ne!(
+        response.status(),
+        axum::http::StatusCode::OK,
+        "/@id/ path traversal should not return 200 OK, got {}",
+        response.status()
+    );
+
+    let _ = std::fs::remove_dir_all(&outside_dir);
+}
+
+#[tokio::test]
+async fn test_id_handler_node_modules_traversal_blocked() {
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().to_path_buf();
+    std::fs::create_dir_all(root.join("node_modules")).unwrap();
+
+    let outside_dir = temp.path().parent().unwrap().join("id_handler_nm_secret");
+    std::fs::create_dir_all(&outside_dir).unwrap();
+    std::fs::write(outside_dir.join("secret.txt"), "top-secret-content").unwrap();
+
+    let config = make_test_config(&root, find_free_port());
+    let app = pledgepack_dev_server::create_app(config);
+
+    // node_modules/../../id_handler_nm_secret/secret.txt escapes both
+    // node_modules and the project root.
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/@id/../../{}/secret.txt",
+                    outside_dir.file_name().unwrap().to_str().unwrap()
+                ))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_ne!(
+        response.status(),
+        axum::http::StatusCode::OK,
+        "/@id/ node_modules traversal should not return 200 OK, got {}",
+        response.status()
+    );
+
+    let _ = std::fs::remove_dir_all(&outside_dir);
+}
+
+#[tokio::test]
+async fn test_id_handler_legitimate_root_relative_file_still_works() {
+    // A regression guard for the fix above: legitimate in-project /@id/
+    // requests must keep working, not just get universally denied.
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().to_path_buf();
+    std::fs::write(root.join("safe.js"), "export default 1;").unwrap();
+
+    let config = make_test_config(&root, find_free_port());
+    let app = pledgepack_dev_server::create_app(config);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/@id/safe.js")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::OK,
+        "legitimate /@id/ request should still succeed after the traversal fix"
+    );
 }

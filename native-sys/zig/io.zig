@@ -48,9 +48,17 @@ pub fn readFile(
     defer _ = fclose(fp);
 
     // Get file size
-    _ = fseek(fp, 0, SEEK_END);
-    const size: usize = @intCast(ftell(fp));
-    _ = fseek(fp, 0, SEEK_SET);
+    if (fseek(fp, 0, SEEK_END) != 0) {
+        return -1;
+    }
+    const ftell_result = ftell(fp);
+    if (ftell_result < 0) {
+        return -1;
+    }
+    const size: usize = @intCast(ftell_result);
+    if (fseek(fp, 0, SEEK_SET) != 0) {
+        return -1;
+    }
 
     if (size == 0) {
         const empty_buf = allocator.alloc(u8, 1) catch return -1;
@@ -222,7 +230,17 @@ pub const IoUringParams = extern struct {
 };
 
 /// Batch-read files using io_uring on Linux.
-/// Falls back to thread pool if io_uring setup fails.
+///
+/// NOTE: This is a stub implementation that delegates to the thread pool.
+/// TODO: Implement actual io_uring batch reads for Linux 5.1+.
+/// A full io_uring implementation would:
+/// 1. Call io_uring_setup() to create a submission/completion ring
+/// 2. Submit IORING_OP_READ for each file
+/// 3. Call io_uring_enter() to submit and wait for completions
+/// 4. Collect results from the completion queue
+///
+/// The thread pool fallback is already efficient for most workloads.
+/// io_uring provides ~24% throughput improvement for very large file counts (>100).
 pub fn readFilesIoUring(
     paths_ptr: [*]const [*]const u8,
     paths_len_ptr: [*]const usize,
@@ -230,15 +248,7 @@ pub fn readFilesIoUring(
     out_bufs: [*][*]u8,
     out_lens: [*]usize,
 ) c_int {
-    // For now, delegate to the thread pool implementation.
-    // A full io_uring implementation would:
-    // 1. Call io_uring_setup() to create a submission/completion ring
-    // 2. Submit IORING_OP_READ for each file
-    // 3. Call io_uring_enter() to submit and wait for completions
-    // 4. Collect results from the completion queue
-    //
-    // The thread pool fallback is already efficient for most workloads.
-    // io_uring provides ~24% throughput improvement for very large file counts (>100).
+    // STUB: Falls back to thread pool. See readFilesBatch for actual implementation.
     return readFilesBatch(paths_ptr, paths_len_ptr, count, out_bufs, out_lens);
 }
 
@@ -254,7 +264,18 @@ pub const windows = struct {
 };
 
 /// Batch-read files using IOCP on Windows.
-/// Falls back to thread pool if IOCP setup fails.
+///
+/// NOTE: This is a stub implementation that delegates to the thread pool.
+/// TODO: Implement actual IOCP batch reads for Windows.
+/// A full IOCP implementation would:
+/// 1. Create an I/O completion port
+/// 2. Open each file with FILE_FLAG_OVERLAPPED
+/// 3. Associate each file handle with the completion port
+/// 4. Issue overlapped ReadFile calls
+/// 5. Wait for completions via GetQueuedCompletionStatus
+///
+/// The thread pool fallback works well on Windows since Windows
+/// has efficient thread scheduling for I/O-bound workloads.
 pub fn readFilesIOCP(
     paths_ptr: [*]const [*]const u8,
     paths_len_ptr: [*]const usize,
@@ -262,16 +283,7 @@ pub fn readFilesIOCP(
     out_bufs: [*][*]u8,
     out_lens: [*]usize,
 ) c_int {
-    // For now, delegate to the thread pool implementation.
-    // A full IOCP implementation would:
-    // 1. Create an I/O completion port
-    // 2. Open each file with FILE_FLAG_OVERLAPPED
-    // 3. Associate each file handle with the completion port
-    // 4. Issue overlapped ReadFile calls
-    // 5. Wait for completions via GetQueuedCompletionStatus
-    //
-    // The thread pool fallback works well on Windows since Windows
-    // has efficient thread scheduling for I/O-bound workloads.
+    // STUB: Falls back to thread pool. See readFilesBatch for actual implementation.
     return readFilesBatch(paths_ptr, paths_len_ptr, count, out_bufs, out_lens);
 }
 
@@ -280,7 +292,17 @@ pub fn readFilesIOCP(
 // Uses kqueue with EVFILT_READ for async file I/O on macOS and BSD.
 
 /// Batch-read files using kqueue on macOS/BSD.
-/// Falls back to thread pool if kqueue setup fails.
+///
+/// NOTE: This is a stub implementation that delegates to the thread pool.
+/// TODO: Implement actual kqueue batch reads for macOS/BSD.
+/// A full kqueue implementation would:
+/// 1. Create a kqueue
+/// 2. Open files with O_NONBLOCK
+/// 3. Register EVFILT_READ events for each file descriptor
+/// 4. Call kevent() to wait for readable events
+/// 5. Read from ready file descriptors
+///
+/// kqueue is particularly efficient for monitoring many file descriptors.
 pub fn readFilesKqueue(
     paths_ptr: [*]const [*]const u8,
     paths_len_ptr: [*]const usize,
@@ -288,15 +310,7 @@ pub fn readFilesKqueue(
     out_bufs: [*][*]u8,
     out_lens: [*]usize,
 ) c_int {
-    // For now, delegate to the thread pool implementation.
-    // A full kqueue implementation would:
-    // 1. Create a kqueue
-    // 2. Open files with O_NONBLOCK
-    // 3. Register EVFILT_READ events for each file descriptor
-    // 4. Call kevent() to wait for readable events
-    // 5. Read from ready file descriptors
-    //
-    // kqueue is particularly efficient for monitoring many file descriptors.
+    // STUB: Falls back to thread pool. See readFilesBatch for actual implementation.
     return readFilesBatch(paths_ptr, paths_len_ptr, count, out_bufs, out_lens);
 }
 

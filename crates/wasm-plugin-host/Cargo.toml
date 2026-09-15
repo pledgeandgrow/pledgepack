@@ -3,7 +3,11 @@ name = "pledgepack-wasm-plugin-host"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish.workspace = true
 description = "WASM Component Model plugin host for PledgePack — sandboxed plugins with fine-grained cache"
+repository = "https://github.com/pledgeandgrow/pledgepack"
+keywords = ["bundler", "build", "rust"]
+categories = ["web-programming", "compilers"]
 
 [dependencies]
 serde = { workspace = true }
@@ -14,6 +18,9 @@ blake3 = { workspace = true }
 wasmtime = { workspace = true }
 wasmtime-wasi = { workspace = true }
 pledgepack-core = { workspace = true }
+parking_lot = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+ed25519-dalek = { workspace = true }
+hex = { workspace = true }

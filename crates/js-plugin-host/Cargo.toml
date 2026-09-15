@@ -3,6 +3,11 @@ name = "pledgepack-js-plugin-host"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish.workspace = true
+description = "JS plugin host for PledgePack"
+repository = "https://github.com/pledgeandgrow/pledgepack"
+keywords = ["bundler", "build", "rust"]
+categories = ["web-programming", "compilers"]
 
 [dependencies]
 serde = { workspace = true }
@@ -11,3 +16,10 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 rquickjs = "0.12"
 pledgepack-core = { workspace = true }
+# Content-hash check for the plugin signing sidecar (goal 12).
+blake3 = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+ed25519-dalek = { workspace = true }
+hex = { workspace = true }

@@ -58,7 +58,7 @@ impl ReactAdapter {
             ..
         } = Parser::new(&allocator, source, source_type).parse();
 
-        if (panicked || !parser_errors.is_empty()) && panicked {
+        if panicked || !parser_errors.is_empty() {
             anyhow::bail!(
                 "Failed to parse {}: {}",
                 file_path,
@@ -89,8 +89,12 @@ impl ReactAdapter {
         let transform_result = transformer.build_with_scoping(scoping, &mut program);
 
         if !transform_result.diagnostics.is_empty() {
+            let has_errors = transform_result.diagnostics.has_errors();
             for err in &transform_result.diagnostics {
                 tracing::warn!("Transform error in {}: {:?}", file_path, err);
+            }
+            if has_errors {
+                anyhow::bail!("Transform errors in {}", file_path);
             }
         }
 
@@ -235,5 +239,28 @@ mod tests {
             extract_function_name("function MyComponent(props) {"),
             Some("MyComponent".to_string())
         );
+    }
+
+    // PRODUCTION-READINESS-100.md goal 93: adapter-solid's transform() was
+    // found to crash deterministically inside oxc's Codegen::build() (ropey
+    // rope_builder.rs:248, Option::unwrap on None — see adapter-solid's own
+    // tests). This crate's `transform()` calls `Codegen::new().with_options
+    // (...).build(&program)` with the *same* options pattern, so this test
+    // exists to answer: is the crash systemic to this oxc/ropey pin (would
+    // affect every adapter, including this one, in real builds) or specific
+    // to something Solid does (its `jsx.import_source` setting, most
+    // likely)? See PRODUCTION-READINESS-100.md Phase 8 goal 93 for the
+    // result and full writeup.
+    #[test]
+    fn transform_simple_jsx_does_not_crash_codegen() {
+        let adapter = ReactAdapter::new();
+        let result = adapter.transform(
+            "function App() { return <div>hello</div>; }",
+            pledgepack_core::module::ModuleKind::Jsx,
+            "App.jsx",
+            false,
+        );
+        assert!(result.is_ok(), "transform failed: {:?}", result.err());
+        assert!(result.unwrap().code.contains("hello"));
     }
 }

@@ -227,35 +227,12 @@ impl MiddlewareFn {
     }
 }
 
-/// Apply CORS headers to a response
-#[allow(dead_code)]
-pub fn apply_cors_headers(
-    response: &mut axum::response::Response,
-    origin: &str,
-    methods: &[String],
-    headers: &[String],
-) {
-    let headers_map = response.headers_mut();
-    headers_map.insert(
-        axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN,
-        axum::http::HeaderValue::from_str(origin)
-            .unwrap_or_else(|_| axum::http::HeaderValue::from_static("*")),
-    );
-    headers_map.insert(
-        axum::http::header::ACCESS_CONTROL_ALLOW_METHODS,
-        axum::http::HeaderValue::from_str(&methods.join(", "))
-            .unwrap_or_else(|_| axum::http::HeaderValue::from_static("GET, POST, OPTIONS")),
-    );
-    headers_map.insert(
-        axum::http::header::ACCESS_CONTROL_ALLOW_HEADERS,
-        axum::http::HeaderValue::from_str(&headers.join(", "))
-            .unwrap_or_else(|_| axum::http::HeaderValue::from_static("Content-Type")),
-    );
-}
-
-/// Check if a request path matches a rewrite rule and return the rewritten path
-#[allow(dead_code)]
-pub fn apply_rewrite(path: &str, from: &str, to: &str) -> Option<String> {
-    path.strip_prefix(from)
-        .map(|rest| format!("{}{}", to, rest))
-}
+// PRODUCTION-READINESS-100.md goal 91: `apply_cors_headers` and
+// `apply_rewrite` were removed from here — both were confirmed genuinely
+// unused (zero call sites anywhere in this repo or in pledgejs) rather than
+// reserved for a specific planned feature. `apply_cors_headers` in
+// particular was a hand-rolled, never-wired CORS implementation that had
+// been superseded by the real one: `DevServerConfig.cors` +
+// `tower_http::cors::CorsLayer` in `crates/dev-server/src/lib.rs`'s
+// `serve()` (see Phase 1 goal 16) — keeping both around risked a future
+// reader mistaking the dead one for the active implementation.

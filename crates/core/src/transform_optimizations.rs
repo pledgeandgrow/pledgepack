@@ -83,7 +83,7 @@ pub fn compile_to_wasm(
     let exports = extract_export_signatures(source);
 
     // Generate JS glue code for loading WASM
-    let wasm_url = format!("/{}", clean_path.replace('\\', "/"));
+    let wasm_url = format!("/{}", crate::normalize_path_str(&clean_path));
     let mut js_glue = String::new();
 
     js_glue.push_str(&format!(
@@ -180,6 +180,81 @@ pub struct SideEffectAnalysis {
     pub impure_exports: Vec<String>,
 }
 
+/// Count net brace depth change in a line, skipping braces inside string literals,
+/// template literals (backticks), and comments. This prevents brace tracking from
+/// breaking on template literals containing `{` or `}` and on regex patterns.
+fn count_braces_skip_strings(line: &str) -> i32 {
+    let chars: Vec<char> = line.chars().collect();
+    let mut depth: i32 = 0;
+    let mut i = 0;
+
+    while i < chars.len() {
+        let c = chars[i];
+
+        // Skip single-quoted and double-quoted string literals
+        if c == '"' || c == '\'' {
+            let quote = c;
+            i += 1;
+            while i < chars.len() {
+                if chars[i] == '\\' && i + 1 < chars.len() {
+                    i += 2;
+                    continue;
+                }
+                if chars[i] == quote {
+                    break;
+                }
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+
+        // Skip template literals (backtick strings) — don't count braces inside them
+        if c == '`' {
+            i += 1;
+            while i < chars.len() {
+                if chars[i] == '\\' && i + 1 < chars.len() {
+                    i += 2;
+                    continue;
+                }
+                if chars[i] == '`' {
+                    break;
+                }
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+
+        // Skip line comments
+        if c == '/' && i + 1 < chars.len() && chars[i + 1] == '/' {
+            break; // rest of line is comment
+        }
+
+        // Skip block comments
+        if c == '/' && i + 1 < chars.len() && chars[i + 1] == '*' {
+            i += 2;
+            while i + 1 < chars.len() {
+                if chars[i] == '*' && chars[i + 1] == '/' {
+                    i += 2;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+
+        match c {
+            '{' => depth += 1,
+            '}' => depth -= 1,
+            _ => {}
+        }
+        i += 1;
+    }
+
+    depth
+}
+
 /// Analyze a module's source for side effects
 pub fn analyze_side_effects(source: &str) -> SideEffectAnalysis {
     let mut side_effect_count = 0;
@@ -194,16 +269,16 @@ pub fn analyze_side_effects(source: &str) -> SideEffectAnalysis {
     // 4. console.* calls
     // 5. DOM manipulation (document.*, window.*)
 
-    let mut in_function = 0u32;
-    let mut in_class = 0u32;
-    let mut brace_depth = 0u32;
+    let mut in_function = 0i32;
+    let mut in_class = 0i32;
+    let mut brace_depth = 0i32;
 
     for line in source.lines() {
         let trimmed = line.trim();
 
-        // Track nesting
-        brace_depth =
-            brace_depth + trimmed.matches('{').count() as u32 - trimmed.matches('}').count() as u32;
+        // Track nesting — use string-aware brace counting to avoid breaking
+        // on template literals (backtick strings) and regex containing braces
+        brace_depth += count_braces_skip_strings(trimmed);
 
         if trimmed.starts_with("function ") || trimmed.contains("function ") {
             in_function = brace_depth;
@@ -496,7 +571,12 @@ pub fn analyze_cross_chunk_hoisting(
                             continue;
                         }
                         for other_module in other_modules {
-                            if other_module.contains(import.as_str()) {
+                            // Use exact match instead of substring match to avoid
+                            // matching "util" against "utility", "utils", "my-utils", etc.
+                            if other_module == import.as_str()
+                                || other_module.ends_with(&format!("/{}", import))
+                                || other_module.ends_with(&format!("\\{}", import))
+                            {
                                 // Check if already tracked
                                 let exists = hoisted.iter().any(|h: &HoistedVariable| {
                                     h.name == *import
@@ -830,6 +910,100 @@ pub fn fold_constants(source: &str) -> String {
     result
 }
 
+/// Compute a mask indicating which byte positions are inside string literals,
+/// comments, or regex patterns. Positions marked `true` should be skipped
+/// during constant folding to avoid corrupting string/comment/regex content.
+fn compute_skip_mask(code: &str) -> Vec<bool> {
+    let bytes = code.as_bytes();
+    let mut mask = vec![false; bytes.len()];
+    let mut i = 0;
+
+    while i < bytes.len() {
+        // Skip string literals (single, double, backtick)
+        if bytes[i] == b'"' || bytes[i] == b'\'' || bytes[i] == b'`' {
+            let quote = bytes[i];
+            mask[i] = true;
+            i += 1;
+            while i < bytes.len() {
+                mask[i] = true;
+                if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                    mask[i + 1] = true;
+                    i += 2;
+                    continue;
+                }
+                if bytes[i] == quote {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+
+        // Skip line comments
+        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'/' {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                mask[i] = true;
+                i += 1;
+            }
+            continue;
+        }
+
+        // Skip block comments
+        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            mask[i] = true;
+            mask[i + 1] = true;
+            i += 2;
+            while i + 1 < bytes.len() {
+                mask[i] = true;
+                if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                    mask[i + 1] = true;
+                    i += 2;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+
+        // Skip regex literals (simplified: /pattern/flags)
+        // Only treat / as regex if preceded by an operator-like character
+        if bytes[i] == b'/' && i > 0 {
+            let prev = bytes[i - 1];
+            if matches!(
+                prev,
+                b'(' | b'=' | b',' | b':' | b'[' | b'!' | b'&' | b'|' | b'?'
+            ) {
+                mask[i] = true;
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'/' && bytes[i] != b'\n' {
+                    mask[i] = true;
+                    if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                        mask[i + 1] = true;
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                }
+                // Mark closing / and any flags
+                if i < bytes.len() && bytes[i] == b'/' {
+                    mask[i] = true;
+                    i += 1;
+                    while i < bytes.len() && bytes[i].is_ascii_alphabetic() {
+                        mask[i] = true;
+                        i += 1;
+                    }
+                }
+                continue;
+            }
+        }
+
+        i += 1;
+    }
+
+    mask
+}
+
 fn fold_numeric_arithmetic(source: &str) -> String {
     let mut result = source.to_string();
 
@@ -839,8 +1013,14 @@ fn fold_numeric_arithmetic(source: &str) -> String {
         let mut found = false;
         // Search for patterns like " N + M " where N and M are numbers
         let bytes = result.as_bytes();
+        let skip_mask = compute_skip_mask(&result);
         let mut i = 0;
         while i < bytes.len() {
+            // Skip positions inside strings, comments, or regex
+            if skip_mask[i] {
+                i += 1;
+                continue;
+            }
             if bytes[i].is_ascii_digit()
                 || (bytes[i] == b'.' && i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit())
             {
@@ -857,16 +1037,20 @@ fn fold_numeric_arithmetic(source: &str) -> String {
                 while op_start < bytes.len() && bytes[op_start].is_ascii_whitespace() {
                     op_start += 1;
                 }
-                // Check for operator
-                if op_start < bytes.len() && "+-*/".contains(bytes[op_start] as char) {
+                // Check for operator (must not be inside a string/comment/regex)
+                if op_start < bytes.len()
+                    && !skip_mask[op_start]
+                    && "+-*/".contains(bytes[op_start] as char)
+                {
                     let op = bytes[op_start] as char;
                     // Skip whitespace after operator
                     let mut num2_start = op_start + 1;
                     while num2_start < bytes.len() && bytes[num2_start].is_ascii_whitespace() {
                         num2_start += 1;
                     }
-                    // Extract second number
+                    // Extract second number (must not be inside a string/comment/regex)
                     if num2_start < bytes.len()
+                        && !skip_mask[num2_start]
                         && (bytes[num2_start].is_ascii_digit() || bytes[num2_start] == b'.')
                     {
                         let mut num2_end = num2_start;
@@ -969,12 +1153,30 @@ fn fold_string_concat(source: &str) -> String {
 }
 
 fn fold_boolean(source: &str) -> String {
-    let mut result = source.to_string();
+    // Use skip mask to avoid replacing inside strings, comments, or regex
+    let skip_mask = compute_skip_mask(source);
+    let mut result = String::new();
+    let mut i = 0;
 
-    // true && X → X
-    result = result.replace("true && ", "");
-    // false || X → X
-    result = result.replace("false || ", "");
+    while i < source.len() {
+        if !skip_mask[i] {
+            // true && X → X (short-circuit: remove "true && ")
+            if source[i..].starts_with("true && ") {
+                i += "true && ".len();
+                continue;
+            }
+            // false || X → X (short-circuit: remove "false || ")
+            if source[i..].starts_with("false || ") {
+                i += "false || ".len();
+                continue;
+            }
+        }
+        // Copy the current character (preserves multi-byte UTF-8)
+        let ch = source[i..].chars().next().unwrap();
+        result.push(ch);
+        i += ch.len_utf8();
+    }
+
     // true ? X : Y → X
     // false ? X : Y → Y
     // These are more complex and would need proper parsing

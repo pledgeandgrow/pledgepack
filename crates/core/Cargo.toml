@@ -3,6 +3,11 @@ name = "pledgepack-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish.workspace = true
+description = "Core bundler engine for PledgePack"
+repository = "https://github.com/pledgeandgrow/pledgepack"
+keywords = ["bundler", "build", "rust"]
+categories = ["web-programming", "compilers"]
 
 [dependencies]
 serde = { workspace = true }
@@ -12,6 +17,17 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 blake3 = { workspace = true }
 sha2 = { workspace = true }
+hmac = { workspace = true }
+hex = { workspace = true }
+# Real Ed25519 signature verification for plugin signing (G12.35) — was
+# previously a non-empty-string check with the real check commented out.
+# See PRODUCTION-READINESS-100.md goal 11.
+ed25519-dalek = { workspace = true }
+# CSPRNG for a genuinely unguessable build-time obfuscation key (was derived
+# from SystemTime::now(), see PRODUCTION-READINESS-100.md goal 15). Pinned to
+# "0.8" to match crates/cache's existing pin rather than adding a 4th locked
+# `rand` version (see deny.toml's rand skip-entries).
+rand = "0.8"
 dashmap = { workspace = true }
 rayon = { workspace = true }
 tokio = { workspace = true }
@@ -78,11 +94,22 @@ grass = { workspace = true }
 # TOML parsing
 toml = { workspace = true }
 
+# JSON5 parsing (handles comments, trailing commas, unquoted keys in config files)
+json5 = "0.4"
+
 # HTTP client for plugin registry
 ureq = { workspace = true }
 
+# HTML parsing for security features (SRI injection, CSP analysis)
+scraper = { workspace = true }
+
 [dev-dependencies]
 tempfile = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "transform_bench"
+harness = false
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }

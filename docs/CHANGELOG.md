@@ -4,6 +4,177 @@ Development history of the Pledge build system enhancements.
 
 ---
 
+## [Unreleased] — Production Readiness
+
+### Summary
+Three audit batches implementing 150 production-readiness goals across security, correctness, transforms, HMR, resolver, dev server, native FFI, optimizer, module graph, engine, cache, CLI, cross-platform, and testing. All crates compile cleanly under `cargo check --target x86_64-pc-windows-gnu` except `wasm-plugin-host` (pre-existing wasmtime v28 API incompatibility).
+
+### Security
+- Fixed dev-server path traversal in `module_handler`/`public_dir_handler` (canonicalization)
+- Removed `/@fs/` `contains("node_modules")` bypass — canonical path checks
+- Added `RequestBodyLimitLayer` (10MB) to dev server
+- Added security headers (`X-Frame-Options`, `X-Content-Type-Options`, `Referrer-Policy`)
+- Fixed `read_file` FFI memory leak (`pledge_io_free`)
+- Randomized `stack_chk_guard` at startup (`init_stack_canary`)
+- Added null-pointer validation on all FFI return values
+- Added `CACHE_FORMAT_VERSION` to cache entries with mismatch detection
+- Deprecated XOR encryption; fixed empty-key panic
+- `prepare_psx_files()` path traversal validation
+
+### Transforms — JS
+- Fixed Fast Refresh type mismatch — `__pledge_fast_refresh` initialized as callable function
+- Fixed `extract_component_name` `const`/`export const` parsing bug
+- `is_react_component` regex cached in `OnceLock`
+- Transform diagnostics propagate as errors (`has_errors()`)
+- Browser targets and decorator support wired from tsconfig
+- Minifier `compress` options enabled
+
+### Transforms — CSS
+- CSS module class extraction rewritten (skips `url()`, strings, comments)
+- CSS source maps generated in production when `config.source_maps` is true
+- CSS minify skipped in dev mode
+- `flatten_nesting()` for CSS nesting transpilation
+- Browser targets passed to Lightning CSS
+- Dark mode handles component-scoped custom properties
+- CSS-in-JS extraction skips strings/comments
+- Escaped/unicode class names handled
+
+### Transforms — SFC
+- Vue `v-if`/`v-else`/`v-for` as real conditionals
+- Vue `v-model` for components, checkboxes, selects, modifiers
+- Svelte `{#if}`/`{:else}`/`{/if}` and `{#each}` blocks
+- Source maps for Vue, Svelte, Astro transforms
+- `extract_sfc_blocks` with depth tracking and attributes
+
+### Resolver
+- pnpm symlinked `node_modules` layout support
+- `browser` field object mapping support
+- Alias boundary enforcement (longest-first + path boundary)
+- `imports` field (`#` subpaths) resolution
+- Context-driven condition priority (`ResolveRuntime`/`ResolveModuleType`)
+
+### Module Graph & Optimizer
+- Cycle detection during graph construction (`can_reach`)
+- Deterministic topological ordering (`sort_unstable`)
+- `emit_with_chunks` wires optimizer chunk boundaries
+- `tree_shake` depth limit removed (`usize::MAX`)
+- Side-effect detection handles IIFEs and top-level `await`
+- `reverse_deps` deduplication
+- `can_reach` follows dynamic dependencies
+- `MAX_MODULES` limit + `.pledge.lock` file locking
+
+### Dev Server
+- Bounded `module_cache` and `import_graph` (LRU eviction)
+- Graceful SIGINT/SIGTERM shutdown
+- Brotli compression
+- ETag/Last-Modified conditional requests
+- SPA fallback for preview/serve
+- CORS middleware
+- Unix socket support (`--socket` CLI flag)
+- Response size limit (`MAX_RESPONSE_SIZE`)
+- `is_path_within` canonicalization (symlink-safe)
+- HMR diff `Insert` line number fixed
+- `sourceMappingURL` appended to dev JS responses
+- `accept()` callbacks invoked on update
+- CSS Modules HMR class-name remapping
+- `HmrDiffConfig` configurable thresholds
+
+### Engine & Cache
+- `parallel_fetch` uses `std::thread::scope`
+- `DedupCache` persistence (`persist()`/`load()`)
+- Deterministic signing key derivation (BLAKE3 KDF)
+- `function_cache` wrapped in `DashMap`
+- `panic = "unwind"` in release profile
+- Cache directory creation failure no longer silently ignored
+- Remote cache `set` errors logged
+
+### CLI
+- `pledge clean` command
+- `pledge update` self-update command
+- `pledge dev --socket` Unix socket flag
+- `validate_config_values()` — types, ranges, cross-field constraints
+- `description`/`license`/`repository`/`keywords`/`categories` on all crates
+
+### Data Transforms
+- Multiline `.env` values (quoted, backslash continuation)
+- `${VAR}` expansion cycle detection
+- Dead branch elimination improved
+- CSV parser handles quoted fields with commas
+- GraphQL keyword boundary checking
+- Source maps for all data transforms
+
+### Cross-Platform
+- `normalize_path()` utility for consistent path handling
+- CRLF normalization for source files
+- Path canonicalization for symlink safety
+
+### Tests
+- Optimizer tests
+- Resolver tests
+- Cache tests (`lib.rs`, `advanced.rs`, `remote.rs`, `git_cache.rs`)
+- HMR diff tests
+- JS/CSS/env transform edge case tests
+
+### Known Issues
+- `wasm-plugin-host` does not compile against wasmtime 28 — `WasiCtxView`, `HasSelf`, `p2::add_to_linker`, `StoreLimitsBuilder`, and `task_transform` module all changed. Pre-existing issue requiring a dedicated migration across ~17 wasmtime major versions.
+- `cargo test` on Windows may hit file-locking issues during `dlltool` (antivirus/indexing interference).
+- PostCSS full plugin ecosystem requires a Node.js subprocess (not implemented).
+
+---
+
+## [0.3.2] - 2026-08-05
+
+### Summary
+Framework rename and security hardening release. Renamed `Framework::PledgeStack` to `Framework::Pledge` (serializes as `"pledge"`), updated template names, and added supply-chain security improvements (SHA256 checksum verification, cosign artifact signing, stricter cargo-deny policy).
+
+### Changed
+- **Renamed `Framework::PledgeStack` to `Framework::Pledge`** — serializes as `"pledge"` instead of `"pledgestack"`
+- **Updated template name** from `"pledgestack"` to `"pledge"`
+- **Bumped cargo-deny bans** from `warn` to `deny` for `multiple-versions` and `wildcards`
+- **Pinned git dependencies** — `unknown-git` changed from `allow` to `deny` (no git dependencies in the project)
+
+### Security
+- **SHA256 checksum verification** in `bin/postinstall.js` — downloaded binaries are verified against a `.sha256` sidecar file published with each release
+- **Cosign artifact signing** — release artifacts are signed with `cosign sign-blob` (sigstore) in the release workflow
+- **Windows ARM64 build target** added to the release matrix (`aarch64-pc-windows-msvc`)
+
+### Fixed
+- Fixed duplicate import maps in build output
+- Fixed index.html path resolution
+- Fixed auto-install of dependencies on Windows
+- Fixed stale cache dependency re-injection
+- Fixed WIT version mismatch — test-plugin-guest `world.wit` now matches main WIT (added `schema-version: option<u32>` fields)
+- Fixed `wit/README.md` version references from v0.1.0 to v0.1.2
+- Documented `render-chunk` hook in `wit/README.md` hooks table and Vite/Rollup mapping
+- WASM E2E tests now fail (panic) when the guest artifact is missing instead of silently skipping
+
+### CI/CD
+- Added `cargo-llvm-cov` coverage job to CI workflow with Codecov upload
+- Added Dependabot config for cargo, github-actions, and npm ecosystems
+- Added SHA256 checksum generation and cosign signing steps to release workflow
+
+---
+
+## [0.3.1] - 2026-08-04
+
+### Summary
+Post-0.3.0 stabilization release. Template improvements and license policy fixes.
+
+### Changed
+- Added MPL-2.0, NCSA, and CDLA-Permissive-2.0 to the `deny.toml` license allow-list
+- Cooler template pages with glow effects, descriptions, and feature tags
+- All templates now show PledgePack branding alongside the framework name
+
+### Fixed
+- Added framework dependencies to scaffolded `package.json` for React templates
+- Fixed macOS archive creation — produce `.o` object file from Zig, link directly
+- Fixed `CARGO_CFG_TARGET_OS` usage instead of `cfg!` macro, bust cargo cache
+- Fixed Zig `setup-zig` action version (use `mlugg/setup-zig@v2`)
+- Fixed runtime crypto provider installation for rustls/reqwest
+- Fixed macOS archive alignment issues
+
+---
+
 ## Release 0.3.0 (2026-08-04)
 
 ### Summary

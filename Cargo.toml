@@ -13,6 +13,9 @@ members = [
     "crates/adapter-next",
     "crates/adapter-tanstack",
     "crates/adapter-pledgestack",
+    "crates/task-system",
+    "crates/task-system-macros",
+    "crates/wasm-plugin-host",
     "native-sys",
 ]
 
@@ -20,6 +23,16 @@ members = [
 version = "0.3.2"
 edition = "2024"
 license = "MIT"
+# None of these crates are published to crates.io today (see
+# PRODUCTION-READINESS-100.md goal 62) — no workflow runs `cargo publish` or
+# sets CARGO_REGISTRY_TOKEN. `publish = false` here (inherited via
+# `publish.workspace = true` in each crate) guards against an accidental
+# publish and satisfies cargo-deny's wildcard-dependency check, since
+# publishable crates can't reference workspace siblings without an explicit
+# version requirement. Flip a specific crate back to publishable (remove its
+# `publish.workspace = true`, add a real `version` to its internal deps) only
+# as a deliberate step per goal 60.
+publish = false
 authors = ["Pledge and Grow"]
 
 [workspace.dependencies]
@@ -30,6 +43,7 @@ bincode = { version = "2", features = ["serde"] }
 
 # Async runtime
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "net", "sync", "signal"] }
+futures = "0.3"
 
 # HTTP server
 axum = "0.8"
@@ -42,11 +56,20 @@ tokio-tungstenite = "0.26"
 oxc = { version = "0.141", features = ["transformer", "codegen", "minifier", "semantic", "ast_visit"] }
 
 # Lightning CSS
+# NOTE: lightningcss is at an alpha version. This is a known risk —
+# alpha versions may have breaking changes, bugs, and security issues.
+# TODO: Upgrade to a stable release when lightningcss 1.0.0 is released.
+# review-by: 2026-12-15 — re-check for a 1.0.0 stable release (see
+# PRODUCTION-READINESS-100.md goal 23); also the root cause of the
+# RUSTSEC-2026-0235 ignore in deny.toml (transitive via parcel_sourcemap),
+# so re-evaluate both together.
 lightningcss = "1.0.0-alpha.72"
 
 # Hashing (for cache keys and SRI)
 blake3 = "1"
 sha2 = "0.10"
+hmac = "0.12"
+hex = "0.4"
 
 # Base64 encoding for inline assets
 base64 = "0.23"
@@ -104,6 +127,13 @@ memmap2 = "0.9"
 comfy-table = "7"
 
 # YAML parsing (pure Rust, zero unsafe, YAML 1.2 compliant)
+# NOTE: noyalib is used for YAML parsing. This is a pre-1.0 crate with
+# minimal maintenance history. TODO: Evaluate switching to serde_yaml.
+# review-by: 2026-12-15 (PRODUCTION-READINESS-100.md goal 24) — note
+# serde_yaml itself was archived/deprecated by its maintainer; confirm
+# whether that's still the best available alternative or whether another
+# maintained YAML crate (or noyalib itself, if it's since matured) is the
+# right call before switching anything.
 noyalib = "0.0.15"
 
 # Source-context error diagnostics
@@ -136,8 +166,17 @@ toml = "1.1"
 # HTTP client for plugin registry
 ureq = { version = "3", features = ["json"] }
 
+# HTML parsing for security features (SRI injection, CSP analysis)
+scraper = "0.22"
+
+# HTTP client for remote cache
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+
 # Temporary directories for tests
 tempfile = "3"
+
+# Benchmarking (PRODUCTION-READINESS-100.md goal 98)
+criterion = "0.5"
 
 # Compression for cache entries
 zstd = "0.13"
@@ -157,12 +196,20 @@ pledgepack-adapter-solid = { path = "crates/adapter-solid" }
 pledgepack-adapter-next = { path = "crates/adapter-next" }
 pledgepack-adapter-tanstack = { path = "crates/adapter-tanstack" }
 pledgepack-adapter-pledgestack = { path = "crates/adapter-pledgestack" }
+pledgepack-task-system = { path = "crates/task-system" }
+pledgepack-wasm-plugin-host = { path = "crates/wasm-plugin-host" }
+
+# WASM Component Model plugin host
+wasmtime = "28"
+wasmtime-wasi = "28"
+parking_lot = "0.12"
+pledgepack-task-system-macros = { path = "crates/task-system-macros" }
 
 [profile.release]
 opt-level = 3
 lto = "fat"
 codegen-units = 1
-panic = "abort"
+panic = "unwind"
 strip = true
 
 [profile.release-fast]

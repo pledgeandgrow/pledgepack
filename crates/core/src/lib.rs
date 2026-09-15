@@ -1,11 +1,26 @@
-// pledge-core: The core build engine
-//
-// Orchestrates the build pipeline:
-//   1. Resolve entry point
-//   2. Parse + transform modules (via SWC)
-//   3. Build module graph (via Zig native layer)
-//   4. Cache results (function-level incremental computation)
-//   5. Output bundles (dev: serve modules, prod: optimize + chunk)
+//! pledge-core: The core build engine
+//!
+//! Orchestrates the build pipeline:
+//!   1. Resolve entry point
+//!   2. Parse + transform modules (via SWC)
+//!   3. Build module graph (via Zig native layer)
+//!   4. Cache results (function-level incremental computation)
+//!   5. Output bundles (dev: serve modules, prod: optimize + chunk)
+
+/// Schema version of the PledgeStack integration contract between
+/// `pledgepack-adapter-pledgestack` (which produces `RouteManifest` and
+/// stamps it into the `__pledge_ps_manifest.json` file) and
+/// `pledgepack-dev-server` (which stamps the same version onto the
+/// `/__pledge_router` response as the `X-Pledgepack-Schema-Version`
+/// header), so both surfaces PledgeStack's `bundler-pledgepack` adapter
+/// checks report the same number from one source of truth instead of two
+/// independently-maintained constants drifting apart. Bump when
+/// `RouteManifest`'s shape changes in a way a consumer should know about —
+/// see `RouteManifest::SCHEMA_VERSION`'s doc comment in
+/// `pledgepack-adapter-pledgestack` for the full versioning policy.
+/// PRODUCTION-READINESS-100.md goal 81 — there was previously no version
+/// field anywhere in this contract at all.
+pub const PLEDGESTACK_MANIFEST_SCHEMA_VERSION: u32 = 1;
 
 pub mod a11y;
 pub mod advanced;
@@ -29,6 +44,7 @@ pub mod drizzle;
 pub mod ecosystem;
 pub mod edge;
 pub mod encrypt;
+pub mod estree;
 pub mod engine;
 pub mod env;
 pub mod examples_gallery;
@@ -90,6 +106,7 @@ pub use config::TransformPipelineConfig;
 pub use config::WatchConfig;
 pub use config::WorkspaceConfig;
 pub use engine::BuildEngine;
+pub use engine::EmitChunk;
 pub use env::EnvVars;
 pub use module::{ModuleId, ModuleKind, ResolvedModule};
 pub use module_graph::SerializableModuleGraph;
@@ -127,6 +144,17 @@ pub fn create_debounced_watcher(
     )?;
 
     debouncer.watch(root, RecursiveMode::Recursive)?;
+
+    // Intentionally leaked: the debouncer owns the underlying `notify` watcher
+    // and the callback closure that feeds the channel. It must live for the
+    // process lifetime to keep watching for file changes. There is no
+    // owning struct returned from this function (only the `Receiver`), so the
+    // debouncer has nowhere to be stored.
+    //
+    // This is a known minor memory leak (~1 KB per watcher). The watcher is
+    // typically created once per dev server session, so the impact is negligible.
+    // TODO: Return a `WatcherHandle` struct that owns the debouncer for proper
+    // lifecycle management and deterministic shutdown.
     std::mem::forget(debouncer);
 
     Ok(rx)
@@ -138,9 +166,28 @@ pub fn format_size(bytes: usize) -> String {
     humansize::format_size(bytes, humansize::BINARY)
 }
 
+/// Normalize a path to use forward slashes (cross-platform consistent).
+/// Handles both Windows backslashes and already-normalized paths.
+pub fn normalize_path(path: &std::path::Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+/// Normalize a path-like string to use forward slashes (cross-platform
+/// consistent). Equivalent to [`normalize_path`] but for string inputs
+/// such as URL paths and module specifiers.
+pub fn normalize_path_str(path: &str) -> String {
+    path.replace('\\', "/")
+}
+
 /// Generate a JSON Schema for `PledgeConfig`, suitable for IDE autocompletion
 /// and config validation. Returns the schema as a `serde_json::Value`.
-pub fn generate_config_schema() -> serde_json::Value {
+///
+/// Errors during schema serialization are propagated rather than silently
+/// swallowed, so callers can surface them to the user.
+pub fn generate_config_schema() -> anyhow::Result<serde_json::Value> {
     let schema = schemars::schema_for!(PledgeConfig);
-    serde_json::to_value(&schema).unwrap_or(serde_json::Value::Null)
+    serde_json::to_value(&schema).map_err(|e| {
+        tracing::error!("Failed to serialize config schema: {}", e);
+        anyhow::anyhow!("Config schema serialization failed: {}", e)
+    })
 }

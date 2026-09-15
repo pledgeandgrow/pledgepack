@@ -1,20 +1,29 @@
-// Production optimizer: tree shaking, code splitting, minification, scope hoisting
-//
-// Strategy: Use the cached module graph from the build engine,
-// then run optimization passes on the FULL graph (not cached chunks).
-//
-// This is how we avoid Turbopack's 72% bundle bloat:
-//   - Function-level cache makes graph reconstruction fast
-//   - Optimization runs on the complete graph (not individual cached chunks)
-//   - Tree shaking sees the full dependency picture
+//! Production optimizer: tree shaking, code splitting, minification, scope hoisting
+//!
+//! Strategy: Use the cached module graph from the build engine,
+//! then run optimization passes on the FULL graph (not cached chunks).
+//!
+//! This is how we avoid Turbopack's 72% bundle bloat:
+//!   - Function-level cache makes graph reconstruction fast
+//!   - Optimization runs on the complete graph (not individual cached chunks)
+//!   - Tree shaking sees the full dependency picture
 
 use anyhow::Result;
 use pledgepack_core::config::BuildConfig;
-use pledgepack_core::module::{ModuleId, ResolvedModule};
+use pledgepack_core::module::{ModuleId, ModuleKind, ResolvedModule};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
+mod side_effects;
+
+/// The bundle optimizer. Runs tree shaking, code splitting, and chunk
+/// grouping over the full module graph produced by the build engine.
+///
+/// Create with [`Optimizer::new`], then call [`Optimizer::optimize`] or
+/// [`Optimizer::optimize_with_config`] to produce the final [`Chunk`] set.
+/// The optimizer is stateful and resets its internal state at the start
+/// of each run, so a single instance can be reused across builds.
 pub struct Optimizer {
     /// Modules that have side effects (can't be tree-shaken)
     side_effect_modules: HashSet<ModuleId>,
@@ -22,19 +31,34 @@ pub struct Optimizer {
     chunks: Vec<Chunk>,
 }
 
+/// A group of modules emitted together as one output file.
+///
+/// Chunks are produced by [`Optimizer::optimize`]; the `id` becomes the
+/// output file name and `modules` lists the module IDs contained in the
+/// chunk.
 #[derive(Debug, Clone)]
 pub struct Chunk {
+    /// Chunk identifier used as the output file name (e.g. `"entry-0"`,
+    /// `"vendor"`, `"shared"`).
     pub id: String,
+    /// IDs of the modules contained in this chunk, in emit order.
     pub modules: Vec<ModuleId>,
+    /// What kind of chunk this is (entry, vendor, shared, etc.).
     pub chunk_type: ChunkType,
 }
 
+/// Classification of a [`Chunk`], determining how it is emitted and loaded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChunkType {
+    /// Entry chunk — one per entry point, loaded directly by the page.
     Entry,
+    /// Vendor chunk — third-party modules from `node_modules`.
     Vendor,
+    /// Async chunk — modules behind a dynamic `import()`, loaded on demand.
     Async,
+    /// Shared chunk — modules used by more than one entry point.
     Shared,
+    /// Route chunk — modules for a single route (route-based splitting).
     Route,
 }
 
@@ -45,6 +69,7 @@ impl Default for Optimizer {
 }
 
 impl Optimizer {
+    /// Create a new optimizer with empty state.
     pub fn new() -> Self {
         Self {
             side_effect_modules: HashSet::new(),
@@ -59,6 +84,11 @@ impl Optimizer {
         all_modules: &HashMap<ModuleId, ResolvedModule>,
         graph: &pledgepack_core::Graph,
     ) -> Result<Vec<Chunk>> {
+        // Reset state from any previous optimization run so repeated calls on
+        // the same Optimizer instance don't accumulate stale chunks/side effects.
+        self.chunks.clear();
+        self.side_effect_modules.clear();
+
         // Phase 1: Mark side-effect-free modules
         self.mark_side_effects(all_modules);
 
@@ -82,6 +112,11 @@ impl Optimizer {
         graph: &pledgepack_core::Graph,
         build_config: &BuildConfig,
     ) -> Result<Vec<Chunk>> {
+        // Reset state from any previous optimization run so repeated calls on
+        // the same Optimizer instance don't accumulate stale chunks/side effects.
+        self.chunks.clear();
+        self.side_effect_modules.clear();
+
         // Phase 1: Mark side-effect-free modules
         self.mark_side_effects(all_modules);
 
@@ -98,7 +133,7 @@ impl Optimizer {
 
         // Phase 3c: If inline_dynamic_imports, merge all async chunks into their parent entry chunks
         if build_config.inline_dynamic_imports {
-            self.inline_dynamic_imports();
+            self.inline_dynamic_imports(entry_modules, graph);
         }
 
         Ok(self.chunks.clone())
@@ -112,45 +147,22 @@ impl Optimizer {
         modules.par_iter().for_each(|(id, module)| {
             let source = String::from_utf8_lossy(&module.source);
 
-            // Heuristic: modules with top-level statements that perform
-            // actual side effects (function calls, assignments, etc.)
-            // Declarations (function, const, let, var, class) are NOT side effects.
-            let has_side_effects = source.lines().any(|line| {
-                let trimmed = line.trim();
-                if trimmed.is_empty()
-                    || trimmed.starts_with("import ")
-                    || trimmed.starts_with("export ")
-                    || trimmed.starts_with("//")
-                    || trimmed.starts_with("/*")
-                    || trimmed.starts_with("*")
-                    || trimmed.starts_with("function ")
-                    || trimmed.starts_with("const ")
-                    || trimmed.starts_with("let ")
-                    || trimmed.starts_with("var ")
-                    || trimmed.starts_with("class ")
-                    || trimmed.starts_with("interface ")
-                    || trimmed.starts_with("type ")
-                    || trimmed.starts_with("enum ")
-                    || trimmed.starts_with("}")
-                    || trimmed.starts_with(")")
-                    || trimmed.starts_with("async function")
-                    || trimmed.starts_with("export default function")
-                    || trimmed.starts_with("export function")
-                    || trimmed.starts_with("export const")
-                    || trimmed.starts_with("export class")
-                    || trimmed.starts_with("export async function")
-                    || trimmed.starts_with("export type")
-                    || trimmed.starts_with("export interface")
-                    || trimmed.starts_with("export enum")
-                    || trimmed.starts_with("export *")
-                {
-                    return false;
-                }
-                // Actual side effects: top-level function calls, assignments, console.*, etc.
-                !trimmed.is_empty()
-            });
+            // Use AST-based detection (exact) for JS/TS modules, falling back
+            // to the string heuristic for non-JS modules (CSS, JSON, assets).
+            let has_sx = if matches!(
+                module.kind,
+                ModuleKind::JavaScript | ModuleKind::TypeScript | ModuleKind::Jsx | ModuleKind::Tsx
+            ) {
+                let source_type = oxc::span::SourceType::from_path(&module.path)
+                    .unwrap_or(oxc::span::SourceType::mjs());
+                side_effects::has_side_effects_ast(&source, source_type)
+            } else {
+                module_source_has_side_effects(&source)
+            };
 
-            if has_side_effects && let Ok(mut sx) = side_effects.lock() {
+            if has_sx
+                && let Ok(mut sx) = side_effects.lock()
+            {
                 sx.insert(*id);
             }
         });
@@ -173,8 +185,11 @@ impl Optimizer {
             }
             reachable.insert(id);
 
-            // Follow dependencies (modules that this module imports)
-            let deps = graph.get_dependencies(id, 256);
+            // Follow dependencies (modules that this module imports).
+            // get_all_dependencies grows the FFI buffer until nothing is
+            // truncated — a fixed capacity would silently drop edges for
+            // modules with many direct dependencies.
+            let deps = graph.get_all_dependencies(id);
             for dep in deps {
                 if !reachable.contains(&dep) {
                     queue.push(dep);
@@ -193,6 +208,25 @@ impl Optimizer {
         modules: &HashMap<ModuleId, ResolvedModule>,
         graph: &pledgepack_core::Graph,
     ) {
+        // The Zig-backed Graph is Send but not Sync, so we extract all
+        // dependencies into a plain HashMap sequentially first (O(V+E)),
+        // then parallelize the BFS over the extracted map — no Mutex needed.
+        let mut dep_map: HashMap<ModuleId, Vec<ModuleId>> = HashMap::new();
+        {
+            let mut stack: Vec<ModuleId> = entry_modules.to_vec();
+            let mut visited = HashSet::new();
+            while let Some(id) = stack.pop() {
+                if !visited.insert(id) {
+                    continue;
+                }
+                let deps = graph.get_all_dependencies(id);
+                for &dep in &deps {
+                    stack.push(dep);
+                }
+                dep_map.insert(id, deps);
+            }
+        }
+
         // Track which modules are used by multiple entry points
         // Process each entry's dependency traversal in parallel
         let module_users: Mutex<HashMap<ModuleId, HashSet<ModuleId>>> = Mutex::new(HashMap::new());
@@ -208,8 +242,8 @@ impl Optimizer {
                 }
                 visited.insert(id);
                 local_users.entry(id).or_default().insert(*entry);
-                for dep in graph.get_dependencies(id, 256) {
-                    queue.push(dep);
+                if let Some(deps) = dep_map.get(&id) {
+                    queue.extend(deps.iter().copied());
                 }
             }
 
@@ -260,6 +294,11 @@ impl Optimizer {
             })
             .collect();
 
+        // Convert lookup Vecs to HashSets for O(1) `contains` in the hot
+        // per-module loop below (avoids O(n²) linear scans).
+        let vendor_set: HashSet<ModuleId> = vendor_modules.iter().copied().collect();
+        let shared_set: HashSet<ModuleId> = shared_modules.iter().copied().collect();
+
         // Entry chunk: entry module + its exclusive deps (parallelized)
         let entry_chunks: Vec<Chunk> = entry_modules
             .par_iter()
@@ -275,14 +314,14 @@ impl Optimizer {
                     }
                     visited.insert(id);
                     if id != *entry
-                        && !vendor_modules.contains(&id)
-                        && !shared_modules.contains(&id)
+                        && !vendor_set.contains(&id)
+                        && !shared_set.contains(&id)
                         && !entry_module_set.contains(&id)
                     {
                         chunk_modules.push(id);
                     }
-                    for dep in graph.get_dependencies(id, 256) {
-                        queue.push(dep);
+                    if let Some(deps) = dep_map.get(&id) {
+                        queue.extend(deps.iter().copied());
                     }
                 }
 
@@ -348,9 +387,13 @@ impl Optimizer {
             }
 
             if !chunk_modules.is_empty() {
+                // Convert to a HashSet for O(1) membership tests when removing
+                // these modules from other chunks (avoids O(n²) Vec::contains).
+                let chunk_module_set: HashSet<ModuleId> =
+                    chunk_modules.iter().copied().collect();
                 // Remove these modules from other chunks to avoid duplication
                 for chunk in &mut self.chunks {
-                    chunk.modules.retain(|m| !chunk_modules.contains(m));
+                    chunk.modules.retain(|m| !chunk_module_set.contains(m));
                 }
 
                 self.chunks.push(Chunk {
@@ -367,8 +410,17 @@ impl Optimizer {
         }
     }
 
-    /// Inline dynamic imports — merge all async chunks into their parent entry chunks
-    fn inline_dynamic_imports(&mut self) {
+    /// Inline dynamic imports — merge async chunks into the entry chunk that
+    /// actually imports them (not into every entry chunk).
+    ///
+    /// For each async chunk, we walk its modules' reverse dependencies
+    /// (`get_dependents`) to find which entry module imports them, then merge
+    /// the async chunk's modules into only that entry's chunk.
+    fn inline_dynamic_imports(
+        &mut self,
+        entry_modules: &[ModuleId],
+        graph: &pledgepack_core::Graph,
+    ) {
         // Find all async chunks
         let async_chunks: Vec<(usize, Vec<ModuleId>)> = self
             .chunks
@@ -382,7 +434,8 @@ impl Optimizer {
             return;
         }
 
-        // Merge async chunk modules into entry chunks
+        // Map each entry module to the index of its entry chunk.
+        let entry_module_set: HashSet<ModuleId> = entry_modules.iter().copied().collect();
         let entry_indices: Vec<usize> = self
             .chunks
             .iter()
@@ -391,8 +444,40 @@ impl Optimizer {
             .map(|(i, _)| i)
             .collect();
 
+        // For each async chunk, find which entry chunk(s) import its modules
+        // via reverse-dependency traversal, and merge into only those entries.
         for (_, async_modules) in &async_chunks {
-            for &entry_idx in &entry_indices {
+            // Collect the entry chunk indices that import this async chunk.
+            // We walk the reverse deps of each async module until we reach an
+            // entry module, then map that entry module to its chunk index.
+            let mut target_entries: HashSet<usize> = HashSet::new();
+            for &async_module in async_modules {
+                let mut queue = vec![async_module];
+                let mut visited = HashSet::new();
+                while let Some(id) = queue.pop() {
+                    if !visited.insert(id) {
+                        continue;
+                    }
+                    if entry_module_set.contains(&id) {
+                        // Find the entry chunk that owns this entry module.
+                        if let Some(idx) = entry_indices.iter().find(|&&i| {
+                            self.chunks
+                                .get(i)
+                                .is_some_and(|c| c.modules.contains(&id))
+                        }) {
+                            target_entries.insert(*idx);
+                        }
+                        continue;
+                    }
+                    // Walk reverse dependencies (modules that import `id`).
+                    for importer in graph.get_all_dependents(id) {
+                        queue.push(importer);
+                    }
+                }
+            }
+
+            // Merge the async chunk's modules into each target entry chunk only.
+            for &entry_idx in &target_entries {
                 if let Some(entry_chunk) = self.chunks.get_mut(entry_idx) {
                     for module in async_modules {
                         if !entry_chunk.modules.contains(module) {
@@ -438,6 +523,10 @@ impl Optimizer {
             .map(|(m, _)| *m)
             .collect();
 
+        // Convert to a HashSet for O(1) membership tests in the per-route
+        // filter below (avoids O(n²) Vec::contains over every route's modules).
+        let shared_set: HashSet<ModuleId> = shared.iter().copied().collect();
+
         if !shared.is_empty() {
             self.chunks.push(Chunk {
                 id: "route-shared".to_string(),
@@ -449,7 +538,7 @@ impl Optimizer {
         for (route_name, mods) in routes {
             let route_modules: Vec<ModuleId> = mods
                 .iter()
-                .filter(|m| !shared.contains(m))
+                .filter(|m| !shared_set.contains(m))
                 .copied()
                 .collect();
 
@@ -468,4 +557,147 @@ impl Optimizer {
             shared.len()
         );
     }
+}
+
+/// Heuristic side-effect detection over a module's source text.
+///
+/// Returns `true` when the module likely performs work at evaluation time:
+///
+///   - Immediately-invoked function expressions (`(() => {})()`,
+///     `(function () {})()`, `!function () {}()`, `void function () {}()`)
+///     — these always execute when the module loads.
+///   - Top-level `await` — pauses module evaluation and may run arbitrary
+///     asynchronous work.
+///   - `export default <call>` — a computed default export expression like
+///     `export default makeStore()` runs at evaluation time (plain
+///     `export default function/class/identifier/object` does not).
+///   - Any other top-level statement that isn't a declaration — function
+///     calls, assignments, `console.*`, `if`/`for`/`try` blocks, bare
+///     blocks, etc.
+///
+/// Multi-line statements are handled by tracking bracket depth: only lines
+/// that begin at depth 0 start a new top-level statement, and lines that
+/// continue a statement (`)` / `}` / `]` / `,` / `.` / operators) are not
+/// classified independently. This avoids both false positives (e.g. object
+/// literal fields inside `const x = { ... }` being read as statements) and
+/// false negatives (e.g. `foo()` on the second line of a call chain).
+///
+/// This is intentionally a heuristic — a full AST analysis would be more
+/// accurate, but it catches the common cases without paying for a parse.
+fn module_source_has_side_effects(source: &str) -> bool {
+    // Immediately-invoked function expressions are always side effects.
+    const IIFE_PATTERNS: &[&str] = &[
+        "(() =>",
+        "(async () =>",
+        "(function ()",
+        "(function(",
+        "!function(",
+        "!function (" ,
+        "void function",
+    ];
+    if IIFE_PATTERNS.iter().any(|p| source.contains(p)) {
+        return true;
+    }
+
+    // Track rough bracket depth so that lines inside a multi-line statement
+    // (object literals, call argument lists, template braces) are not
+    // mistaken for new top-level statements. Brackets inside strings and
+    // comments are counted too — this is a heuristic, not a lexer.
+    let mut depth: i64 = 0;
+
+    for line in source.lines() {
+        let trimmed = line.trim();
+
+        if trimmed.is_empty()
+            || trimmed.starts_with("//")
+            || trimmed.starts_with("/*")
+            || trimmed.starts_with('*')
+        {
+            continue;
+        }
+
+        // A line that starts at depth 0 begins a new top-level statement —
+        // only those lines are classified. Lines that start inside an open
+        // bracket belong to a statement we already classified.
+        let starts_statement = depth <= 0;
+
+        // Update depth for the next line before classifying this one.
+        for b in trimmed.bytes() {
+            match b {
+                b'{' | b'(' | b'[' => depth += 1,
+                b'}' | b')' | b']' => depth -= 1,
+                _ => {}
+            }
+        }
+
+        if !starts_statement {
+            continue;
+        }
+
+        // Continuation of a statement that began on a previous line
+        // (method chains, ternaries, operator-split expressions).
+        let first = trimmed.as_bytes()[0];
+        if matches!(
+            first,
+            b'}' | b')' | b']' | b',' | b'.' | b'?' | b':' | b'|' | b'&' | b'+' | b'='
+        ) {
+            continue;
+        }
+
+        // Top-level await performs (possibly async) work at evaluation time.
+        if trimmed.starts_with("await ") || trimmed.starts_with("await(") {
+            return true;
+        }
+
+        // `export default <expr>` is only a side effect when the expression
+        // is computed — a call or a more complex expression. Declarations
+        // and plain re-exports are not.
+        if let Some(rest) = trimmed.strip_prefix("export default") {
+            let rest = rest.trim_start();
+            if rest.starts_with("function")
+                || rest.starts_with("async function")
+                || rest.starts_with("class")
+                || rest.starts_with('{')
+                || rest.is_empty()
+            {
+                continue;
+            }
+            // Arrow-function default exports (`export default () => {}`,
+            // `export default async () => {}`) are declarations, not calls.
+            if (rest.starts_with('(') || rest.starts_with("async "))
+                && rest.contains("=>")
+            {
+                continue;
+            }
+            // `export default foo` (identifier) — not a side effect.
+            // `export default foo()` / `export default new X()` — is.
+            if !rest.contains('(') {
+                continue;
+            }
+            return true;
+        }
+
+        // Declaration keywords never count as side effects.
+        let is_declaration = trimmed.starts_with("import ")
+            || trimmed.starts_with("export ")
+            || trimmed.starts_with("const ")
+            || trimmed.starts_with("let ")
+            || trimmed.starts_with("var ")
+            || trimmed.starts_with("function ")
+            || trimmed.starts_with("class ")
+            || trimmed.starts_with("interface ")
+            || trimmed.starts_with("type ")
+            || trimmed.starts_with("declare ")
+            || trimmed.starts_with("enum ")
+            || trimmed.starts_with("namespace ")
+            || trimmed.starts_with("abstract ")
+            || trimmed.starts_with("using ")
+            || trimmed.starts_with("async function");
+
+        if !is_declaration {
+            return true;
+        }
+    }
+
+    false
 }

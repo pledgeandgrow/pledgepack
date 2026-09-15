@@ -580,12 +580,17 @@ pub const TaskGraph = struct {
     ) usize {
         const start_idx = self.id_to_index.get(id) orelse return 0;
 
-        // Simple BFS with a visited bitmap (no heap allocation)
+        // BFS with heap-allocated visited/queue arrays (no fixed-size limit).
         const n = self.nodes.items.len;
-        if (n > 256) return 0; // Safety limit for stack-allocated visited array
+        if (n == 0) return 0;
 
-        var visited = [_]bool{false} ** 256;
-        var queue = [_]u32{0} ** 256;
+        const allocator = std.heap.page_allocator;
+        const visited = allocator.alloc(bool, n) catch return 0;
+        defer allocator.free(visited);
+        @memset(visited, false);
+
+        const queue = allocator.alloc(u32, n) catch return 0;
+        defer allocator.free(queue);
         var queue_head: usize = 0;
         var queue_tail: usize = 0;
 
@@ -1079,8 +1084,11 @@ pub fn restoreTaskGraph(snapshot: *const ArenaSnapshot) !TaskGraph {
 /// G8.14: Allocate arena memory on a specific NUMA node.
 /// Returns a buffer aligned to page size. Falls back to regular allocation
 /// on platforms without NUMA support.
+///
+/// NOTE: Stub — uses ordinary allocation. NUMA-aware allocation not implemented.
+/// TODO: Implement using libnuma on Linux for NUMA-aware memory allocation.
 pub fn numaAlloc(allocator: Allocator, size: usize, node: u32) ![]u8 {
-    _ = node; // NUMA node selection is platform-specific
+    _ = node; // STUB: NUMA node parameter ignored
 
     // On Linux, we would use:
     //   mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)
@@ -1096,9 +1104,13 @@ pub fn numaAlloc(allocator: Allocator, size: usize, node: u32) ![]u8 {
 
 /// G8.14: Detect the optimal NUMA node for the current CPU.
 /// Returns 0 on platforms without NUMA support.
+///
+/// NOTE: Stub — always returns 0. NUMA node detection not implemented.
+/// TODO: Implement using /sys/devices/system/node or sched_getcpu on Linux.
 pub fn numaPreferredNode() u32 {
-    // On Linux, this would read /sys/devices/system/node/online or use
-    // sched_getcpu() + numa_node_of_cpu(). On Windows, GetNumaProcessorNode.
+    // STUB: NUMA node detection not implemented. On Linux, this would read
+    // /sys/devices/system/node/online or use sched_getcpu() + numa_node_of_cpu().
+    // On Windows, GetNumaProcessorNode.
     return 0;
 }
 
@@ -1113,7 +1125,11 @@ pub const HUGE_PAGE_SIZE: usize = 2 * 1024 * 1024;
 
 /// G8.15: Allocate memory using huge pages if available.
 /// Falls back to regular allocation on platforms without huge page support.
+///
+/// NOTE: Stub — uses ordinary allocation. Huge page support not implemented.
+/// TODO: Implement using mmap with MAP_HUGETLB on Linux.
 pub fn hugePageAlloc(allocator: Allocator, size: usize) ![]u8 {
+    // STUB: Falls back to regular aligned allocation.
     // On Linux, we would use:
     //   mmap(NULL, size, PROT_READ|PROT_WRITE,
     //        MAP_PRIVATE|MAP_ANONYMOUS|MAP_HUGETLB, -1, 0)
@@ -1126,10 +1142,13 @@ pub fn hugePageAlloc(allocator: Allocator, size: usize) ![]u8 {
 }
 
 /// G8.15: Check if huge pages are available on the current platform.
+///
+/// NOTE: Stub — always returns false. Huge page availability detection not implemented.
+/// TODO: Check /proc/meminfo for HugePages_Total on Linux, SeLockMemoryPrivilege on Windows.
 pub fn hugePagesAvailable() bool {
-    // On Linux, check /proc/meminfo for HugePages_Total > 0.
-    // On Windows, check for SeLockMemoryPrivilege.
-    // For now, return false as a safe default.
+    // STUB: Huge page availability not implemented. On Linux, check
+    // /proc/meminfo for HugePages_Total > 0. On Windows, check for
+    // SeLockMemoryPrivilege. For now, return false as a safe default.
     return false;
 }
 

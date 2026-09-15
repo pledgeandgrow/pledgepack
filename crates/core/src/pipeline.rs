@@ -9,19 +9,45 @@ use anyhow::Result;
 use std::sync::Arc;
 
 pub async fn run_build(config: Arc<crate::config::PledgeConfig>) -> Result<BuildEngine> {
+    let mode = config.mode;
+    let _span = tracing::span!(tracing::Level::INFO, "build", mode = ?mode).entered();
+
     let engine = BuildEngine::new(config.clone());
 
-    match config.mode {
+    match mode {
         BuildMode::Development => run_dev_build(engine, &config).await,
         BuildMode::Production => run_prod_build(engine, &config).await,
     }
 }
 
 async fn run_dev_build(
-    engine: BuildEngine,
-    _config: &crate::config::PledgeConfig,
+    mut engine: BuildEngine,
+    config: &crate::config::PledgeConfig,
 ) -> Result<BuildEngine> {
     tracing::info!("Starting dev build...");
+
+    // Phase 1: Build module graph (resolve → parse → transform).
+    // In dev mode we skip optimization/bundling and serve modules directly,
+    // but we still need to resolve, parse, and transform all modules so the
+    // dev server can serve them with on-demand transforms.
+    let result = {
+        let _resolve_span = tracing::span!(tracing::Level::INFO, "resolve").entered();
+        let _parse_span = tracing::span!(tracing::Level::INFO, "parse").entered();
+        let _transform_span = tracing::span!(tracing::Level::INFO, "transform").entered();
+        engine.build().await?
+    };
+
+    if config.profile {
+        tracing::info!("[profile] Parse + Transform: {}ms", result.duration_ms);
+    }
+
+    tracing::info!(
+        "Development build complete: {} modules built, {} cached ({}ms)",
+        result.modules_built,
+        result.modules_cached,
+        result.duration_ms
+    );
+
     Ok(engine)
 }
 
@@ -35,7 +61,12 @@ async fn run_prod_build(
     let build_start = std::time::Instant::now();
 
     // Phase 1: Build module graph (resolve + parse + transform)
-    let result = engine.build().await?;
+    let result = {
+        let _resolve_span = tracing::span!(tracing::Level::INFO, "resolve").entered();
+        let _parse_span = tracing::span!(tracing::Level::INFO, "parse").entered();
+        let _transform_span = tracing::span!(tracing::Level::INFO, "transform").entered();
+        engine.build().await?
+    };
 
     if profile {
         tracing::info!("[profile] Parse + Transform: {}ms", result.duration_ms);
@@ -47,7 +78,10 @@ async fn run_prod_build(
 
     // Phase 3: Emit output to disk with asset hashing + manifest
     let emit_start = std::time::Instant::now();
-    engine.emit()?;
+    {
+        let _emit_span = tracing::span!(tracing::Level::INFO, "emit").entered();
+        engine.emit()?;
+    }
     tracing::info!("Output written to {}", config.out_dir.display());
 
     if profile {

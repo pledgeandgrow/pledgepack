@@ -3,10 +3,14 @@
 // The world defines the complete plugin interface surface.
 // A WASM plugin component implements this world to be loaded by PledgePack.
 //
-// Versioning: v0.1.2 — FROZEN (additive change from v0.1.1)
+// Versioning: v0.1.3 — FROZEN (additive change from v0.1.2)
 //   - v0.1.0: initial contract (8 hooks, 11 record types)
 //   - v0.1.1: added optional `enforce` field to plugin-metadata
 //   - v0.1.2: added `render-chunk` hook + `render-chunk-input`/`render-chunk-output` records
+//   - v0.1.3: added `handle-hot-update` hook + `hot-update-input`/`hot-update-output`
+//     records, and `handle-hot-update: bool` to `hook-flags`. Previously absent
+//     from both hosts entirely (PRODUCTION-READINESS-100.md goal 43) despite being
+//     a commonly-used Vite hook (custom HMR update handling).
 //   - Breaking changes require a new world (pledgepack-plugin-v1)
 //   - Additive changes (new hooks, new optional fields) are allowed
 //   - The host checks `plugin-version` at load time and rejects mismatches
@@ -18,7 +22,7 @@
 // The JS shim implements the same interface but via QuickJS, not WASM.
 // This ensures both tiers share the same cache contract.
 
-package pledgepack:plugin@0.1.2;
+package pledgepack:plugin@0.1.3;
 
 world pledgepack-plugin {
   // The plugin declares its metadata at instantiation time
@@ -38,6 +42,14 @@ world pledgepack-plugin {
   // Mirrors Rollup `renderChunk(code, chunk, outputOptions)`.
   // Added in v0.1.2 (additive, backward-compatible).
   export render-chunk: func(input: render-chunk-input) -> option<render-chunk-output>;
+
+  // Hot update hook (dev mode only, sequential — first plugin to return
+  // `some` wins and its module-ids list is used; a plugin returning `none`
+  // defers to the next plugin, or to the host's default HMR handling if no
+  // plugin handles it).
+  // Mirrors Vite `handleHotUpdate(ctx)`.
+  // Added in v0.1.3 (additive, backward-compatible).
+  export handle-hot-update: func(input: hot-update-input) -> option<hot-update-output>;
 
   // Lifecycle hooks (parallel — all plugins called, order not guaranteed)
   export build-start: func();
@@ -98,6 +110,8 @@ world pledgepack-plugin {
     generate-bundle: bool,
     configure-server: bool,
     render-chunk: bool,
+    // Added in v0.1.3.
+    handle-hot-update: bool,
   }
 
   // ─── resolveId hook ──────────────────────────────────────────────
@@ -125,6 +139,10 @@ world pledgepack-plugin {
     // Cache key: hash of all inputs that affect this result
     // The host uses this to cache the resolve result as a task graph node
     cache-key: string,
+    // G7.6: Output schema version — incremented when the output format changes.
+    // The host validates this against its supported versions and rejects mismatches.
+    // Current: 1
+    schema-version: option<u32>,
   }
 
   // ─── load hook ───────────────────────────────────────────────────
@@ -145,6 +163,8 @@ world pledgepack-plugin {
     source-map: option<string>,
     // Cache key: hash of all inputs that affect this result
     cache-key: string,
+    // G7.6: Output schema version (current: 1)
+    schema-version: option<u32>,
   }
 
   // ─── transform hook ──────────────────────────────────────────────
@@ -175,6 +195,8 @@ world pledgepack-plugin {
     // Cache key: hash of all inputs that affect this result
     // The host uses this to cache the transform result as a task graph node
     cache-key: string,
+    // G7.6: Output schema version (current: 1)
+    schema-version: option<u32>,
   }
 
   // ─── transformIndexHtml hook ─────────────────────────────────────
@@ -197,6 +219,8 @@ world pledgepack-plugin {
     tags: list<html-tag>,
     // Cache key
     cache-key: string,
+    // G7.6: Output schema version (current: 1)
+    schema-version: option<u32>,
   }
 
   record html-tag {
@@ -246,5 +270,32 @@ world pledgepack-plugin {
     source-map: option<string>,
     // Cache key: hash of all inputs that affect this result
     cache-key: string,
+    // G7.6: Output schema version (current: 1)
+    schema-version: option<u32>,
+  }
+
+  // ─── handleHotUpdate hook (dev mode only) ─────────────────────────
+  //
+  // Called when a watched file changes, before the host applies its
+  // default HMR handling. Lets a plugin customize or suppress HMR for
+  // files it owns (e.g. a non-JS asset type with its own hot-reload
+  // protocol). Mirrors Vite `handleHotUpdate({ file, modules, server })`.
+  // Added in v0.1.3 (additive, backward-compatible).
+
+  record hot-update-input {
+    // Absolute path of the file that changed.
+    file: string,
+    // Unix timestamp (milliseconds) of the change.
+    timestamp: u64,
+  }
+
+  record hot-update-output {
+    // Module IDs to HMR-update instead of the host's default resolution.
+    // An empty list means "suppress HMR for this change entirely" (the
+    // plugin handled it some other way, e.g. by pushing a custom WS
+    // message) rather than "fall through to the default" — a plugin that
+    // wants the default behavior should return `none` from the hook
+    // entirely instead of `some` with an empty list.
+    module-ids: list<string>,
   }
 }

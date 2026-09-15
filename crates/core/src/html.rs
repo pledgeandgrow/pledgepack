@@ -13,6 +13,7 @@
 //   - Inject meta tags from config
 
 use anyhow::Result;
+use scraper::{Html, Selector};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use tracing::info;
@@ -267,37 +268,22 @@ pub fn generate_default_html_with_base(entry: &str, title: &str, base: &str) -> 
 }
 
 /// Extract <script type="module" src="..."> src paths
+/// Uses the `scraper` crate for proper HTML parsing — handles attributes
+/// containing `>`, self-closing tags, single-quoted and unquoted attributes.
 fn extract_script_srcs(html: &str) -> Vec<String> {
-    let mut scripts = Vec::new();
-    let mut search_pos = 0;
-
-    while let Some(pos) = html[search_pos..].find("<script") {
-        let abs_pos = search_pos + pos;
-        let rest = &html[abs_pos..];
-
-        if let Some(end) = rest.find('>') {
-            let tag = &rest[..end];
-
-            // Check for type="module" and src="..."
-            if tag.contains(r#"type="module""#) || tag.contains("type='module'") {
-                if let Some(src_start) = tag.find(r#"src=""#) {
-                    let src_rest = &tag[src_start + 5..];
-                    if let Some(src_end) = src_rest.find('"') {
-                        scripts.push(src_rest[..src_end].to_string());
-                    }
-                } else if let Some(src_start) = tag.find("src='") {
-                    let src_rest = &tag[src_start + 5..];
-                    if let Some(src_end) = src_rest.find('\'') {
-                        scripts.push(src_rest[..src_end].to_string());
-                    }
-                }
-            }
-        }
-
-        search_pos = abs_pos + 1;
-    }
-
-    scripts
+    let document = Html::parse_document(html);
+    let selector = Selector::parse("script[src]").unwrap();
+    document
+        .select(&selector)
+        .filter(|el| {
+            el.value()
+                .attr("type")
+                .map(|t| t.eq_ignore_ascii_case("module"))
+                .unwrap_or(false)
+        })
+        .filter_map(|el| el.value().attr("src"))
+        .map(|s| s.to_string())
+        .collect()
 }
 
 /// Extract <link rel="stylesheet" href="..."> href paths
@@ -362,13 +348,15 @@ fn extract_module_preloads(html: &str) -> Vec<String> {
 }
 
 /// Extract <title>...</title>
+/// Uses `scraper` so <title> tags with attributes (e.g. <title id="...">)
+/// are matched correctly.
 fn extract_title(html: &str) -> Option<String> {
-    if let Some(start) = html.find("<title>")
-        && let Some(end) = html[start..].find("</title>")
-    {
-        return Some(html[start + 7..start + end].trim().to_string());
-    }
-    None
+    let document = Html::parse_document(html);
+    let selector = Selector::parse("title").unwrap();
+    document
+        .select(&selector)
+        .next()
+        .map(|el| el.text().collect::<String>().trim().to_string())
 }
 
 /// Extract <meta name="..." content="..."> tags
@@ -440,12 +428,15 @@ pub fn minify_html(html: &str) -> String {
         }
 
         if c == '<' {
-            // Check for HTML comment
-            if html[result.len().saturating_sub(0)..].ends_with("<") && chars.peek() == Some(&'!') {
+            result.push(c);
+            // Check for HTML comment: last emitted char is '<' followed by "!--"
+            if result.ends_with('<') && chars.peek() == Some(&'!') {
                 // Look ahead for <!--
                 let mut lookahead = chars.clone();
                 lookahead.next(); // !
                 if lookahead.next() == Some('-') && lookahead.next() == Some('-') {
+                    // Strip the comment entirely — remove the '<' we just pushed
+                    result.pop();
                     chars.next(); // consume !
                     chars.next(); // consume -
                     chars.next(); // consume -
@@ -454,7 +445,6 @@ pub fn minify_html(html: &str) -> String {
                 }
             }
             in_tag = true;
-            result.push(c);
             continue;
         }
 

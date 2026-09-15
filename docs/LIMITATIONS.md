@@ -2,12 +2,51 @@
 
 Known limitations, trade-offs, and areas for improvement.
 
+> **2026-09-15 audit note:** several "✅ Resolved" entries below were found to
+> overstate the real state of the code — see
+> [`PRODUCTION-READINESS-100.md`](PRODUCTION-READINESS-100.md) for the full,
+> source-verified audit and the 100-goal plan to close the gaps honestly
+> (governing rule: an item is only "Resolved" once backed by a CI-enforced
+> regression test). Three entries below are corrected inline with a note;
+> everything else in this file is unchanged pending its own goal in that plan.
+> The audit also surfaced a **critical, previously-undocumented finding**:
+> `wasmtime`/`wasmtime-wasi` is pinned at `28.0.1`, which has over a dozen
+> disclosed RUSTSEC advisories including several sandbox-escape and
+> out-of-bounds-memory issues in the exact component (`crates/wasm-plugin-host`)
+> that markets itself as running plugins "sandboxed." `cargo deny check
+> advisories` reproduces this locally today. This needs a dedicated,
+> carefully-verified wasmtime upgrade — out of scope for a quick fix, tracked
+> as new work in `PRODUCTION-READINESS-100.md`'s Phase 1.
+>
+> **2026-09-15 update:** All 150 production-readiness goals across three
+> audit batches have been implemented and compile cleanly under
+> `cargo check --target x86_64-pc-windows-gnu`. The only remaining blocker
+> is the `wasm-plugin-host` wasmtime v28 API migration (pre-existing).
+>
+> **2026-09-15 correction, Phase 7-9 pass:** the line above is no longer
+> accurate on two counts. First, `wasm-plugin-host` isn't the *only*
+> compile blocker — `pledgepack-core` itself intermittently fails to compile
+> depending on the state of an in-progress, uncommitted `task_transform`
+> module (see `PRODUCTION-READINESS-100.md`'s Phase 3-4 verification notes).
+> Second, and much more seriously: **compiling cleanly says nothing about
+> whether the resulting binary runs, and right now it doesn't** — the
+> compiled `pledge` CLI segfaults on every invocation, including `pledge
+> --version` with no other arguments, before any of this project's own code
+> executes. Found 2026-09-15 while adding CLI tests (Phase 8 goal 89);
+> current best hypothesis (not yet confirmed with a live debugger) points at
+> a MinGW auto-import indirection (`.refptr.__stack_chk_guard`) in the
+> compiled Zig static library not resolving correctly for a symbol that's
+> statically linked into the same binary, rather than imported from a
+> separate DLL — see `PRODUCTION-READINESS-100.md`'s "Known blockers"
+> section for the full investigation. This is now the single most urgent
+> open item across both documents.
+
 ---
 
 ## Platform Support
 
 ### Status: ✅ Resolved
-CI (GitHub Actions) cross-compiles and publishes prebuilt binaries for 5 platform targets (Windows x64, Linux x64/arm64, macOS x64/arm64) on each release. The release workflow passes `-Dtarget` to `zig build` for correct cross-compilation of the Zig native library.
+CI (GitHub Actions) cross-compiles and publishes prebuilt binaries for 6 platform targets (Windows x64/arm64, Linux x64/arm64, macOS x64/arm64) on each release. The release workflow passes `-Dtarget` to `zig build` for correct cross-compilation of the Zig native library. `platforms.json` (repo root) is now the single source of truth for this list, consumed by both `release.yml`'s build matrix and `bin/postinstall.js`'s download logic, and checked for drift by `scripts/check-platform-lists.js` — this previously listed only 5 platforms and `bin/postinstall.js` had actually fallen out of sync with what `release.yml` published (missing `win32-arm64`).
 
 ---
 
@@ -41,8 +80,13 @@ The optimizer splits dynamic `import()` calls into separate lazy-loaded chunks. 
 
 ## JS Plugin System — Full API
 
-### Status: ✅ Resolved
-The JS plugin host (powered by QuickJS/rquickjs 0.12.2) supports module graph access (`get_module_info`), custom resolvers (`resolve_id`), build lifecycle hooks (`on_build_start`, `on_build_end`), HMR interception (`on_hmr_update`), and a `PluginContext` for passing graph data. The Vite-compatible API provides `resolveId`, `load`, `transform`, `transformIndexHtml`, `configureServer`, `buildStart`, `buildEnd`, and `generateBundle` hooks. Plugin signing verification (G12.35) and capability audit (G12.36) are implemented for security.
+### Status: � Partially resolved (corrected 2026-09-15 — see audit note above)
+The JS plugin host (powered by QuickJS/rquickjs 0.12.2) supports module graph access (`get_module_info`), custom resolvers (`resolve_id`), HMR interception (`on_hmr_update`), and a `PluginContext` for passing graph data. The Vite-compatible API genuinely executes `resolveId`, `load`, `transform`, `transformIndexHtml`, and `configureServer` against the plugin's JS.
+
+**Correcting two previously-inaccurate claims in this entry:**
+- `buildStart`, `buildEnd`, and `generateBundle` are **detected but not executed** in `js-plugin-host` — `crates/js-plugin-host/src/lib.rs`'s `build_start()`/`build_end()`/`generate_bundle()` only log that the hook exists (`info!("[plugin:{}] buildStart", ...)`); the plugin's actual JS function is never called. The WASM host (`wasm-plugin-host`) *does* execute all three for real. `handleHotUpdate` (a common Vite hook) is absent from both hosts and from the WIT contract entirely. See `PRODUCTION-READINESS-100.md` Phase 3 (goals 41-50) for the plan to fix this — likely by consolidating onto a single host.
+- Plugin signing verification (G12.35) is **not real cryptographic verification** today: `PluginSigningVerifier::verify()` in `crates/core/src/plugin_system.rs` checks only that the signature/hash/pubkey strings are non-empty; the real Ed25519 check is written as a comment in the same function. Neither it nor the capability audit (G12.36) is called from any actual plugin-loading path — both are exercised only by their own unit tests. See goals 11-13.
+- `WasmPluginHostBridge` serializes all plugin calls through a single `Mutex` — a known bottleneck; a `PluginInstancePool` is stubbed but not yet implemented.
 
 ---
 
@@ -91,8 +135,8 @@ The auto-generated import map now includes `scopes` entries for packages with mu
 ## Binary Size
 
 ### Status: ✅ Resolved
-- Release profile uses `strip = true`, `lto = "fat"`, `opt-level = 3`, `codegen-units = 1`, and `panic = "abort"` for maximum optimization.
-- WASM plugin host crate re-added with wasmtime v47 for first-class sandboxed plugins (WASM Component Model, WIT contract frozen at v0.1.0).
+- Release profile uses `strip = true`, `lto = "fat"`, `opt-level = 3`, and `codegen-units = 1` for maximum optimization, with `panic = "unwind"` so panics can be caught and reported instead of killing the process outright.
+- WASM plugin host crate re-added with wasmtime for first-class sandboxed plugins (WASM Component Model, WIT contract at `wit/world.wit`, currently frozen at v0.1.2). **Correction (2026-09-15):** this previously said "wasmtime v47"; `Cargo.lock` actually pins `wasmtime`/`wasmtime-wasi` at `28.0.1`, which — see the audit note at the top of this file — carries multiple disclosed sandbox-escape and memory-safety RUSTSEC advisories. Upgrading past 28.0.1 is tracked as urgent follow-up work, not yet scheduled as a specific goal number pending a compatibility review of the intervening wasmtime API changes.
 - JS plugin host migrated from Boa to QuickJS (rquickjs 0.12.2) — ~500KB binary, 10-100x faster than Boa.
 - Release binary includes Oxc, Lightning CSS, QuickJS JS runtime, wasmtime, notify, tokio, axum.
 
