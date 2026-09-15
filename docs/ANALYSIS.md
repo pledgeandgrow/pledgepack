@@ -1,5 +1,29 @@
 # Analysis — Moat, Competitors, Engine Design, and Audit
 
+> **2026-09-15 correction:** a source-level audit found this document
+> contains specific, false technical claims, despite its own header saying
+> "verified against source code." Confirmed wrong: (1) "Wasmtime v47" —
+> `Cargo.lock` pins `wasmtime`/`wasmtime-wasi` at **28.0.1**, not 47; (2) the
+> "Transform as a cached task" row below marks `transform_via_task_engine()`
+> / `crates/core/src/task_transform.rs` as "**Done**" and "the DEFAULT
+> path" — but `task_transform.rs` is **not wired into `pledgepack-core`'s
+> module tree** (no `pub mod task_transform;` in `lib.rs`) and has
+> unresolved dependencies of its own (a missing `pledgepack_task_system`
+> dependency, a missing `ast_pool` module reference, `native_sys::
+> read_file_async` which doesn't exist, a `TransformOutput.i18n_keys` field
+> that doesn't exist) — adding the module declaration to actually wire it in
+> was tried during this audit and broke the build with 10 further errors.
+> This is real, substantial, evidently mid-flight work, not a finished
+> "DEFAULT path." The actual default transform path is
+> `transform_modules_parallel()` using plain `rayon`, not the task-engine.
+> Given two specific, checkable claims in this document are both false, the
+> other "Done" verdicts below should not be trusted without independently
+> re-verifying each one — this document is **not** currently a reliable
+> source of what's actually implemented. See
+> [`PRODUCTION-READINESS-100.md`](PRODUCTION-READINESS-100.md) for the
+> current, test-verified status (governing rule: a claim counts as done only
+> once backed by a passing, CI-enforced regression test).
+>
 > Status: Consolidated analysis · Last updated: 2026-08-10 (all 194 rival goals complete, all moat pillars built, verified against source code)
 >
 > This file consolidates: Moat Analysis, Competitor Analysis, Engine Design Comparison, Turbo-Tasks Analysis, and Current State Audit.

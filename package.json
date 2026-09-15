@@ -4,8 +4,7 @@
   "description": "A Rust+Zig bundler with incremental computation, JS plugins, and Rollup-quality output. Like Vite, Webpack, or Turbopack — but faster.",
   "type": "module",
   "bin": {
-    "pledgepack": "bin/pledge.js",
-    "pledge": "bin/pledge.js"
+    "pledgepack": "bin/pledge.js"
   },
   "author": "Pledge and Grow",
   "license": "MIT",

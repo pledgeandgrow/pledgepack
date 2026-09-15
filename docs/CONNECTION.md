@@ -8,14 +8,14 @@
 - **npm package:** `pledgepack` (currently `0.3.2`)
 - **Binary:** Native Rust binary (`pledge.exe` / `pledge`) distributed via GitHub Releases + postinstall download
 - **Language:** Rust (Oxc parser, Lightning CSS, QuickJS JS runtime for plugin host and tests, wasmtime for WASM plugins)
-- **CLI:** `pledge dev`, `pledge build`, `pledge serve`, `pledge test`, `pledge analyze`, `pledge create`, `pledge migrate`, `pledge doctor`, `pledge bench`, `pledge cache`, `pledge generate-env-types`, `pledge completions`, `pledge config`
+- **CLI:** `pledgepack dev`, `pledgepack build`, `pledgepack serve`, `pledgepack test`, `pledgepack analyze`, `pledgepack create`, `pledgepack migrate`, `pledgepack doctor`, `pledgepack bench`, `pledgepack cache`, `pledgepack generate-env-types`, `pledgepack completions`, `pledgepack config`
 
 ### PledgeStack (React Framework)
 - **Role:** Opinionated React framework with SSR/SSG/RSC, file-based routing, API routes (like Next.js is to Turbopack)
 - **Repository:** `https://github.com/pledgeandgrow/pledgestack` (monorepo)
 - **npm package:** `pledgestack` (published, currently `0.1.12`)
 - **Language:** TypeScript/JavaScript (depends on pledgepack binary)
-- **CLI:** `pledge dev`, `pledge build`, `pledge start` (wraps `pledge` binary)
+- **CLI:** `pledge dev`, `pledge build`, `pledge start` (`dev`/`build` spawn the compiled `pledgepack` binary directly by resolved path, not via a shell command — see "CLI Command Mapping" below)
 
 ---
 
@@ -394,14 +394,27 @@ export default {
 
 ## CLI Command Mapping
 
+> **Note (2026-09-15):** PledgePack's npm package used to also register a
+> `pledge` bin alias, identical to PledgeStack's own command name — removed
+> because the two packages claiming the same global bin name made which one
+> actually ran non-deterministic (see `PRODUCTION-READINESS-100.md`).
+> PledgePack's commands are `pledgepack dev`/`pledgepack build`/etc. below;
+> PledgeStack's own top-level command is still `pledge` (unaffected — it's a
+> separate package with its own, non-colliding bin registration). The
+> "internally" column was never a literal shell invocation of a `pledge`
+> command anyway — `bundler-pledgepack` resolves and spawns the compiled
+> `pledgepack` binary directly via `require.resolve('pledgepack/...')`, not
+> via a PATH lookup — so this table's *behavior* was never affected by the
+> alias; only the labels below are corrected for clarity.
+
 | PledgeStack command | What it does internally |
 |-----------------|----------------------|
-| `pledge dev` | Calls `pledge dev` (PledgePack) + injects framework middleware |
-| `pledge build` | Calls `pledge build` (PledgePack) + runs SSG/SSR post-build |
+| `pledge dev` | Spawns the `pledgepack` binary's `dev` command + injects framework middleware |
+| `pledge build` | Spawns the `pledgepack` binary's `build` command + runs SSG/SSR post-build |
 | `pledge start` | Starts production SSR server (Node.js, not PledgePack) |
-| `pledge test` | Calls `pledge test` (PledgePack handles test runner) |
-| `pledge analyze` | Calls `pledge analyze` (PledgePack handles analyzer) |
-| `pledge migrate` | Calls `pledge migrate` (PledgePack handles migration) |
+| `pledge test` | Spawns the `pledgepack` binary's `test` command (PledgePack handles test runner) |
+| `pledge analyze` | Spawns the `pledgepack` binary's `analyze` command (PledgePack handles analyzer) |
+| `pledge migrate` | Spawns the `pledgepack` binary's `migrate` command (PledgePack handles migration) |
 
 ---
 

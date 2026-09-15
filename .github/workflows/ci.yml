@@ -461,7 +461,7 @@ jobs:
       - name: npm install (exercises postinstall.js for real)
         run: npm install
 
-      - name: pledge --version resolves and runs the freshly-built binary
+      - name: pledgepack --version resolves and runs the freshly-built binary
         run: |
           node bin/pledge.js --version
 

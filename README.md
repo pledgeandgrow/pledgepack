@@ -2,7 +2,14 @@
 
 A Rust + Zig bundler and dev server. Built with Oxc for transforms, Lightning CSS for styles, Axum for the dev server, and a Zig C ABI for hot-path file I/O and SIMD scanning.
 
-> **npm package:** `pledgepack` · **CLI command:** `pledge` (alias: `pledgepack`) · **Rust crates:** `pledgepack-*`
+> **npm package:** `pledgepack` · **CLI command:** `pledgepack` · **Rust crates:** `pledgepack-*`
+>
+> **Note:** earlier versions also registered a `pledge` alias. It's been
+> removed — `pledgestack` (the separate full-stack framework this bundler
+> can serve as a backend for) also registers a `pledge` command, and having
+> both packages claim the same global bin name meant which binary actually
+> ran was non-deterministic depending on install order. Use `pledgepack`
+> unambiguously from here on.
 
 ## Architecture
 
@@ -113,7 +120,7 @@ pledgepack dev --open             # Auto-open browser
 pledgepack dev --https            # HTTPS with self-signed certs
 
 # Production build
-pledgepack build                  # Build to dist/
+pledgepack build                  # Build to .pledge/ (configurable via out_dir)
 pledgepack build --watch          # Watch mode
 pledgepack build --profile        # Profile build phases
 pledgepack build --type-check     # TypeScript type checking
@@ -355,7 +362,7 @@ The transform pipeline lives in `crates/core/src/transform/` and is split into f
 
 ## Production Output
 
-- Writes transformed modules to `dist/` preserving directory structure
+- Writes transformed modules to `.pledge/` (default; configurable via `out_dir` in `pledge.config.ts`) preserving directory structure
 - Extensions changed to `.js`
 - Generates `index.html` with `<script type="module">` entry
 - Content-hashed filenames for cache busting

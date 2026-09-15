@@ -9,6 +9,62 @@ Development history of the Pledge build system enhancements.
 ### Summary
 Three audit batches implementing 150 production-readiness goals across security, correctness, transforms, HMR, resolver, dev server, native FFI, optimizer, module graph, engine, cache, CLI, cross-platform, and testing. All crates compile cleanly under `cargo check --target x86_64-pc-windows-gnu` except `wasm-plugin-host` (pre-existing wasmtime v28 API incompatibility).
 
+> **2026-09-15 correction:** "compiles cleanly" was never a claim that the
+> resulting binary *runs* — as of this correction it didn't: the compiled
+> `pledge` CLI segfaulted on every invocation (root cause found and fixed
+> the same day, see the entry below and
+> [`PRODUCTION-READINESS-100.md`](PRODUCTION-READINESS-100.md)). See that
+> document for source-verified, test-backed status going forward — 150
+> goals "implemented" here were self-reported, not individually
+> re-verified in this pass.
+
+### 2026-09-15 — Segfault fix and Phase 7-9 hardening
+- **Fixed:** `pledge.exe` segfaulting on every invocation (including `--version`
+  with no other args). Root cause: `native-sys` defined Windows/MSVC-only
+  runtime shims (`__stack_chk_guard`, `__stack_chk_fail`, `___chkstk_ms`,
+  `LdrRegisterDllNotification`) unconditionally instead of gating them to the
+  MSVC target; on this workspace's GNU toolchain they duplicated symbols
+  MinGW's own runtime already provides, corrupting Windows stack-probing for
+  any code run on a `rayon` worker thread. Regression test:
+  `native-sys/tests/rayon_compat.rs`.
+- **Fixed:** production `pledge build` output kept the original dev-mode
+  entry `<script src="/src/...">` tag in the generated `index.html`
+  alongside the new built chunk's script tag, instead of replacing it —
+  found via an actual end-to-end `pledge create`/`build`/`serve` smoke test.
+  Fixed in `crates/core/src/engine.rs` (`remove_entry_script_tags()`).
+- Full write-up of both fixes, plus Phase 7 (PledgeStack integration
+  hardening), Phase 8 (testing/coverage discipline), and Phase 9
+  (documentation, CHANGELOG-entry release gate, benchmarks, stress test,
+  scorecard) in [`PRODUCTION-READINESS-100.md`](PRODUCTION-READINESS-100.md).
+- **BREAKING:** removed the `pledge` bin alias from `package.json` —
+  `pledgepack` is now the only npm-registered command name. `pledgestack`
+  (the separate full-stack framework) also registers a `pledge` command,
+  and `bundler-pledgepack` (bundled into the published `pledgestack`
+  package) depends on `pledgepack` directly, so both packages claimed the
+  same global bin name whenever they ended up in the same `node_modules` —
+  which npm/package-manager version resolved that collision, and in which
+  direction, was undefined. Anyone invoking bare `pledge` for *this*
+  package needs to switch to `pledgepack`. The underlying compiled Rust
+  binary is still named `pledge` on disk (`crates/cli`'s `[[bin]] name =
+  "pledge"`) and unaffected — only the npm-level command registration
+  changed. Needs a version bump at release time to signal the breaking
+  change (next `## [Unreleased]` entry to become a new version header, not
+  done here since picking the actual release version is a release-time
+  decision).
+- **Fixed:** GitHub Actions CI failing on every job that builds Rust code
+  (`test`, `coverage`, `arm64-test`) with `error: target tuple in channel
+  name 'stable-x86_64-pc-windows-gnu'`. Cause: an uncommitted local change
+  to `rust-toolchain.toml` (pinning the channel to a Windows-GNU-specific
+  toolchain string) got swept into this session's earlier `git add .` and
+  pushed to `main` without being individually reviewed. That pin applies
+  workspace-wide regardless of which OS a CI job runs on, so Linux/macOS
+  runners (and the Windows runner too, since the exact host variant wasn't
+  installed there either) couldn't resolve it. Reverted to `channel =
+  "stable"` (the previously-committed value, resolves to MSVC by default on
+  Windows — the target this session's segfault fix is actually gated
+  around). See `PRODUCTION-READINESS-100.md`'s "Known blockers" section for
+  the full account.
+
 ### Security
 - Fixed dev-server path traversal in `module_handler`/`public_dir_handler` (canonicalization)
 - Removed `/@fs/` `contains("node_modules")` bypass — canonical path checks

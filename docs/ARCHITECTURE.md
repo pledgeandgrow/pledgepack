@@ -1,5 +1,18 @@
 # Pledge Architecture
 
+> **2026-09-15 correction:** a source-level audit found two factual errors
+> below, now fixed inline: this document said "Wasmtime v47" in two places —
+> `Cargo.lock` actually pins `wasmtime`/`wasmtime-wasi` at **28.0.1**, which
+> carries multiple disclosed RUSTSEC advisories (see
+> [`PRODUCTION-READINESS-100.md`](PRODUCTION-READINESS-100.md) Phase 1 and
+> [`LIMITATIONS.md`](LIMITATIONS.md)); and the WIT contract version
+> references here (v0.1.0/v0.1.1) are stale — it's at **v0.1.3** as of this
+> session (a `handle-hot-update` hook was added, see
+> `PRODUCTION-READINESS-100.md` Phase 3 goal 43). Treat other specific
+> version numbers and "Done"/"Implemented" claims elsewhere in this document
+> as unverified in this pass — `PRODUCTION-READINESS-100.md` is the
+> currently test-verified source of truth for what's actually working.
+
 ## Overview
 
 Pledge is a hybrid Rust + Zig bundler that uses:
@@ -28,7 +41,7 @@ User source files (src/*.tsx, *.ts)
    └── Scope hoisting (ESM, no wrappers)
         │
         ▼
-   Emitter ──► dist/ (JS files + index.html)
+   Emitter ──► .pledge/ (JS files + index.html)
 ```
 
 ## Crate Dependency Graph
@@ -169,7 +182,7 @@ incremental = true
 - BFS module graph traversal from entry point
 - Per-module: resolve → read → transform → cache → enqueue dependencies
 - Two-tier cache: memory (`HashMap`) → disk (`FunctionCache` with bincode)
-- Emits transformed JS to `dist/` preserving directory structure
+- Emits transformed JS to `.pledge/` preserving directory structure
 
 ### Transform Pipeline (`crates/core/src/transform/`)
 
@@ -310,7 +323,7 @@ Source string
 - **Network URL display**: Local network IP address shown alongside localhost URL via `local-ip-address` crate (e.g., `→ Network: http://192.168.x.x:3000`)
 
 ### WASM Plugin Host (`crates/wasm-plugin-host/src/lib.rs`)
-- **Wasmtime v47** engine loads `.wasm` plugin files (WASM Component Model, WIT contract frozen at v0.1.0)
+- **Wasmtime 28.0.1** engine loads `.wasm` plugin files (WASM Component Model, WIT contract currently at v0.1.3)
 - 8 hooks: `resolve-id`, `load`, `transform`, `transform-index-html`, `build-start`, `build-end`, `generate-bundle`, `configure-server`
 - WIT contract: 11 record types, `cache-key` in every output for task graph caching
 - Sandbox: restricted WASI context (no filesystem, no network, empty env)
@@ -348,7 +361,7 @@ Source string
 - **Test environments**: `test.environment` config — `node` (default), `jsdom` (DOM shims: document, window, navigator, location, customElements, MutationObserver, getComputedStyle), `happy-dom` (lighter DOM shims)
 - **Globals mode**: `test.globals: true` to run tests with global `describe`, `it`, `test`, `expect` without imports
 - **Test isolation**: `test.isolation` config — `file` (each file in own QuickJS context), `pool` (shared pool), `none` (no isolation)
-- **UI mode**: `pledge test --ui` generates HTML report with pass/fail/skip summary, per-test status, error details, and serves it at `localhost:5174` with auto-browser-open
+- **UI mode**: `pledgepack test --ui` generates HTML report with pass/fail/skip summary, per-test status, error details, and serves it at `localhost:5174` with auto-browser-open
 - **Config integration**: `run_test_file_with_config()` accepts `TestConfig` for full configuration support
 
 ### Environment Variables (`crates/core/src/env.rs`)
@@ -409,7 +422,7 @@ Source string
 ### Build Profiling (`crates/core/src/pipeline.rs`)
 - **Per-phase timing**: Parse + Transform, Optimize, Emit phases timed individually
 - **Total build time**: End-to-end build duration reported
-- **Enable**: `pledge build --profile` or `profile: true` in config
+- **Enable**: `pledgepack build --profile` or `profile: true` in config
 
 ### Edge Output (`crates/core/src/edge.rs`)
 - **Cloudflare Workers**: Service Worker format with `fetch` handler + `wrangler.toml`
@@ -420,7 +433,7 @@ Source string
 - **Per-module**: Original + transformed sizes, dependencies, module kind
 - **Chunks**: Modules grouped by directory with size summaries
 - **Duplicates**: Same module name in different paths flagged
-- **HTML report**: `pledge analyze` serves interactive HTML at `localhost:4200`
+- **HTML report**: `pledgepack analyze` serves interactive HTML at `localhost:4200`
 
 ### Transform Optimizations (`crates/core/src/transform_optimizations.rs`)
 - **WASM target compilation**: `?wasm` import suffix detects WASM modules and generates JS glue code
@@ -525,11 +538,11 @@ Source string
 - **Middleware chain** (`crates/core/src/middleware.rs`): Configurable request processing pipeline
 
 ### Observability & Monitoring (#101–#105)
-- **Build telemetry dashboard** (`crates/core/src/telemetry.rs`): `pledge dashboard` command serves interactive web UI at `localhost:4300` with build history chart, cache hit rate, module counts, and build durations. Build records persisted to `.pledge/history.json` (max 100 entries).
+- **Build telemetry dashboard** (`crates/core/src/telemetry.rs`): `pledgepack dashboard` command serves interactive web UI at `localhost:4300` with build history chart, cache hit rate, module counts, and build durations. Build records persisted to `.pledge/history.json` (max 100 entries).
 - **OpenTelemetry/OTLP export** (G12.26): `OtlpExporter` exports build spans via OTLP (gRPC/HTTP) to collectors like Jaeger, Zipkin, or Grafana. `TaskSpan` records with deterministic FNV-1a span IDs. `OtlpExportConfig` with endpoint, protocol, headers, timeout.
-- **Bundle size budget CI** (`crates/core/src/budgets.rs`): `pledge build --check-budgets` flag verifies total bundle size, per-chunk size, chunk count, and per-entry budgets. Exits non-zero on violations. Emits GitHub Actions `::error` annotations when `GITHUB_ACTIONS` env is set. Generates PR comment markdown with chunk size table.
-- **Performance regression detection** (`crates/core/src/bench.rs`): `pledge bench --baseline <ref>` compares median build time against stored baseline. `--threshold` flag sets regression percentage (default 10%). Baseline results persisted in `.pledge/bench.json` keyed by git ref.
-- **Module dependency graph** (`crates/core/src/analyzer.rs`): `pledge analyze --graph` generates interactive force-directed graph HTML with canvas-based physics simulation. Circular dependencies detected via DFS and highlighted in red. Legend distinguishes entry, CSS, module, and circular nodes.
+- **Bundle size budget CI** (`crates/core/src/budgets.rs`): `pledgepack build --check-budgets` flag verifies total bundle size, per-chunk size, chunk count, and per-entry budgets. Exits non-zero on violations. Emits GitHub Actions `::error` annotations when `GITHUB_ACTIONS` env is set. Generates PR comment markdown with chunk size table.
+- **Performance regression detection** (`crates/core/src/bench.rs`): `pledgepack bench --baseline <ref>` compares median build time against stored baseline. `--threshold` flag sets regression percentage (default 10%). Baseline results persisted in `.pledge/bench.json` keyed by git ref.
+- **Module dependency graph** (`crates/core/src/analyzer.rs`): `pledgepack analyze --graph` generates interactive force-directed graph HTML with canvas-based physics simulation. Circular dependencies detected via DFS and highlighted in red. Legend distinguishes entry, CSS, module, and circular nodes.
 - **Build event webhooks** (`crates/core/src/webhooks.rs`): `webhooks: { onBuild: URL, onError: URL }` config sends POST requests after builds. Auto-detects Slack and Discord webhook URL formats and generates appropriate message payloads. Custom headers supported via `webhooks.headers`.
 
 ### Internationalization & Accessibility (#106–#109)
@@ -541,7 +554,7 @@ Source string
 ### Advanced CSS, Security & Performance (#66–#84)
 - **Advanced CSS** (`crates/core/src/css_advanced.rs`): CSS Modules `composes` directive parsing and cross-file resolution (#66). Automatic dark mode CSS generation from `prefers-color-scheme` or custom property inversion (#67). CSS custom property optimization — inline static vars, remove unused, minify names in production (#68). Scoped CSS for React with `data-v-xxxxx` attribute selectors (#69). CSS nesting polyfill verification via lightningcss (#70).
 - **Performance** (`crates/core/src/performance.rs`): Route-based chunk splitting — `detect_routes()` scans app/pages, `split_by_routes()` in optimizer creates per-route chunks with shared extraction (#71). Module prefetch directives — `generate_prefetch_tags()` for `<link rel="modulepreload">` and `<link rel="prefetch">` (#72). CSS-in-JS runtime tree shaking — `strip_css_in_js_runtime()` removes styled-components/emotion/vanilla-extract runtime imports after static extraction (#73). WASM streaming compilation — `generate_wasm_streaming_code()` outputs `WebAssembly.instantiateStreaming()` with fallback (#74). Precompute module hash at transform time — `TransformOutput.content_hash` field (#75).
-- **Security** (`crates/core/src/security.rs`): Subresource Integrity (SRI) — `inject_sri_into_html()` generates SHA-384 `integrity` attributes for script/link tags (#81). Content Security Policy — `CspGenerator` analyzes HTML and generates `_headers` file with CSP (#82). Dependency vulnerability scanning — `scan_vulnerabilities()` checks package.json against CVE database, integrated in `pledge doctor` (#83). License compliance — `scan_licenses()` reads node_modules package.json license fields, `check_license_compliance()` validates against whitelist/blacklist, integrated in `pledge doctor` (#84).
+- **Security** (`crates/core/src/security.rs`): Subresource Integrity (SRI) — `inject_sri_into_html()` generates SHA-384 `integrity` attributes for script/link tags (#81). Content Security Policy — `CspGenerator` analyzes HTML and generates `_headers` file with CSP (#82). Dependency vulnerability scanning — `scan_vulnerabilities()` checks package.json against CVE database, integrated in `pledgepack doctor` (#83). License compliance — `scan_licenses()` reads node_modules package.json license fields, `check_license_compliance()` validates against whitelist/blacklist, integrated in `pledgepack doctor` (#84).
 
 ### Determinism & Verification (`crates/core/src/determinism.rs`)
 - **Provenance tracking** (G11.6): `ProvenanceRecord` tracks input sources, environment, and tool versions for each build artifact. Enables reproducible builds by recording exact inputs.
@@ -559,7 +572,7 @@ Source string
 
 # Build System
 
-## `pledge build` Pipeline
+## `pledgepack build` Pipeline
 
 ```
 1. Load config (pledge.config.ts → pledge.config.js → pledge.config.mjs → pledge.json → defaults)
@@ -587,7 +600,7 @@ Source string
    ├── Tree shake (remove unreachable modules)
    ├── Split chunks (entry / vendor / shared)
    └── Return Vec<Chunk>
-5. Emit to dist/
+5. Emit to .pledge/
    ├── Write each module as .js file
    ├── Generate index.html (with hashed asset references)
    ├── Generate manifest.json
@@ -671,7 +684,7 @@ All assets       → AssetManifest with content-hashed output paths
 
 ```
 1. Plugin discovery — scan configured plugin paths
-2. Plugin loading — WASM plugins via wasmtime v47, JS plugins via QuickJS (rquickjs 0.12.2)
+2. Plugin loading — WASM plugins via wasmtime 28.0.1, JS plugins via QuickJS (rquickjs 0.12.2)
 3. Hot reload — PluginHotReloader watches for file changes, reloads without restart
 4. Sandboxing — SandboxLimits (memory, CPU time) + SandboxedFs (filesystem access)
 5. Dependency resolution — PluginDependencyResolver with import maps for npm packages
@@ -848,7 +861,7 @@ TransformOptions {
 - `parse_federation_config()` parses JSON config into `FederationConfig` struct
 
 ### GraphQL Code Generation (#116)
-- `pledge build --codegen` generates TypeScript types from `.graphql` schema files
+- `pledgepack build --codegen` generates TypeScript types from `.graphql` schema files
 - `graphql: { schema: 'schema.graphql', output: 'src/generated', react_hooks: true }` config
 - Generates TypeScript interfaces for all GraphQL types
 - Nullable fields typed as `T | null`, lists as `T[]`
@@ -856,7 +869,7 @@ TransformOptions {
 - Output: `src/generated/graphql-types.ts`
 
 ### Environment-Specific Builds (#117)
-- `pledge build --env staging` loads `.env.staging` file
+- `pledgepack build --env staging` loads `.env.staging` file
 - Env vars injected as `process.env.*` defines at build time
 - `NODE_ENV` resolved from env file or production flag
 - Multiple environments without code changes: `.env.development`, `.env.staging`, `.env.production`
@@ -940,14 +953,14 @@ CacheKey = blake3(content_hash || function_id || params)
 
 ### Cache Invalidation
 - Content-based: File change → new content hash → cache miss → retransform
-- Manual: `pledge cache clear` removes all disk cache files
+- Manual: `pledgepack cache clear` removes all disk cache files
 - Automatic: Old entries are not garbage collected (future: TTL-based eviction)
 
-## Production Output (`dist/`)
+## Production Output (`.pledge/`)
 
 ### File Structure
 ```
-dist/
+.pledge/
 ├── index.html          # Generated HTML shell (with hashed asset references)
 ├── manifest.json       # Source → output file mapping
 └── src/
@@ -959,7 +972,7 @@ dist/
 ### Compression Output
 When `compress_gzip` and/or `compress_brotli` are enabled in config:
 ```
-dist/
+.pledge/
 ├── index.html.gz       # Gzip compressed (flate2)
 ├── index.html.br       # Brotli compressed (brotli crate)
 ├── src/
@@ -975,7 +988,7 @@ Compressible file types: `.js`, `.mjs`, `.css`, `.html`, `.json`, `.svg`, `.wasm
 
 ### Build Profiling
 - Per-phase timing: Parse + Transform, Optimize, Emit phases timed individually
-- Enable with `pledge build --profile` or `profile: true` in config
+- Enable with `pledgepack build --profile` or `profile: true` in config
 - Reports timing for each phase and total build duration
 
 ### Edge-Ready Output
@@ -1097,7 +1110,7 @@ PLEDGE_FULL_URL=${PLEDGE_API_URL}/api/v1
 `import.meta.env.PLEDGE_*` references in source code are replaced with actual values during transform.
 
 ### Type Generation
-`pledge generate-env-types` generates `pledge-env.d.ts`:
+`pledgepack generate-env-types` generates `pledge-env.d.ts`:
 ```typescript
 interface ImportMetaEnv {
   readonly PLEDGE_API_URL: string;
@@ -1161,7 +1174,7 @@ export default defineConfig({
 - **Config**: `test.coverage: true` to enable, `test.coverage_reporter` to select format
 
 ### UI Mode
-- `pledge test --ui` generates an HTML report with:
+- `pledgepack test --ui` generates an HTML report with:
   - Pass/fail/skip summary with colored indicators
   - Per-test file breakdown with suite and test names
   - Error messages and stack traces for failed tests
@@ -1180,7 +1193,7 @@ export default defineConfig({
 
 ### Build Telemetry Dashboard (#101)
 
-`pledge dashboard` serves an interactive web UI at `localhost:4300` showing build history:
+`pledgepack dashboard` serves an interactive web UI at `localhost:4300` showing build history:
 
 ```
 .pledge/history.json — persistent build records (max 100 entries)
@@ -1196,7 +1209,7 @@ The dashboard renders an SVG chart with build duration trend, cache hit rate, an
 
 ### Bundle Size Budget CI (#102)
 
-`pledge build --check-budgets` or `budgets: { enabled: true }` in config:
+`pledgepack build --check-budgets` or `budgets: { enabled: true }` in config:
 
 ```typescript
 export default defineConfig({
@@ -1214,25 +1227,25 @@ export default defineConfig({
 
 **CI integration**: When `GITHUB_ACTIONS` env is set, violations are emitted as `::error` annotations:
 ```
-::error file=dist/src/index.js::Bundle size budget exceeded: 320KB > 250KB
+::error file=.pledge/src/index.js::Bundle size budget exceeded: 320KB > 250KB
 ```
 
 ### Performance Regression Detection (#103)
 
-`pledge bench --baseline <ref> --threshold <pct>`:
+`pledgepack bench --baseline <ref> --threshold <pct>`:
 
 ```
-pledge bench --baseline main --threshold 10
+pledgepack bench --baseline main --threshold 10
 ```
 
 - Runs 5 build iterations, takes median duration
 - Compares against stored baseline in `.pledge/bench.json`
 - Exits non-zero if regression exceeds threshold (default: 10%)
-- Use `pledge bench --save-baseline <ref>` to store a new baseline
+- Use `pledgepack bench --save-baseline <ref>` to store a new baseline
 
 ### Module Dependency Graph (#104)
 
-`pledge analyze --graph` generates an interactive force-directed dependency graph:
+`pledgepack analyze --graph` generates an interactive force-directed dependency graph:
 
 - Canvas-based physics simulation (Verlet integration)
 - Nodes color-coded by type: entry (green), CSS (blue), module (gray), circular (red)
@@ -1344,13 +1357,13 @@ export default defineConfig({
 - Encrypted values appear as `__pledge_decrypt("base64string")` in output
 - Prevents plain-text secrets from appearing in bundle source
 
-## JSON Schema Generation (`pledge schema`)
+## JSON Schema Generation (`pledgepack schema`)
 
 Generates a JSON Schema for the `pledge.config.ts` configuration, enabling IDE autocompletion and validation:
 
 ```bash
-pledge schema              # Output to stdout
-pledge schema --output schema.json  # Write to file
+pledgepack schema              # Output to stdout
+pledgepack schema --output schema.json  # Write to file
 ```
 
 - Uses `schemars` crate to derive `JsonSchema` from `PledgeConfig` and all sub-structs/enums
@@ -1500,10 +1513,10 @@ When `shared_cache: true`, the build cache is placed at `{workspace_root}/.pledg
 
 # Dev Server & HMR
 
-## `pledge dev` — Development Server
+## `pledgepack dev` — Development Server
 
 ### Overview
-The dev server serves source files from `src/` with on-demand Oxc transforms. Unlike `pledge build` which pre-builds everything to `dist/`, the dev server transforms each file when requested by the browser.
+The dev server serves source files from `src/` with on-demand Oxc transforms. Unlike `pledgepack build` which pre-builds everything to `.pledge/`, the dev server transforms each file when requested by the browser.
 
 ### Routes
 
@@ -1747,7 +1760,7 @@ export default defineConfig({
 
 Or via CLI flag:
 ```bash
-pledge dev --open
+pledgepack dev --open
 ```
 
 ### Implementation
@@ -1877,17 +1890,17 @@ The dev server appends `sourceMappingURL` comments to transformed modules:
 ```
 This enables browser DevTools to show original source code instead of transformed output.
 
-## `pledge serve` — Production Server
+## `pledgepack serve` — Production Server
 
-Simple static file server for `dist/`:
+Simple static file server for `.pledge/`:
 - **Crate**: `axum` + `tower-http::ServeDir`
 - **Port**: 4000 (configurable)
 - **Purpose**: Preview production build locally
 - **No transforms**: Serves pre-built files as-is
 
 ```bash
-pledge build   # Build to dist/
-pledge serve   # Serve dist/ on :4000
+pledgepack build   # Build to .pledge/
+pledgepack serve   # Serve .pledge/ on :4000
 ```
 
 ## Dev Server Optimizations (Features 9-15)
@@ -1946,22 +1959,22 @@ The dev server displays the local network URL alongside localhost, so you can te
 - Shown for both HTTP and HTTPS dev servers
 - Useful for testing on mobile devices, other machines, or VMs on the same network
 
-## `pledge dashboard` — Build Telemetry (#101)
+## `pledgepack dashboard` — Build Telemetry (#101)
 
 The dashboard command serves an interactive web UI for build observability:
 
 ```
-pledge dashboard [--port 4300]
+pledgepack dashboard [--port 4300]
 ```
 
 - Serves at `localhost:4300` (configurable via `--port`)
-- Reads build history from `.pledge/history.json` (populated during `pledge build`)
+- Reads build history from `.pledge/history.json` (populated during `pledgepack build`)
 - Displays SVG chart with build duration trends and cache hit rates
 - Shows recent build summary table with status, duration, module counts
 - No build history required to run — shows empty state if no builds recorded
 
 ### Build History Records
-Each `pledge build` records telemetry data:
+Each `pledgepack build` records telemetry data:
 ```json
 {
   "timestamp": "2024-01-15T10:30:00Z",

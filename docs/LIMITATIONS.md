@@ -60,7 +60,7 @@ The transform pipeline now uses rayon for parallel module transformation. The bu
 ## Source Maps in Production
 
 ### Status: ✅ Resolved
-`pledge build` emits source maps with `none`, `inline`, and `external` options. Oxc's native source map generation is used.
+`pledgepack build` emits source maps with `none`, `inline`, and `external` options. Oxc's native source map generation is used.
 
 ---
 
@@ -114,21 +114,21 @@ The auto-generated import map now includes `scopes` entries for packages with mu
 ## Built-in Test Runner UI
 
 ### Status: ✅ Resolved
-`pledge test --watch` provides an interactive terminal UI with coverage reporting and browser-based test runner support for component tests.
+`pledgepack test --watch` provides an interactive terminal UI with coverage reporting and browser-based test runner support for component tests.
 
 ---
 
 ## HTTPS Dev Server
 
 ### Status: ✅ Resolved
-`pledge dev --https` enables HTTPS with automatic self-signed certificate generation via `rcgen`. Custom certificates are supported via `https.cert` and `https.key` config.
+`pledgepack dev --https` enables HTTPS with automatic self-signed certificate generation via `rcgen`. Custom certificates are supported via `https.cert` and `https.key` config.
 
 ---
 
 ## Incremental Build Watch Mode
 
 ### Status: ✅ Resolved
-`pledge build --watch` uses the function-level incremental cache. On file change, only affected modules are re-transformed and changed chunks are re-emitted.
+`pledgepack build --watch` uses the function-level incremental cache. On file change, only affected modules are re-transformed and changed chunks are re-emitted.
 
 ---
 
@@ -154,7 +154,7 @@ The PledgeStack adapter (`crates/adapter-pledgestack/`) provides comprehensive *
 - ✅ **Middleware discovery** — Root and server middleware files detected
 - ✅ **`.psx` → `.rs` copy** — Files copied for `cargo build` compatibility
 - ✅ **Route manifest generation** — JSON manifest with all frontend + backend + middleware routes
-- ✅ **Project scaffolding** — `pledge create pledgestack` generates full app structure
+- ✅ **Project scaffolding** — `pledgepack create pledgestack` generates full app structure
 - ✅ **Architecture separation** — PledgePack handles bundling/serving; PledgeStack handles SSR/API/middleware runtime (see [CONNECTION.md](./CONNECTION.md))
 
 > **Note:** PledgePack deliberately does NOT implement SSR rendering, API route execution, middleware execution, or `.psx` transpilation — these are PledgeStack's responsibilities. See [CONNECTION.md](./CONNECTION.md) for the full responsibility split.
