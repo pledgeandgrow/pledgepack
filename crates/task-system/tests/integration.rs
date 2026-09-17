@@ -217,19 +217,24 @@ fn active_query_filters_dirty_tasks() {
     assert_eq!(dirty.len(), 0);
 }
 
+// Define a task function using the macro. Must live at module scope, not
+// nested inside the test function below: the macro emits a sibling const
+// (`__MY_TASK_FN_ID`) plus a nested test module that reaches it via
+// `super::` — that resolves correctly for a module-level item, but not for
+// an item nested inside another function's body (Rust's module tree runs
+// through the enclosing module, not the enclosing function's local scope).
+use pledgepack_task_system::task;
+
+#[task]
+fn my_task(input: String) -> Task<u32> {
+    // The body is in the *_impl function; the wrapper just computes the TaskId
+    let _ = input;
+    42
+}
+
 /// Test that the #[task] macro generates correct TaskId computation.
 #[test]
 fn task_macro_generates_task_id() {
-    use pledgepack_task_system::task;
-
-    // Define a task function using the macro
-    #[task]
-    fn my_task(input: String) -> Task<u32> {
-        // The body is in the *_impl function; the wrapper just computes the TaskId
-        let _ = input;
-        42
-    }
-
     // The wrapper should return a Task<u32> with a deterministic TaskId
     let t1 = my_task("hello".to_string());
     let t2 = my_task("hello".to_string());

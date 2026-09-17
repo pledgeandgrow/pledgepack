@@ -44,7 +44,7 @@ fn large_scale_dependency_graph_construction() {
 
     // Phase 1: Build the dependency graph
     let start = Instant::now();
-    let mut graph = DependencyGraph::default();
+    let graph = DependencyGraph::default();
 
     // Register all tasks
     for i in 0..NUM_LEAF_TASKS {
@@ -137,7 +137,7 @@ fn large_scale_dependency_graph_construction() {
 fn large_scale_dirty_propagation() {
     println!("\n  G3.5: Dirty propagation benchmark");
 
-    let mut graph = DependencyGraph::default();
+    let graph = DependencyGraph::default();
 
     // Build a smaller but still significant graph for dirty propagation
     // 10k leaf tasks, 1k agg, 100 mid, 10 high, 1 root

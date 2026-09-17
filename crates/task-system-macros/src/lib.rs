@@ -200,11 +200,6 @@ fn expand_task(
     let fn_id_hash = fnv1a_64(&fn_name_str);
     let fn_id_const_name = format_ident!("__{}_FN_ID", fn_name_str.to_uppercase());
 
-    // The function's name (used as the function ID string for TaskId computation).
-    // We keep the string for TaskId::compute() since blake3 is the content hash,
-    // but the const hash is available for fast equality checks.
-    let fn_id = fn_name_str.clone();
-
     // G2.5: Track whether the original function was async.
     let was_async = input_fn.sig.asyncness.is_some();
 
@@ -302,7 +297,7 @@ fn expand_task(
     let fn_id_with_generics = if has_generics {
         let generic_str: String = generic_params
             .iter()
-            .map(|p| type_to_string_generic(p))
+            .map(type_to_string_generic)
             .collect::<Vec<_>>()
             .join(",");
         format!("{}<{}>", fn_name_str, generic_str)

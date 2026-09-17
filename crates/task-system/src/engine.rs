@@ -21,7 +21,7 @@ use crate::backend::{MemoryBackend, TaskBackend};
 use crate::environment::{self, Environment};
 use crate::graph::{AggregationGraph, DependencyGraph, TaskStatus};
 use crate::read_tracker;
-use crate::registry::{TaskExecutor, TaskRegistry};
+use crate::registry::TaskRegistry;
 use crate::task::TaskId;
 use dashmap::DashMap;
 use serde::{Serialize, de::DeserializeOwned};
@@ -104,19 +104,31 @@ impl Notify {
 /// Error types for the task system.
 #[derive(Debug, thiserror::Error)]
 pub enum TaskError {
+    /// No executor is registered for this task's ID.
     #[error("Task not found in registry: {0}")]
     NotRegistered(String),
+    /// The task's executor returned an error while computing its output.
     #[error("Task computation failed: {0}")]
     ComputationFailed(String),
+    /// A cached task output failed to deserialize.
     #[error("Task output deserialization failed: {0}")]
     DeserializationFailed(String),
+    /// A dependency cycle was found among the listed tasks.
     #[error("Task cycle detected among {tasks:?}")]
-    CycleDetected { tasks: Vec<crate::task::TaskId> },
+    CycleDetected {
+        /// The task IDs that form the cycle.
+        tasks: Vec<crate::task::TaskId>,
+    },
+    /// The task output storage backend (memory/disk/remote) returned an error.
     #[error("Backend error: {0}")]
     BackendError(String),
+    /// Re-executing a task with `verify_determinism` enabled produced a
+    /// different output than the cached one.
     #[error("Determinism violation for task {task_id}:\n{diff}")]
     DeterminismViolation {
+        /// The task whose re-execution diverged from its cached output.
         task_id: crate::task::TaskId,
+        /// A human-readable diff between the cached and recomputed output.
         diff: String,
     },
 }
@@ -635,7 +647,7 @@ impl TaskEngine {
         let results = futures::future::join_all(futures).await;
 
         let mut outputs = Vec::with_capacity(tasks.len());
-        for ((id, _), result) in tasks.into_iter().zip(results.into_iter()) {
+        for ((id, _), result) in tasks.into_iter().zip(results) {
             let value = result?;
             outputs.push((id, value));
         }
@@ -777,10 +789,10 @@ impl TaskEngine {
         };
 
         // Merge read-tracked deps into the output
-        if !read_deps.is_empty() {
-            if let Ok(ref mut out) = output {
-                out.read_dependencies = read_deps;
-            }
+        if !read_deps.is_empty()
+            && let Ok(ref mut out) = output
+        {
+            out.read_dependencies = read_deps;
         }
 
         // Handle the result
@@ -1252,6 +1264,7 @@ pub struct SchedulerTrace {
 }
 
 impl SchedulerTrace {
+    /// Create an empty trace, timed from this call.
     pub fn new() -> Self {
         SchedulerTrace {
             events: Vec::new(),
@@ -1415,9 +1428,13 @@ impl TaskEngine {
 /// Statistics about the task engine.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct TaskEngineStats {
+    /// Number of tasks with an output already present in the memory tier.
     pub cached_tasks: usize,
+    /// Total number of tasks known to the dependency graph.
     pub total_tasks: usize,
+    /// Number of tasks marked dirty (need recomputation before they're read).
     pub dirty_tasks: usize,
+    /// Number of tasks that are up to date.
     pub clean_tasks: usize,
 }
 
@@ -1431,6 +1448,8 @@ pub struct TaskEngineBuilder {
 }
 
 impl TaskEngineBuilder {
+    /// Start building an engine around the given task registry, with only
+    /// the in-memory backend tier enabled.
     pub fn new(registry: TaskRegistry) -> Self {
         TaskEngineBuilder {
             registry,
@@ -1441,21 +1460,27 @@ impl TaskEngineBuilder {
         }
     }
 
+    /// Enable the disk tier, backing the in-memory cache with `disk`.
     pub fn with_disk(mut self, disk: crate::backend::DiskBackend) -> Self {
         self.disk = Some(disk);
         self
     }
 
+    /// Enable the remote tier, backing memory/disk with `remote`.
     pub fn with_remote(mut self, remote: pledgepack_cache::remote::RemoteCache) -> Self {
         self.remote = Some(remote);
         self
     }
 
+    /// Re-execute each task after a cache hit and compare outputs, surfacing
+    /// a [`TaskError::DeterminismViolation`] on divergence. Expensive; for
+    /// testing/debugging, not normal use.
     pub fn with_verify_determinism(mut self) -> Self {
         self.verify_determinism = true;
         self
     }
 
+    /// Finish building and produce the configured `TaskEngine`.
     pub fn build(self) -> TaskEngine {
         let mut backend = TaskBackend::new(self.memory);
         if let Some(disk) = self.disk {

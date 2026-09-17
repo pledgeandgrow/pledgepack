@@ -14,7 +14,7 @@ fn main() {
         let zig_executable = std::env::var("ZIG_EXECUTABLE").unwrap_or_else(|_| "zig".to_string());
         let status = std::process::Command::new(&zig_executable)
             .arg("build")
-            .current_dir(&root)
+            .current_dir(root)
             .status();
         match status {
             Ok(s) if s.success() => {
@@ -48,14 +48,14 @@ fn main() {
     if target_os == "windows" && target_env == "gnu" {
         let msvc_style = lib_dir.join("pledge_native.lib");
         let gnu_style = lib_dir.join("libpledge_native.a");
-        if msvc_style.exists() {
-            if let Err(e) = std::fs::copy(&msvc_style, &gnu_style) {
-                eprintln!(
-                    "[pledge-native-sys] WARNING: failed to copy {} -> {}: {e}",
-                    msvc_style.display(),
-                    gnu_style.display()
-                );
-            }
+        if msvc_style.exists()
+            && let Err(e) = std::fs::copy(&msvc_style, &gnu_style)
+        {
+            eprintln!(
+                "[pledge-native-sys] WARNING: failed to copy {} -> {}: {e}",
+                msvc_style.display(),
+                gnu_style.display()
+            );
         }
     }
 

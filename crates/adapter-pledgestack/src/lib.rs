@@ -704,7 +704,7 @@ impl PledgeStackAdapter {
             server_entry: self.server_entry.as_ref().and_then(|p| {
                 p.strip_prefix(&self.root)
                     .ok()
-                    .map(|r| pledgepack_core::normalize_path(r))
+                    .map(pledgepack_core::normalize_path)
             }),
             root_layout: self.root_layout.clone(),
             not_found: self.not_found.clone(),
@@ -945,13 +945,12 @@ fn detect_route_methods(path: &Path) -> Vec<String> {
         }
 
         for method in &methods {
-            if trimmed.starts_with(&format!("export const {}", method))
+            if (trimmed.starts_with(&format!("export const {}", method))
                 || trimmed.starts_with(&format!("export async function {}", method))
-                || trimmed.starts_with(&format!("export function {}", method))
+                || trimmed.starts_with(&format!("export function {}", method)))
+                && !found.contains(&method.to_string())
             {
-                if !found.contains(&method.to_string()) {
-                    found.push(method.to_string());
-                }
+                found.push(method.to_string());
             }
         }
     }

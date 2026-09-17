@@ -62,13 +62,21 @@
 #![warn(missing_docs)]
 #![warn(clippy::all)]
 
+/// 3-tier task output storage (memory → disk → remote).
 pub mod backend;
+/// The `TaskEngine` — schedules, executes, and caches tasks on demand.
 pub mod engine;
+/// Execution environment (browser/server/shared) used for environment-aware task IDs.
 pub mod environment;
+/// The dependency graph: edges between tasks and dirty/invalidation propagation.
 pub mod graph;
+/// Thread-local read tracking for implicit dependency capture.
 pub mod read_tracker;
+/// The `TaskId` → executor registry.
 pub mod registry;
+/// Route-based prefetch tracking and prediction.
 pub mod route_tracker;
+/// The core `Task<T>` type and `TaskId` computation.
 pub mod task;
 #[cfg(feature = "task-trace")]
 pub mod task_trace;

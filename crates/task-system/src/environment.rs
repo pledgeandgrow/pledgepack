@@ -48,7 +48,9 @@ fn registry() -> &'static RwLock<HashMap<u64, String>> {
 /// G5.9: `Custom` allows plugins to define arbitrary environments (e.g.,
 /// "rust-wasm", "deno", "bun"). The u64 is a hash of the environment name,
 /// looked up in a global registry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
 pub enum Environment {
     /// Browser/client-side code. JSX transforms to DOM operations.
     /// Target: ES2020+, ESM output, browser-compatible APIs.
@@ -66,6 +68,7 @@ pub enum Environment {
     /// environment. Used for file I/O, config parsing, etc.
     /// Tasks with this environment share a single task node across all
     /// environments, avoiding redundant computation.
+    #[default]
     Shared,
     /// G5.9: A plugin-defined custom environment.
     /// The u64 is a blake3 hash of the environment name, registered via
@@ -184,12 +187,6 @@ impl Environment {
     }
 }
 
-impl Default for Environment {
-    fn default() -> Self {
-        Environment::Shared
-    }
-}
-
 impl std::fmt::Display for Environment {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.as_str())
@@ -202,7 +199,7 @@ thread_local! {
     /// The current environment for the executing task on this thread.
     /// Set by `TaskEngine::compute_task()` before calling the executor.
     /// Read by `current_environment()` when tasks need to know their env.
-    static CURRENT_ENVIRONMENT: RefCell<Environment> = RefCell::new(Environment::Shared);
+    static CURRENT_ENVIRONMENT: RefCell<Environment> = const { RefCell::new(Environment::Shared) };
 }
 
 /// Get the current environment for the executing task on this thread.

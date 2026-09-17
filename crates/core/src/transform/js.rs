@@ -200,7 +200,6 @@ pub(super) fn transform_js(
         let minifier = oxc::minifier::Minifier::new(oxc::minifier::MinifierOptions {
             mangle: Some(Default::default()),
             compress: Some(Default::default()),
-            ..Default::default()
         });
         minifier.minify(&allocator, &mut program);
     }

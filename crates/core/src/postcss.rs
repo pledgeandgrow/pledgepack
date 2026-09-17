@@ -827,18 +827,19 @@ fn inline_imports(css: &str, file_path: &str, root: &Path) -> String {
             }
 
             // Try url() form: @import url(...) or @import url("...")
-            if let Some(url) = extract_import_url(trimmed) {
-                if !url.starts_with("http://") && !url.starts_with("https://") {
-                    let resolved = if url.starts_with('/') {
-                        root.join(url.trim_start_matches('/'))
-                    } else {
-                        file_dir.join(&url)
-                    };
-                    if let Ok(imported_css) = std::fs::read_to_string(&resolved) {
-                        result.push_str(&imported_css);
-                        result.push('\n');
-                        continue;
-                    }
+            if let Some(url) = extract_import_url(trimmed)
+                && !url.starts_with("http://")
+                && !url.starts_with("https://")
+            {
+                let resolved = if url.starts_with('/') {
+                    root.join(url.trim_start_matches('/'))
+                } else {
+                    file_dir.join(&url)
+                };
+                if let Ok(imported_css) = std::fs::read_to_string(&resolved) {
+                    result.push_str(&imported_css);
+                    result.push('\n');
+                    continue;
                 }
             }
 

@@ -3659,25 +3659,25 @@ export default defineConfig({
                 .args(["list", "-g", "pledgepack", "--depth=0"])
                 .output();
 
-            if let Ok(output) = npm_result {
-                if output.status.success() {
-                    println!("  \x1b[90mUpdating via npm...\x1b[0m");
-                    let status = std::process::Command::new("npm")
-                        .args(["install", "-g", &format!("pledgepack@{}", target_version)])
-                        .status();
-                    if status.map(|s| s.success()).unwrap_or(false) {
-                        println!(
-                            "\n  \x1b[32m✓\x1b[0m Updated to pledgepack@{}\n",
-                            target_version
-                        );
-                    } else {
-                        eprintln!(
-                            "\n  \x1b[31m✗\x1b[0m Failed to update. Try: npm install -g pledgepack@{}\n",
-                            target_version
-                        );
-                    }
-                    return Ok(());
+            if let Ok(output) = npm_result
+                && output.status.success()
+            {
+                println!("  \x1b[90mUpdating via npm...\x1b[0m");
+                let status = std::process::Command::new("npm")
+                    .args(["install", "-g", &format!("pledgepack@{}", target_version)])
+                    .status();
+                if status.map(|s| s.success()).unwrap_or(false) {
+                    println!(
+                        "\n  \x1b[32m✓\x1b[0m Updated to pledgepack@{}\n",
+                        target_version
+                    );
+                } else {
+                    eprintln!(
+                        "\n  \x1b[31m✗\x1b[0m Failed to update. Try: npm install -g pledgepack@{}\n",
+                        target_version
+                    );
                 }
+                return Ok(());
             }
 
             // Fallback: suggest manual update

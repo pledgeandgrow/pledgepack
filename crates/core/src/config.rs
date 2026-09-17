@@ -1088,7 +1088,7 @@ impl Default for PledgeConfig {
                 .iter()
                 .find(|p| p.exists())
                 .and_then(|p| p.strip_prefix(&cwd).ok())
-                .map(|p| crate::normalize_path(p))
+                .map(crate::normalize_path)
                 .unwrap_or_else(|| "src/index.tsx".to_string())
         };
         Self {

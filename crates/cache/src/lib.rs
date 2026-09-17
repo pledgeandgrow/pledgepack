@@ -67,10 +67,8 @@ impl FunctionCache {
     /// to `cache_dir` (created if missing) so they survive restarts;
     /// otherwise only the in-memory tier is used.
     pub fn new(cache_dir: PathBuf, persist: bool) -> Self {
-        if persist {
-            if let Err(e) = std::fs::create_dir_all(&cache_dir) {
-                tracing::warn!("Failed to create cache directory {:?}: {}", cache_dir, e);
-            }
+        if persist && let Err(e) = std::fs::create_dir_all(&cache_dir) {
+            tracing::warn!("Failed to create cache directory {:?}: {}", cache_dir, e);
         }
 
         Self {

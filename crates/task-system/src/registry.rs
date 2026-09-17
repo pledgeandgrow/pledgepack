@@ -79,6 +79,7 @@ pub struct TaskRegistry {
 }
 
 impl TaskRegistry {
+    /// Create an empty registry with no executors registered.
     pub fn new() -> Self {
         TaskRegistry {
             executors: DashMap::new(),

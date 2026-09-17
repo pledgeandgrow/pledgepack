@@ -133,51 +133,53 @@ export const sprite = `{}`;"#,
         });
     }
 
-    if is_production && config.image.enabled && !is_inline {
-        if crate::image_pipeline::is_raster_image(source) {
-            use crate::image_pipeline::{
-                ImageFormat, ImageOptions, generate_image_module, process_image,
-            };
+    if is_production
+        && config.image.enabled
+        && !is_inline
+        && crate::image_pipeline::is_raster_image(source)
+    {
+        use crate::image_pipeline::{
+            ImageFormat, ImageOptions, generate_image_module, process_image,
+        };
 
-            let mut formats = Vec::new();
-            if config.image.webp {
-                formats.push(ImageFormat::WebP);
+        let mut formats = Vec::new();
+        if config.image.webp {
+            formats.push(ImageFormat::WebP);
+        }
+        if config.image.avif {
+            formats.push(ImageFormat::AVIF);
+        }
+        formats.push(ImageFormat::JPEG);
+
+        let opts = ImageOptions {
+            formats,
+            widths: if !config.image.responsive_widths.is_empty() {
+                config.image.responsive_widths.clone()
+            } else {
+                vec![640, 750, 828, 1080, 1200, 1920, 2048]
+            },
+            quality: config.image.quality as u8,
+            blur_placeholder: true,
+            progressive: true,
+            strip_metadata: true,
+        };
+
+        match process_image(source, clean_path, &opts) {
+            Ok(processed) => {
+                let code = generate_image_module(&processed);
+                return Ok(TransformOutput {
+                    code,
+                    source_map: None,
+                    css_modules: None,
+                    is_css: false,
+                    extracted_css: None,
+                    is_worker: false,
+                    dynamic_imports: Vec::new(),
+                    content_hash: None,
+                });
             }
-            if config.image.avif {
-                formats.push(ImageFormat::AVIF);
-            }
-            formats.push(ImageFormat::JPEG);
-
-            let opts = ImageOptions {
-                formats,
-                widths: if !config.image.responsive_widths.is_empty() {
-                    config.image.responsive_widths.clone()
-                } else {
-                    vec![640, 750, 828, 1080, 1200, 1920, 2048]
-                },
-                quality: config.image.quality as u8,
-                blur_placeholder: true,
-                progressive: true,
-                strip_metadata: true,
-            };
-
-            match process_image(source, clean_path, &opts) {
-                Ok(processed) => {
-                    let code = generate_image_module(&processed);
-                    return Ok(TransformOutput {
-                        code,
-                        source_map: None,
-                        css_modules: None,
-                        is_css: false,
-                        extracted_css: None,
-                        is_worker: false,
-                        dynamic_imports: Vec::new(),
-                        content_hash: None,
-                    });
-                }
-                Err(e) => {
-                    tracing::warn!("Image optimization failed for {}: {}", clean_path, e);
-                }
+            Err(e) => {
+                tracing::warn!("Image optimization failed for {}: {}", clean_path, e);
             }
         }
     }

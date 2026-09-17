@@ -378,7 +378,7 @@ impl Resolver {
         // 1. Check aliases (sorted longest-first to avoid prefix mismatches, e.g.
         //    so that `@/` does not incorrectly match `@components/Button`)
         let mut sorted_aliases: Vec<&Alias> = self.aliases.iter().collect();
-        sorted_aliases.sort_by(|a, b| b.from.len().cmp(&a.from.len()));
+        sorted_aliases.sort_by_key(|a| std::cmp::Reverse(a.from.len()));
 
         for alias in &sorted_aliases {
             if specifier.starts_with(&alias.from) {
@@ -503,12 +503,10 @@ impl Resolver {
                 if pkg_json.is_file()
                     && let Ok(content) = std::fs::read_to_string(&pkg_json)
                     && let Ok(pkg) = serde_json::from_str::<serde_json::Value>(&content)
-                {
-                    if let Some(resolved) =
+                    && let Some(resolved) =
                         self.resolve_package_entry(&module_path, &pkg, subpath, specifier)?
-                    {
-                        return Ok(Some(resolved));
-                    }
+                {
+                    return Ok(Some(resolved));
                 }
 
                 // Try direct file resolution for subpath
@@ -747,32 +745,30 @@ impl Resolver {
             if pkg_json_path.is_file()
                 && let Ok(content) = std::fs::read_to_string(&pkg_json_path)
                 && let Ok(pkg) = serde_json::from_str::<serde_json::Value>(&content)
+                && let Some(imports) = pkg.get("imports").and_then(|v| v.as_object())
             {
-                if let Some(imports) = pkg.get("imports").and_then(|v| v.as_object()) {
-                    if let Some(mapping) = imports.get(specifier) {
-                        // imports can be a string or a conditional object
-                        if let Some(s) = mapping.as_str() {
-                            return self.try_resolve_path(&current.join(s));
-                        } else if let Some(obj) = mapping.as_object() {
-                            // Conditional imports: resolve using the same
-                            // context-driven condition priority as exports.
-                            for condition in conditions_for_context(self.runtime, self.module_type)
+                if let Some(mapping) = imports.get(specifier) {
+                    // imports can be a string or a conditional object
+                    if let Some(s) = mapping.as_str() {
+                        return self.try_resolve_path(&current.join(s));
+                    } else if let Some(obj) = mapping.as_object() {
+                        // Conditional imports: resolve using the same
+                        // context-driven condition priority as exports.
+                        for condition in conditions_for_context(self.runtime, self.module_type) {
+                            if let Some(target) = obj.get(condition)
+                                && let Some(t) = target.as_str()
                             {
-                                if let Some(target) = obj.get(condition)
-                                    && let Some(t) = target.as_str()
-                                {
-                                    let resolved = current.join(t);
-                                    if let Some(p) = self.try_resolve_path(&resolved)? {
-                                        return Ok(Some(p));
-                                    }
+                                let resolved = current.join(t);
+                                if let Some(p) = self.try_resolve_path(&resolved)? {
+                                    return Ok(Some(p));
                                 }
                             }
                         }
                     }
-                    // imports are package-scoped: once we find a package.json
-                    // with an imports field, stop searching upwards.
-                    return Ok(None);
                 }
+                // imports are package-scoped: once we find a package.json
+                // with an imports field, stop searching upwards.
+                return Ok(None);
             }
             if !current.pop() {
                 break;

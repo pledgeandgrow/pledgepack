@@ -290,7 +290,7 @@ impl RouteTracker {
 
         // Sort by frequency
         let mut predictions: Vec<(String, u32)> = transitions.into_iter().collect();
-        predictions.sort_by(|a, b| b.1.cmp(&a.1));
+        predictions.sort_by_key(|p| std::cmp::Reverse(p.1));
 
         predictions.into_iter().map(|(r, _)| r).collect()
     }

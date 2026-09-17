@@ -868,7 +868,7 @@ document.addEventListener("click", function(e) {
         // Warn on threshold crossings rather than every insertion past the
         // limit, to avoid flooding the log on large builds.
         if module_count == WARN_MODULES + 1
-            || (module_count > WARN_MODULES && module_count % WARN_MODULES == 0)
+            || (module_count > WARN_MODULES && module_count.is_multiple_of(WARN_MODULES))
         {
             warn!(
                 "Large module count ({}). Consider increasing memory limits or splitting the build.",

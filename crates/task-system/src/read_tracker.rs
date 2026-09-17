@@ -106,7 +106,7 @@ impl ReadTracker {
 thread_local! {
     /// The current read tracker for the executing task on this thread.
     /// Set by `TaskEngine::compute_task()` before calling the executor.
-    static CURRENT_READ_TRACKER: RefCell<Option<ReadTracker>> = RefCell::new(None);
+    static CURRENT_READ_TRACKER: RefCell<Option<ReadTracker>> = const { RefCell::new(None) };
 }
 
 /// Record a file read in the current thread's read tracker.
@@ -123,7 +123,11 @@ pub fn record_read<P: AsRef<Path>>(path: P) {
 
 /// Install a read tracker for the duration of a closure.
 ///
-/// Returns the closure's result and the tracker with recorded reads.
+/// Returns the closure's result and the tracker with recorded reads. Only
+/// exercised by this module's own tests today — production code runs async
+/// task executors, which need the install/collect pair below instead (a
+/// closure can't span an `.await`).
+#[allow(dead_code)]
 pub(crate) fn with_read_tracker<F, R>(f: F) -> (R, ReadTracker)
 where
     F: FnOnce() -> R,

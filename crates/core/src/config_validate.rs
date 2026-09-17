@@ -427,16 +427,15 @@ pub fn validate_config_values(config: &serde_json::Value) -> Vec<ValidationError
 
     if let Some(obj) = config.as_object() {
         // Validate devServer.port range (0-65535)
-        if let Some(ds) = obj.get("devServer").and_then(|v| v.as_object()) {
-            if let Some(port) = ds.get("port").and_then(|v| v.as_u64()) {
-                if port > 65535 {
-                    errors.push(ValidationError {
-                        field: "devServer.port".to_string(),
-                        message: format!("port must be 0-65535, got {}", port),
-                        suggestion: None,
-                    });
-                }
-            }
+        if let Some(ds) = obj.get("devServer").and_then(|v| v.as_object())
+            && let Some(port) = ds.get("port").and_then(|v| v.as_u64())
+            && port > 65535
+        {
+            errors.push(ValidationError {
+                field: "devServer.port".to_string(),
+                message: format!("port must be 0-65535, got {}", port),
+                suggestion: None,
+            });
         }
 
         // Validate https config: if present, cert and key are required
@@ -458,27 +457,26 @@ pub fn validate_config_values(config: &serde_json::Value) -> Vec<ValidationError
         }
 
         // Validate image.quality range (0-100)
-        if let Some(image) = obj.get("image").and_then(|v| v.as_object()) {
-            if let Some(quality) = image.get("quality").and_then(|v| v.as_u64()) {
-                if quality > 100 {
-                    errors.push(ValidationError {
-                        field: "image.quality".to_string(),
-                        message: format!("quality must be 0-100, got {}", quality),
-                        suggestion: None,
-                    });
-                }
-            }
+        if let Some(image) = obj.get("image").and_then(|v| v.as_object())
+            && let Some(quality) = image.get("quality").and_then(|v| v.as_u64())
+            && quality > 100
+        {
+            errors.push(ValidationError {
+                field: "image.quality".to_string(),
+                message: format!("quality must be 0-100, got {}", quality),
+                suggestion: None,
+            });
         }
 
         // Validate htmlEntry file exists
-        if let Some(entry) = obj.get("htmlEntry").and_then(|v| v.as_str()) {
-            if !std::path::Path::new(entry).exists() {
-                errors.push(ValidationError {
-                    field: "htmlEntry".to_string(),
-                    message: format!("htmlEntry file does not exist: {}", entry),
-                    suggestion: None,
-                });
-            }
+        if let Some(entry) = obj.get("htmlEntry").and_then(|v| v.as_str())
+            && !std::path::Path::new(entry).exists()
+        {
+            errors.push(ValidationError {
+                field: "htmlEntry".to_string(),
+                message: format!("htmlEntry file does not exist: {}", entry),
+                suggestion: None,
+            });
         }
     }
 

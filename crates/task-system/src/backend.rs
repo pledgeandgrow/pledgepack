@@ -175,6 +175,7 @@ pub struct MemoryBackend {
 }
 
 impl MemoryBackend {
+    /// Create an empty in-memory backend.
     pub fn new() -> Self {
         Self::default()
     }
@@ -298,6 +299,8 @@ pub struct DiskBackend {
 }
 
 impl DiskBackend {
+    /// Create a disk backend rooted at `cache_dir`, creating the `tasks`
+    /// subdirectory if it doesn't already exist.
     pub fn new(cache_dir: PathBuf) -> std::io::Result<Self> {
         let tasks_dir = cache_dir.join("tasks");
         std::fs::create_dir_all(&tasks_dir)?;
@@ -314,8 +317,7 @@ impl DiskBackend {
     pub fn store(&self, output: &StoredOutput) -> std::io::Result<()> {
         let path = self.path_for(&output.task_id);
         let tmp = path.with_extension("json.tmp");
-        let data = serde_json::to_vec_pretty(output)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let data = serde_json::to_vec_pretty(output).map_err(std::io::Error::other)?;
         std::fs::write(&tmp, &data)?;
         std::fs::rename(&tmp, &path)?;
         debug!("Stored task output to disk: {}", output.task_id);
@@ -385,10 +387,10 @@ impl DiskBackend {
             let entry = entry?;
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if let Some(hex) = name.strip_suffix(".json") {
-                if let Some(id) = TaskId::from_hex(hex) {
-                    ids.push(id);
-                }
+            if let Some(hex) = name.strip_suffix(".json")
+                && let Some(id) = TaskId::from_hex(hex)
+            {
+                ids.push(id);
             }
         }
         Ok(ids)
@@ -406,12 +408,14 @@ impl DiskBackend {
 /// On a disk miss, we check remote. On a remote hit, we promote to both disk and memory.
 /// On a full miss, the task is computed and stored to all tiers.
 pub struct TaskBackend {
+    /// The in-memory tier, always present.
     pub memory: MemoryBackend,
     disk: Option<DiskBackend>,
     remote: Option<pledgepack_cache::remote::RemoteCache>,
 }
 
 impl TaskBackend {
+    /// Wrap a memory backend with no disk or remote tier configured.
     pub fn new(memory: MemoryBackend) -> Self {
         TaskBackend {
             memory,
@@ -420,11 +424,13 @@ impl TaskBackend {
         }
     }
 
+    /// Enable the disk tier.
     pub fn with_disk(mut self, disk: DiskBackend) -> Self {
         self.disk = Some(disk);
         self
     }
 
+    /// Enable the remote tier.
     pub fn with_remote(mut self, remote: pledgepack_cache::remote::RemoteCache) -> Self {
         self.remote = Some(remote);
         self
@@ -441,12 +447,12 @@ impl TaskBackend {
         }
 
         // 2. Disk
-        if let Some(disk) = &self.disk {
-            if let Ok(Some(output)) = disk.get(id) {
-                // Promote to memory
-                self.memory.store(output.clone());
-                return Some(Arc::new(output));
-            }
+        if let Some(disk) = &self.disk
+            && let Ok(Some(output)) = disk.get(id)
+        {
+            // Promote to memory
+            self.memory.store(output.clone());
+            return Some(Arc::new(output));
         }
 
         // 3. Remote — async, so we can't do it here synchronously.
@@ -482,10 +488,10 @@ impl TaskBackend {
         self.memory.store(output.clone());
 
         // Store to disk if configured
-        if let Some(disk) = &self.disk {
-            if let Err(e) = disk.store(&output) {
-                tracing::warn!("Failed to store task output to disk: {}", e);
-            }
+        if let Some(disk) = &self.disk
+            && let Err(e) = disk.store(&output)
+        {
+            tracing::warn!("Failed to store task output to disk: {}", e);
         }
 
         // Remote store is async — handled by TaskEngine

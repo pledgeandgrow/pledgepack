@@ -57,6 +57,7 @@ pub struct DependencyGraph {
 }
 
 impl DependencyGraph {
+    /// Create an empty dependency graph.
     pub fn new() -> Self {
         Self::default()
     }
@@ -271,6 +272,7 @@ pub struct AggregationNode {
 }
 
 impl AggregationNode {
+    /// Create a fresh, clean aggregation node for a single task (no children yet).
     pub fn new(task_id: TaskId) -> Self {
         AggregationNode {
             task_id,
@@ -343,6 +345,7 @@ pub struct AggregationGraph {
 }
 
 impl AggregationGraph {
+    /// Create an empty aggregation graph.
     pub fn new() -> Self {
         AggregationGraph {
             nodes: DashMap::new(),
@@ -647,10 +650,10 @@ impl AggregationGraph {
 
     /// Mark a task as clean and propagate the clean delta up the aggregation tree.
     pub fn mark_clean(&self, task: TaskId, dep_graph: &DependencyGraph) {
-        if let Some(mut node) = self.nodes.get_mut(&task) {
-            if node.dirty_count > 0 {
-                node.dirty_count = node.dirty_count.saturating_sub(1);
-            }
+        if let Some(mut node) = self.nodes.get_mut(&task)
+            && node.dirty_count > 0
+        {
+            node.dirty_count = node.dirty_count.saturating_sub(1);
         }
 
         let dependents = dep_graph.dependents(&task);

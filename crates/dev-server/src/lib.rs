@@ -864,12 +864,12 @@ async fn require_access_token(
     }
 
     let mut response = next.run(req).await;
-    if query_token.is_some() {
-        if let Ok(cookie) = HeaderValue::from_str(&format!(
+    if query_token.is_some()
+        && let Ok(cookie) = HeaderValue::from_str(&format!(
             "{ACCESS_TOKEN_COOKIE}={expected_token}; Path=/; HttpOnly; SameSite=Strict"
-        )) {
-            response.headers_mut().insert(header::SET_COOKIE, cookie);
-        }
+        ))
+    {
+        response.headers_mut().insert(header::SET_COOKIE, cookie);
     }
     response
 }
@@ -3121,22 +3121,22 @@ async fn hmr_broadcast_loop(
         // CSS Modules: compute class name mappings for HMR remapping
         // When a .module.css changes, transform it to get the new scoped class names
         // and include the mapping in the update so clients can re-import the module
-        if update.update_type == "update" && update.path.ends_with(".module.css") {
-            if let Some(ref full_code) = update.full_code {
-                let mut lazy_pipeline = state.lazy_pipeline.write().await;
-                lazy_pipeline.ensure_initialized();
-                let kind = ModuleKind::from_extension(".css");
-                if let Ok(css_output) =
-                    pledge_transform::transform(full_code, kind, &update.path, false, &state.config)
-                {
-                    if let Some(ref css_module_map) = css_output.css_modules {
-                        let map: serde_json::Map<String, serde_json::Value> = css_module_map
-                            .iter()
-                            .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
-                            .collect();
-                        update.module_map = Some(serde_json::Value::Object(map));
-                    }
-                }
+        if update.update_type == "update"
+            && update.path.ends_with(".module.css")
+            && let Some(ref full_code) = update.full_code
+        {
+            let mut lazy_pipeline = state.lazy_pipeline.write().await;
+            lazy_pipeline.ensure_initialized();
+            let kind = ModuleKind::from_extension(".css");
+            if let Ok(css_output) =
+                pledge_transform::transform(full_code, kind, &update.path, false, &state.config)
+                && let Some(ref css_module_map) = css_output.css_modules
+            {
+                let map: serde_json::Map<String, serde_json::Value> = css_module_map
+                    .iter()
+                    .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+                    .collect();
+                update.module_map = Some(serde_json::Value::Object(map));
             }
         }
 
@@ -3619,10 +3619,10 @@ async fn public_dir_handler(
         let etag = format!("\"{:x}\"", hasher.finish());
 
         // Check If-None-Match for conditional request — return 304 if ETag matches
-        if let Some(if_none_match) = request_headers.get("if-none-match") {
-            if if_none_match == etag.as_bytes() {
-                return (StatusCode::NOT_MODIFIED, [(header::ETAG, etag.as_str())]).into_response();
-            }
+        if let Some(if_none_match) = request_headers.get("if-none-match")
+            && if_none_match == etag.as_bytes()
+        {
+            return (StatusCode::NOT_MODIFIED, [(header::ETAG, etag.as_str())]).into_response();
         }
 
         return (

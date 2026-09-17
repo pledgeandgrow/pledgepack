@@ -204,15 +204,13 @@ impl EstreeConverter {
             }
             Expression::ArrowFunctionExpression(arrow) => {
                 let body = if arrow.expression {
-                    if let Some(body_stmt) = arrow.body.statements.first() {
-                        if let Statement::ExpressionStatement(expr_stmt) = body_stmt {
-                            json!({
-                                "type": "BlockStatement",
-                                "body": [{"type": "ReturnStatement", "argument": self.convert_expression(&expr_stmt.expression)}]
-                            })
-                        } else {
-                            json!({"type": "BlockStatement", "body": []})
-                        }
+                    if let Some(Statement::ExpressionStatement(expr_stmt)) =
+                        arrow.body.statements.first()
+                    {
+                        json!({
+                            "type": "BlockStatement",
+                            "body": [{"type": "ReturnStatement", "argument": self.convert_expression(&expr_stmt.expression)}]
+                        })
                     } else {
                         json!({"type": "BlockStatement", "body": []})
                     }

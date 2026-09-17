@@ -331,9 +331,19 @@ pub trait TaskVerify: Serialize + DeserializeOwned + Send + Sync {}
 /// G1.20: Blanket implementation — any type satisfying the bounds is verified.
 impl<T: Serialize + DeserializeOwned + Send + Sync> TaskVerify for T {}
 
+/// Marker for `Task`'s phantom `T`/`E`/`V` type parameters — the task never
+/// actually stores a `T`, `E`, or `V`, only a content-addressed `TaskId`; this
+/// exists purely so the compiler tracks the intended output/effect/version
+/// types at each use site.
+type TaskMarker<T, E, V> = PhantomData<fn() -> (T, E, V)>;
+
+/// A reference to a task's output, identified by its content-addressed
+/// [`TaskId`]. Cheap to copy — it carries no data of its own beyond the ID
+/// and a zero-sized marker for `T`/`E`/`V`. Call [`Task::read`] to resolve
+/// the actual output of type `T`.
 pub struct Task<T, E: TaskEffect = NoEffect, V: TaskVersion = V1> {
     id: TaskId,
-    _marker: PhantomData<fn() -> (T, E, V)>,
+    _marker: TaskMarker<T, E, V>,
 }
 
 // Manual impls because T, E, V are only used in PhantomData<fn() -> (T, E, V)> which is
@@ -343,10 +353,7 @@ unsafe impl<T, E: TaskEffect, V: TaskVersion> Sync for Task<T, E, V> {}
 
 impl<T, E: TaskEffect, V: TaskVersion> Clone for Task<T, E, V> {
     fn clone(&self) -> Self {
-        Task {
-            id: self.id,
-            _marker: PhantomData,
-        }
+        *self
     }
 }
 
@@ -622,11 +629,10 @@ impl<T, E: TaskEffect, V: TaskVersion> Task<T, E, V> {
     /// ```ignore
     /// const _: () = Task<MyOutput>::verify();
     /// ```
-    pub const fn verify() -> ()
+    pub const fn verify()
     where
         T: Serialize + DeserializeOwned + Send + Sync,
     {
-        ()
     }
 }
 
@@ -961,7 +967,7 @@ mod tests {
     #[tokio::test]
     async fn read_fast_returns_none_for_uncached_task() {
         use crate::backend::{MemoryBackend, TaskBackend};
-        use crate::engine::{TaskEngine, TaskEngineBuilder};
+        use crate::engine::TaskEngine;
         use crate::registry::TaskRegistry;
 
         let engine = TaskEngine::new(TaskRegistry::new(), TaskBackend::new(MemoryBackend::new()));
@@ -973,7 +979,7 @@ mod tests {
     #[tokio::test]
     async fn read_fast_returns_value_after_compute() {
         use crate::backend::{MemoryBackend, StoredOutput, TaskBackend};
-        use crate::engine::{TaskEngine, TaskEngineBuilder};
+        use crate::engine::TaskEngine;
         use crate::registry::{TaskExecutor, TaskRegistry};
 
         let registry = TaskRegistry::new();
@@ -1009,7 +1015,7 @@ mod tests {
     #[tokio::test]
     async fn read_fast_returns_none_after_invalidation() {
         use crate::backend::{MemoryBackend, StoredOutput, TaskBackend};
-        use crate::engine::{TaskEngine, TaskEngineBuilder};
+        use crate::engine::TaskEngine;
         use crate::registry::{TaskExecutor, TaskRegistry};
 
         let registry = TaskRegistry::new();
@@ -1189,8 +1195,9 @@ mod tests {
         let any = task.into_any();
         assert_eq!(any.id(), id);
 
-        // Cast back to Task<u32>
-        let recovered: Task<u32> = any.cast::<u32>();
+        // Cast back to Task<u32> — T/E/V all inferred from the annotation
+        // below (E/V via Task's own default type parameters).
+        let recovered: Task<u32> = any.cast();
         assert_eq!(recovered, task);
     }
 
@@ -1234,8 +1241,8 @@ mod tests {
         assert_eq!(tasks[0].id(), id1);
         assert_eq!(tasks[1].id(), id2);
 
-        // Recover typed tasks
-        let recovered_u32: Task<u32> = tasks[0].cast::<u32>();
+        // Recover typed tasks — T/E/V inferred from the annotation below.
+        let recovered_u32: Task<u32> = tasks[0].cast();
         assert_eq!(recovered_u32, task_u32);
     }
 
@@ -1442,7 +1449,6 @@ mod tests {
         const _: () = Task::<String, HasEffect>::verify();
         const _: () = Task::<u64, NoEffect, V2>::verify();
         // If we reach here, verification passed.
-        assert!(true, "verify() compiled successfully for valid types");
     }
 
     #[test]

@@ -255,11 +255,11 @@ fn find_open_tag(
         // Boundary check: the character right after the prefix must not be
         // alphanumeric, otherwise this is a different tag (e.g. `<templatex>`).
         let after = &source[abs + open_prefix.len()..];
-        if let Some(c) = after.chars().next() {
-            if c.is_alphanumeric() {
-                search = abs + open_prefix.len();
-                continue;
-            }
+        if let Some(c) = after.chars().next()
+            && c.is_alphanumeric()
+        {
+            search = abs + open_prefix.len();
+            continue;
         }
         // Find the end of the opening tag (the next `>`).
         let gt = source[abs..].find('>')?;
@@ -536,33 +536,30 @@ fn nodes_to_render_calls(nodes: &[HtmlNode], depth: usize) -> String {
     let mut i = 0;
     while i < nodes.len() {
         let node = &nodes[i];
-        if let HtmlNode::Element { attrs, .. } = node {
-            if has_directive(attrs, "v-if") {
-                let cond = get_directive(attrs, "v-if").unwrap_or_default();
-                // Look ahead for a `v-else` sibling to form an else branch.
-                if i + 1 < nodes.len() {
-                    if let HtmlNode::Element {
-                        attrs: next_attrs, ..
-                    } = &nodes[i + 1]
-                    {
-                        if has_directive(next_attrs, "v-else") {
-                            // Render the true branch without re-applying its own
-                            // v-if ternary (the pair forms the ternary here).
-                            let true_expr = node_to_render_call_opts(node, depth + 1, true);
-                            let false_expr =
-                                node_to_render_call_opts(&nodes[i + 1], depth + 1, false);
-                            items.push(format!("({}) ? {} : {}", cond, true_expr, false_expr));
-                            i += 2;
-                            continue;
-                        }
-                    }
-                }
-                // No v-else sibling: render with a `null` else branch.
-                let true_expr = node_to_render_call_opts(node, depth + 1, false);
-                items.push(format!("({}) ? {} : null", cond, true_expr));
-                i += 1;
+        if let HtmlNode::Element { attrs, .. } = node
+            && has_directive(attrs, "v-if")
+        {
+            let cond = get_directive(attrs, "v-if").unwrap_or_default();
+            // Look ahead for a `v-else` sibling to form an else branch.
+            if i + 1 < nodes.len()
+                && let HtmlNode::Element {
+                    attrs: next_attrs, ..
+                } = &nodes[i + 1]
+                && has_directive(next_attrs, "v-else")
+            {
+                // Render the true branch without re-applying its own
+                // v-if ternary (the pair forms the ternary here).
+                let true_expr = node_to_render_call_opts(node, depth + 1, true);
+                let false_expr = node_to_render_call_opts(&nodes[i + 1], depth + 1, false);
+                items.push(format!("({}) ? {} : {}", cond, true_expr, false_expr));
+                i += 2;
                 continue;
             }
+            // No v-else sibling: render with a `null` else branch.
+            let true_expr = node_to_render_call_opts(node, depth + 1, false);
+            items.push(format!("({}) ? {} : null", cond, true_expr));
+            i += 1;
+            continue;
         }
         items.push(node_to_render_call_opts(node, depth + 1, false));
         i += 1;
@@ -625,10 +622,8 @@ fn node_to_render_call_opts(node: &HtmlNode, depth: usize, skip_vif: bool) -> St
             let mut result = base;
             // v-if wraps the element in a ternary (unless the caller is
             // already forming a v-if/v-else pair).
-            if !skip_vif {
-                if let Some(cond) = &vif {
-                    result = format!("({}) ? {} : null", cond, result);
-                }
+            if !skip_vif && let Some(cond) = &vif {
+                result = format!("({}) ? {} : null", cond, result);
             }
             // v-for wraps the (possibly v-if'd) element in a `.map()` call so
             // each item is rendered: `list.map(item => ...)`.
