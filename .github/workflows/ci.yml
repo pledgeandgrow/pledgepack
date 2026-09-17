@@ -163,9 +163,18 @@ jobs:
           # checked on PRs — mirrors that job's exact target/zig-target
           # pairing (no extra cross-tool install needed; windows-latest
           # already carries the ARM64 MSVC toolchain).
+          #
+          # zig-version 0.15.2 (not the workspace default 0.16.0): Zig
+          # 0.16.0's own std.debug.SelfInfo for this exact target has a
+          # `@ptrCast increases pointer alignment` bug at
+          # lib/std/debug/SelfInfo/Windows.zig:670 (LdrRegisterDllNotification
+          # callback cast), pulled in transitively by the default panic
+          # handler's stack-trace support — unrelated to this crate's own
+          # code. EXPERIMENTAL: testing whether 0.15.2 avoids it.
           - os: windows-latest
             target: aarch64-pc-windows-msvc
             zig-target: aarch64-windows-msvc
+            zig-version: 0.15.2
     steps:
       - uses: actions/checkout@v5
 
@@ -187,7 +196,7 @@ jobs:
       - name: Install Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
+          version: ${{ matrix.zig-version || '0.16.0' }}
 
       - name: Install cross-compilation tools (aarch64-linux)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
