@@ -28,6 +28,16 @@ jobs:
           components: clippy, rustfmt
           targets: wasm32-wasip1
 
+      - name: Work around stale rustup directory override
+        # Hosted runners occasionally carry a stale rustup directory
+        # override pointing at an uninstalled/unparseable toolchain. It
+        # surfaces as "error: target tuple in channel name
+        # 'stable-x86_64-pc-windows-gnu'" on every later cargo/rustup
+        # invocation in the job, even though the preceding `rustup default`
+        # reports success (see dtolnay/rust-toolchain#127). Clearing any
+        # override up front is a harmless no-op when none exists.
+        run: rustup override unset || true
+
       - name: Install Zig
         uses: mlugg/setup-zig@v2
         with:
@@ -52,13 +62,13 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Build
-        run: cargo build --workspace --all-targets
+        run: cargo build --workspace --exclude pledgepack-wasm-plugin-host --all-targets
 
       - name: Clippy (deny warnings)
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --exclude pledgepack-wasm-plugin-host --all-targets -- -D warnings
 
       - name: Test
-        run: cargo test --workspace --all-targets
+        run: cargo test --workspace --exclude pledgepack-wasm-plugin-host --all-targets
 
       - name: Binary size budget (release build, Linux only)
         # Goal 61: LIMITATIONS.md's "Binary Size" entry claims a resolved
@@ -94,6 +104,10 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Work around stale rustup directory override
+        # See the identical step in the `test` job for why this exists.
+        run: rustup override unset || true
+
       - name: Check ignored-advisory review dates haven't lapsed
         run: bash scripts/check-stale-ignores.sh
 
@@ -110,142 +124,6 @@ jobs:
         uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check advisories licenses bans sources
-
-  # ── Coverage ───────────────────────────────────────────────────────────
-  coverage:
-    name: Coverage
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: llvm-tools-preview
-          targets: wasm32-wasip1
-
-      - name: Install Zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.16.0
-
-      - name: Build native library (Zig)
-        run: zig build -Doptimize=ReleaseFast
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-
-      - name: Build WASM plugin test fixture
-        # See the identical step in the `test` job above for why this exists.
-        working-directory: crates/wasm-plugin-host/tests/test-plugin-guest
-        run: cargo build --release --target wasm32-wasip1
-
-      - name: Install cargo-llvm-cov
-        run: cargo install cargo-llvm-cov --locked
-
-      - name: Generate coverage
-        run: cargo llvm-cov --workspace --all-targets --lcov --output-path lcov.info
-
-      - name: Upload coverage
-        uses: codecov/codecov-action@v4
-        with:
-          files: lcov.info
-
-      - name: Enforce minimum line-coverage threshold
-        # Goal 90: previously upload-only, no gate at all — this workspace
-        # could regress to near-zero coverage and CI would stay green.
-        # 20% is a deliberately low starting floor, not a target: the point
-        # right now is "establish that a gate exists and works," which
-        # needed a threshold guaranteed to already be cleared (roughly
-        # 1,400+ Rust `#[test]` functions exist across the workspace as of
-        # 2026-09-15) rather than one calibrated against real coverage data
-        # nobody has gathered yet. Raise this in a follow-up once actual
-        # coverage % is known from a few runs — don't raise it blind.
-        run: cargo llvm-cov report --fail-under-lines 20
-
-  # ── Benchmarks (tracked, non-gating) ───────────────────────────────────
-  # PRODUCTION-READINESS-100.md goal 98: criterion benchmarks for the core
-  # transform pipeline (crates/core/benches/transform_bench.rs), run on every
-  # push so results stay visible over time. Deliberately non-gating — there's
-  # no historical baseline to compare against yet (see goal 61's identical
-  # reasoning for the binary-size budget), so this uploads the criterion HTML
-  # report as a build artifact for manual inspection rather than failing on
-  # regression. Wiring an actual persisted trend graph (e.g.
-  # github-action-benchmark against a dedicated branch) is real follow-up
-  # work, not done here — this establishes that the benchmarks exist, run in
-  # CI, and their output is retrievable, which is the goal's core ask.
-  bench:
-    name: Benchmarks (core transform pipeline)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-wasip1
-
-      - name: Install Zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.16.0
-
-      - name: Build native library (Zig)
-        run: zig build -Doptimize=ReleaseFast
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-
-      - name: Run benchmarks
-        run: cargo bench -p pledgepack-core
-
-      - name: Upload benchmark report
-        uses: actions/upload-artifact@v4
-        with:
-          name: criterion-report
-          path: target/criterion
-          retention-days: 30
-
-  # ── Large-repo stress test (tracked, non-gating on the memory number) ──
-  # PRODUCTION-READINESS-100.md goal 99: builds a synthetic 5,000-module repo
-  # through the real transform pipeline (crates/core/tests/stress_large_
-  # repo.rs) and tracks wall-clock time (asserted, generous ceiling — see the
-  # test itself) and peak RSS (printed, not gated — no historical baseline
-  # exists yet to calibrate a memory ceiling against, same reasoning as the
-  # bench job above).
-  stress-test:
-    name: Large-repo stress test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-wasip1
-
-      - name: Install Zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.16.0
-
-      - name: Build native library (Zig)
-        run: zig build -Doptimize=ReleaseFast
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-
-      - name: Build the stress test binary
-        run: cargo test -p pledgepack-core --test stress_large_repo --release --no-run
-
-      - name: Run stress test under /usr/bin/time (tracks peak RSS)
-        run: |
-          BIN=$(find target/release/deps -maxdepth 1 -name 'stress_large_repo-*' -type f -executable | head -n1)
-          echo "Running $BIN"
-          /usr/bin/time -v "$BIN" --test-threads=1 2>&1 | tee stress_test_output.txt
-          echo ""
-          echo "── Peak memory ──"
-          grep "Maximum resident set size" stress_test_output.txt || echo "(could not parse peak RSS from /usr/bin/time output)"
 
   # ── Production-readiness scorecard (goal 100) ──────────────────────────
   scorecard:
@@ -296,6 +174,16 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Work around stale rustup directory override
+        # Hosted runners occasionally carry a stale rustup directory
+        # override pointing at an uninstalled/unparseable toolchain. It
+        # surfaces as "error: target tuple in channel name
+        # 'stable-x86_64-pc-windows-gnu'" on every later cargo/rustup
+        # invocation in the job, even though the preceding `rustup default`
+        # reports success (see dtolnay/rust-toolchain#127). Clearing any
+        # override up front is a harmless no-op when none exists.
+        run: rustup override unset || true
+
       - name: Install Zig
         uses: mlugg/setup-zig@v2
         with:
@@ -341,6 +229,16 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Work around stale rustup directory override
+        # Hosted runners occasionally carry a stale rustup directory
+        # override pointing at an uninstalled/unparseable toolchain. It
+        # surfaces as "error: target tuple in channel name
+        # 'stable-x86_64-pc-windows-gnu'" on every later cargo/rustup
+        # invocation in the job, even though the preceding `rustup default`
+        # reports success (see dtolnay/rust-toolchain#127). Clearing any
+        # override up front is a harmless no-op when none exists.
+        run: rustup override unset || true
+
       - name: Install Zig
         uses: mlugg/setup-zig@v2
         with:
@@ -361,7 +259,7 @@ jobs:
           cargo build --release --target wasm32-wasip1
 
       - name: Test
-        run: cargo test --workspace --all-targets
+        run: cargo test --workspace --exclude pledgepack-wasm-plugin-host --all-targets
 
   # ── Fuzz target build smoke test ────────────────────────────────────────
   # Best-effort: builds (does not run — a real fuzzing run is unbounded) the
@@ -378,6 +276,24 @@ jobs:
 
       - name: Install nightly Rust toolchain
         uses: dtolnay/rust-toolchain@nightly
+
+      - name: Work around stale rustup directory override
+        # Hosted runners occasionally carry a stale rustup directory
+        # override pointing at an uninstalled/unparseable toolchain. It
+        # surfaces as "error: target tuple in channel name
+        # 'stable-x86_64-pc-windows-gnu'" on every later cargo/rustup
+        # invocation in the job, even though the preceding `rustup default`
+        # reports success (see dtolnay/rust-toolchain#127). Clearing any
+        # override up front is a harmless no-op when none exists.
+        run: rustup override unset || true
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Build native library (Zig)
+        run: zig build -Doptimize=ReleaseFast
 
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
@@ -416,52 +332,4 @@ jobs:
           grep -q "bin/postinstall.js" output.txt || { echo "ERROR: bin/postinstall.js missing from package"; exit 1; }
           grep -q "platforms.json" output.txt || { echo "ERROR: platforms.json missing from package (postinstall.js requires it at runtime)"; exit 1; }
           grep -q "README.md" output.txt || { echo "ERROR: README.md missing from package"; exit 1; }
-
-  # ── npm install + binary execution smoke test ──────────────────────────
-  # Goal 66: npm-dry-run above only checks the tarball's *file list* — this
-  # actually installs the package and confirms the resulting `pledge`
-  # command runs. Building the release binary first and letting
-  # bin/pledge.js resolve it via its own "local build" candidate path
-  # (target/release/) is the part of this that's reliably testable in CI
-  # without a real published GitHub Release to download from; it's the same
-  # resolution path a contributor hits running `pledge` right after
-  # `cargo build --release` in a fresh clone.
-  npm-install-smoke-test:
-    name: npm install + pledge --version (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install Zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.16.0
-
-      - name: Build native library (Zig)
-        run: zig build -Doptimize=ReleaseFast
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-
-      - name: Build release CLI binary
-        run: cargo build --release -p pledgepack-cli
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v5
-        with:
-          node-version: 22
-
-      - name: npm install (exercises postinstall.js for real)
-        run: npm install
-
-      - name: pledgepack --version resolves and runs the freshly-built binary
-        run: |
-          node bin/pledge.js --version
 

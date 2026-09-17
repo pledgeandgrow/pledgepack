@@ -4386,7 +4386,7 @@ checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 
 [[package]]
 name = "pledgepack-adapter-next"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "pledgepack-core",
@@ -4398,7 +4398,7 @@ dependencies = [
 
 [[package]]
 name = "pledgepack-adapter-pledgestack"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "pledgepack-core",
@@ -4409,7 +4409,7 @@ dependencies = [
 
 [[package]]
 name = "pledgepack-adapter-react"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "oxc",
@@ -4421,7 +4421,7 @@ dependencies = [
 
 [[package]]
 name = "pledgepack-adapter-solid"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "oxc",
@@ -4431,7 +4431,7 @@ dependencies = [
 
 [[package]]
 name = "pledgepack-adapter-tanstack"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "pledgepack-core",
@@ -4443,7 +4443,7 @@ dependencies = [
 
 [[package]]
 name = "pledgepack-cache"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "bincode",
@@ -4462,7 +4462,7 @@ dependencies = [
 
 [[package]]
 name = "pledgepack-cli"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "axum",
@@ -4504,7 +4504,7 @@ dependencies = [
 
 [[package]]
 name = "pledgepack-core"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "base64 0.23.0",
@@ -4552,7 +4552,7 @@ dependencies = [
 
 [[package]]
 name = "pledgepack-dev-server"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "axum",
@@ -4587,7 +4587,7 @@ dependencies = [
 
 [[package]]
 name = "pledgepack-js-plugin-host"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "blake3",
@@ -4603,7 +4603,7 @@ dependencies = [
 
 [[package]]
 name = "pledgepack-native-sys"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "rayon",
@@ -4611,7 +4611,7 @@ dependencies = [
 
 [[package]]
 name = "pledgepack-optimizer"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "globset",
@@ -4624,7 +4624,7 @@ dependencies = [
 
 [[package]]
 name = "pledgepack-resolver"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "dashmap 6.2.1",
@@ -4637,7 +4637,7 @@ dependencies = [
 
 [[package]]
 name = "pledgepack-task-system"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "bincode",
@@ -4659,7 +4659,7 @@ dependencies = [
 
 [[package]]
 name = "pledgepack-task-system-macros"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4668,7 +4668,7 @@ dependencies = [
 
 [[package]]
 name = "pledgepack-wasm-plugin-host"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "blake3",

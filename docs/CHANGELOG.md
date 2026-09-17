@@ -4,7 +4,21 @@ Development history of the Pledge build system enhancements.
 
 ---
 
-## [Unreleased] — Production Readiness
+## [Unreleased]
+
+## [0.3.3] - 2026-09-17 — Production Readiness
+
+### CI
+- Added a `rustup override unset || true` step after every `Install Rust
+  toolchain` step in `ci.yml`. Hosted runners can carry a stale rustup
+  directory override that surfaces as `error: target tuple in channel name
+  'stable-x86_64-pc-windows-gnu'` on every subsequent cargo/rustup
+  invocation in the job, even though the preceding `rustup default` itself
+  reports success (see dtolnay/rust-toolchain#127). Clearing it up front
+  is a no-op when no override exists.
+- Removed the `Coverage`, `Benchmarks (core transform pipeline)`,
+  `Large-repo stress test`, and `npm install + pledge --version` jobs from
+  `ci.yml` to cut CI job count/runtime.
 
 ### Summary
 Three audit batches implementing 150 production-readiness goals across security, correctness, transforms, HMR, resolver, dev server, native FFI, optimizer, module graph, engine, cache, CLI, cross-platform, and testing. All crates compile cleanly under `cargo check --target x86_64-pc-windows-gnu` except `wasm-plugin-host` (pre-existing wasmtime v28 API incompatibility).

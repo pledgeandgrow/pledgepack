@@ -29,6 +29,10 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Work around stale rustup directory override
+        # See the identical step in ci.yml's `test` job for why this exists.
+        run: rustup override unset || true
+
       - name: Check ignored-advisory review dates haven't lapsed
         run: bash scripts/check-stale-ignores.sh
 
@@ -93,6 +97,10 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
+      - name: Work around stale rustup directory override
+        # See the identical step in ci.yml's `test` job for why this exists.
+        run: rustup override unset || true
 
       - name: Install Zig
         uses: mlugg/setup-zig@v2
