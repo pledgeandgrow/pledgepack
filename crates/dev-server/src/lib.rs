@@ -54,13 +54,54 @@ fn bounded_insert<V>(map: &mut HashMap<String, V>, key: String, value: V, max_en
     map.insert(key, value);
 }
 
+/// Canonicalize `path`, walking up to its nearest existing ancestor and
+/// re-appending the (non-existent) trailing components if `path` itself
+/// doesn't exist. Falls back to `path` unchanged if no ancestor exists
+/// (e.g. a bare relative path with no existing parent).
+fn canonicalize_from_nearest_ancestor(path: &std::path::Path) -> std::path::PathBuf {
+    let mut ancestor = path;
+    let mut trailing: Vec<&std::ffi::OsStr> = Vec::new();
+    loop {
+        match std::fs::canonicalize(ancestor) {
+            Ok(mut resolved) => {
+                for part in trailing.iter().rev() {
+                    resolved.push(part);
+                }
+                return resolved;
+            }
+            Err(_) => match ancestor.parent() {
+                Some(parent) => {
+                    if let Some(name) = ancestor.file_name() {
+                        trailing.push(name);
+                    }
+                    ancestor = parent;
+                }
+                None => return path.to_path_buf(),
+            },
+        }
+    }
+}
+
 /// Returns true if `path` is within `base` after canonicalization.
 /// Handles `..` traversal attempts safely.
 fn is_path_within(path: &std::path::Path, base: &std::path::Path) -> bool {
     // First, try canonicalization — this resolves symlinks, so a symlink inside
     // the project root pointing outside it cannot bypass the check.
-    let canonical_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    //
+    // `path` frequently doesn't exist yet (a candidate file the caller is
+    // about to check before it's written, or a path under a directory that
+    // was never created — e.g. no `public/` dir in the project root), so
+    // `canonicalize(path)` fails while `canonicalize(base)` (the project
+    // root, which always exists) succeeds. Comparing an un-resolved `path`
+    // against a resolved `base` then spuriously fails whenever `base` sits
+    // behind a symlink the OS resolves transparently — macOS's
+    // `/var` -> `/private/var` temp-dir symlink, or Windows' `\\?\`
+    // extended-length prefix on canonicalized paths — even though `path`
+    // and `base` describe the same real location. Resolve `path` from its
+    // nearest existing ancestor instead, so both sides go through the same
+    // symlink/prefix resolution.
     let canonical_base = std::fs::canonicalize(base).unwrap_or_else(|_| base.to_path_buf());
+    let canonical_path = canonicalize_from_nearest_ancestor(path);
 
     if canonical_path.starts_with(&canonical_base) {
         return true;
