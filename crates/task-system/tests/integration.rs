@@ -2,8 +2,8 @@
 // dependency chains, caching, invalidation, and the demand-driven scheduler.
 
 use pledgepack_task_system::{
-    Task, TaskId, TaskEngine, TaskEngineBuilder, TaskRegistry, TaskExecutor,
-    StoredOutput, MemoryBackend, TaskBackend,
+    MemoryBackend, StoredOutput, Task, TaskBackend, TaskEngine, TaskEngineBuilder, TaskExecutor,
+    TaskId, TaskRegistry,
 };
 
 /// Test that TaskId is deterministic for the same inputs.
@@ -26,9 +26,7 @@ async fn simple_task_compute_and_cache() {
     registry.register(
         task_id,
         "double".to_string(),
-        TaskExecutor::sync(move || {
-            Ok(StoredOutput::new(task_id, &84u32, vec![])?)
-        }),
+        TaskExecutor::sync(move || Ok(StoredOutput::new(task_id, &84u32, vec![])?)),
     );
 
     let engine = TaskEngine::new(registry, TaskBackend::new(MemoryBackend::new()));
@@ -55,14 +53,16 @@ async fn disk_cache_persists_across_engines() {
         task_id,
         "persisted_value".to_string(),
         TaskExecutor::sync(move || {
-            Ok(StoredOutput::new(task_id, &"persisted".to_string(), vec![])?)
+            Ok(StoredOutput::new(
+                task_id,
+                &"persisted".to_string(),
+                vec![],
+            )?)
         }),
     );
 
     // First engine: compute and store to disk
-    let engine1 = TaskEngineBuilder::new(registry)
-        .with_disk(disk)
-        .build();
+    let engine1 = TaskEngineBuilder::new(registry).with_disk(disk).build();
 
     let task: Task<String> = Task::from_id(task_id);
     let result1 = task.read(&engine1).await.unwrap();
@@ -75,17 +75,22 @@ async fn disk_cache_persists_across_engines() {
         "persisted_value".to_string(),
         TaskExecutor::sync(move || {
             // This should NOT be called if disk cache works
-            Ok(StoredOutput::new(task_id, &"recomputed".to_string(), vec![])?)
+            Ok(StoredOutput::new(
+                task_id,
+                &"recomputed".to_string(),
+                vec![],
+            )?)
         }),
     );
 
     let disk2 = pledgepack_task_system::DiskBackend::new(tmp.path().to_path_buf()).unwrap();
-    let engine2 = TaskEngineBuilder::new(registry2)
-        .with_disk(disk2)
-        .build();
+    let engine2 = TaskEngineBuilder::new(registry2).with_disk(disk2).build();
 
     let result2 = task.read(&engine2).await.unwrap();
-    assert_eq!(*result2, "persisted", "Should load from disk, not recompute");
+    assert_eq!(
+        *result2, "persisted",
+        "Should load from disk, not recompute"
+    );
 }
 
 /// Test that invalidation marks tasks dirty and they get recomputed on next read.
@@ -126,7 +131,7 @@ async fn invalidation_and_recompute() {
 /// Test that the aggregation graph tracks dirty counts correctly.
 #[test]
 fn aggregation_graph_dirty_propagation() {
-    use pledgepack_task_system::{DependencyGraph, AggregationGraph};
+    use pledgepack_task_system::{AggregationGraph, DependencyGraph};
 
     let dep_graph = DependencyGraph::new();
     let agg_graph = AggregationGraph::new();
@@ -168,7 +173,11 @@ fn active_query_filters_dirty_tasks() {
         child_id,
         "child".to_string(),
         TaskExecutor::sync(move || {
-            Ok(StoredOutput::new(child_id, &"child_value".to_string(), vec![])?)
+            Ok(StoredOutput::new(
+                child_id,
+                &"child_value".to_string(),
+                vec![],
+            )?)
         }),
     );
 
@@ -176,7 +185,11 @@ fn active_query_filters_dirty_tasks() {
         root_id,
         "root".to_string(),
         TaskExecutor::sync(move || {
-            Ok(StoredOutput::new(root_id, &"root_value".to_string(), vec![child_id])?)
+            Ok(StoredOutput::new(
+                root_id,
+                &"root_value".to_string(),
+                vec![child_id],
+            )?)
         }),
     );
 
@@ -283,7 +296,11 @@ fn env_aware_task_id_all_environments_differ() {
     let len_before = ids.len();
     ids.sort();
     ids.dedup();
-    assert_eq!(len_before, ids.len(), "All 5 environment IDs must be unique");
+    assert_eq!(
+        len_before,
+        ids.len(),
+        "All 5 environment IDs must be unique"
+    );
 }
 
 /// Test that from_tasks_with_env produces correct environment-aware TaskId.
@@ -306,7 +323,7 @@ fn from_tasks_with_env_produces_valid_id() {
 /// Test environment thread-local context.
 #[test]
 fn environment_thread_local_context() {
-    use pledgepack_task_system::{current_environment, run_with_environment, Environment};
+    use pledgepack_task_system::{Environment, current_environment, run_with_environment};
 
     assert_eq!(current_environment(), Environment::Shared);
 
@@ -314,7 +331,11 @@ fn environment_thread_local_context() {
         assert_eq!(current_environment(), Environment::Server);
     });
 
-    assert_eq!(current_environment(), Environment::Shared, "Should restore after run");
+    assert_eq!(
+        current_environment(),
+        Environment::Shared,
+        "Should restore after run"
+    );
 }
 
 // ============ Read Tracker Tests (G5.4-G5.5 integration) ============
@@ -332,14 +353,22 @@ fn read_tracker_integration() {
 
     assert_eq!(tracker.len(), 2);
     let reads = tracker.reads();
-    assert!(reads.iter().any(|p| p.to_string_lossy().ends_with("Button.tsx")));
-    assert!(reads.iter().any(|p| p.to_string_lossy().ends_with("helpers.ts")));
+    assert!(
+        reads
+            .iter()
+            .any(|p| p.to_string_lossy().ends_with("Button.tsx"))
+    );
+    assert!(
+        reads
+            .iter()
+            .any(|p| p.to_string_lossy().ends_with("helpers.ts"))
+    );
 }
 
 /// Test that read tracker can be installed and collected for async contexts.
 #[tokio::test]
 async fn read_tracker_async_install_collect() {
-    use pledgepack_task_system::{install_tracker, collect_tracker, record_read};
+    use pledgepack_task_system::{collect_tracker, install_tracker, record_read};
 
     install_tracker();
     record_read("src/app.tsx");
@@ -348,8 +377,16 @@ async fn read_tracker_async_install_collect() {
     let reads = collect_tracker();
     assert_eq!(reads.len(), 2);
     let read_paths = reads.reads();
-    assert!(read_paths.iter().any(|p| p.to_string_lossy().ends_with("app.tsx")));
-    assert!(read_paths.iter().any(|p| p.to_string_lossy().ends_with("home.tsx")));
+    assert!(
+        read_paths
+            .iter()
+            .any(|p| p.to_string_lossy().ends_with("app.tsx"))
+    );
+    assert!(
+        read_paths
+            .iter()
+            .any(|p| p.to_string_lossy().ends_with("home.tsx"))
+    );
 }
 
 // ============ Route Tracker Tests (G6.1-G6.3) ============
@@ -362,7 +399,9 @@ async fn route_tracker_records_modules() {
     let tracker = RouteTracker::new(RouteTrackerConfig::default());
 
     tracker.record_module("/about", "src/pages/about.tsx").await;
-    tracker.record_module("/about", "src/components/Header.tsx").await;
+    tracker
+        .record_module("/about", "src/components/Header.tsx")
+        .await;
     tracker.record_module("/", "src/pages/index.tsx").await;
 
     let about_modules = tracker.modules_for_route("/about").await.unwrap();
@@ -446,7 +485,10 @@ async fn route_tracker_prediction() {
 
     let predictions = tracker.predict_next_routes("/").await;
     assert!(!predictions.is_empty());
-    assert_eq!(predictions[0], "/about", "Most common next route after / should be /about");
+    assert_eq!(
+        predictions[0], "/about",
+        "Most common next route after / should be /about"
+    );
 }
 
 /// Test that route tracker marks prefetched routes.

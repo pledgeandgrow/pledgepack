@@ -17,18 +17,18 @@
 //   - TaskRegistry (function ID → executor function mapping)
 //   - Scheduler (demand-driven, work-stealing)
 
-use crate::backend::{TaskBackend, MemoryBackend};
+use crate::backend::{MemoryBackend, TaskBackend};
 use crate::environment::{self, Environment};
-use crate::graph::{DependencyGraph, AggregationGraph, TaskStatus};
+use crate::graph::{AggregationGraph, DependencyGraph, TaskStatus};
 use crate::read_tracker;
-use crate::registry::{TaskRegistry, TaskExecutor};
+use crate::registry::{TaskExecutor, TaskRegistry};
 use crate::task::TaskId;
 use dashmap::DashMap;
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{Serialize, de::DeserializeOwned};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, RwLock};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use tracing::{error, info, trace, warn};
 
 /// G4.15: Serializable snapshot of scheduler state.
@@ -91,7 +91,10 @@ impl Notify {
                 std::task::Poll::Ready(())
             } else {
                 // Register this waker alongside any other waiters.
-                self.wakers.lock().unwrap_or_else(|e| e.into_inner()).push(cx.waker().clone());
+                self.wakers
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(cx.waker().clone());
                 std::task::Poll::Pending
             }
         })
@@ -108,9 +111,7 @@ pub enum TaskError {
     #[error("Task output deserialization failed: {0}")]
     DeserializationFailed(String),
     #[error("Task cycle detected among {tasks:?}")]
-    CycleDetected {
-        tasks: Vec<crate::task::TaskId>,
-    },
+    CycleDetected { tasks: Vec<crate::task::TaskId> },
     #[error("Backend error: {0}")]
     BackendError(String),
     #[error("Determinism violation for task {task_id}:\n{diff}")]
@@ -377,7 +378,10 @@ impl TaskEngine {
         }
 
         // Restore active queries
-        let mut queries = self.active_queries.write().unwrap_or_else(|e| e.into_inner());
+        let mut queries = self
+            .active_queries
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
         queries.clear();
         for (id, roots_hex) in &cp.active_queries {
             let roots: Vec<TaskId> = roots_hex
@@ -411,7 +415,10 @@ impl TaskEngine {
         let env_tasks: HashSet<TaskId> = all_tasks
             .iter()
             .filter(|t| {
-                self.task_envs.get(t).map(|e| *e == env || *e == Environment::Shared).unwrap_or(true)
+                self.task_envs
+                    .get(t)
+                    .map(|e| *e == env || *e == Environment::Shared)
+                    .unwrap_or(true)
             })
             .copied()
             .collect();
@@ -464,7 +471,10 @@ impl TaskEngine {
         let env_tasks: HashSet<TaskId> = all_tasks
             .iter()
             .filter(|t| {
-                self.task_envs.get(t).map(|e| *e == env || *e == Environment::Shared).unwrap_or(true)
+                self.task_envs
+                    .get(t)
+                    .map(|e| *e == env || *e == Environment::Shared)
+                    .unwrap_or(true)
             })
             .copied()
             .collect();
@@ -473,22 +483,14 @@ impl TaskEngine {
 
         for task in &env_tasks {
             let label = task.short_hex();
-            mermaid.push_str(&format!(
-                "  {}[\"{}\"]\n",
-                task.to_hex(),
-                label
-            ));
+            mermaid.push_str(&format!("  {}[\"{}\"]\n", task.to_hex(), label));
         }
 
         for task in &env_tasks {
             let deps = self.dep_graph.dependencies(task);
             for dep in &deps {
                 if env_tasks.contains(dep) {
-                    mermaid.push_str(&format!(
-                        "  {} --> {}\n",
-                        dep.to_hex(),
-                        task.to_hex()
-                    ));
+                    mermaid.push_str(&format!("  {} --> {}\n", dep.to_hex(), task.to_hex()));
                 }
             }
         }
@@ -498,15 +500,23 @@ impl TaskEngine {
 
     /// Register an active query. Only tasks in active queries are scheduled.
     pub fn register_query(&self, roots: Vec<TaskId>) -> u64 {
-        let id = self.next_query_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let id = self
+            .next_query_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let query = ActiveQuery { id, roots };
-        self.active_queries.write().unwrap_or_else(|e| e.into_inner()).insert(id, query);
+        self.active_queries
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id, query);
         id
     }
 
     /// Unregister an active query.
     pub fn unregister_query(&self, query_id: u64) {
-        self.active_queries.write().unwrap_or_else(|e| e.into_inner()).remove(&query_id);
+        self.active_queries
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&query_id);
     }
 
     /// Read a task's output, scheduling it (and its dependencies) if needed.
@@ -520,10 +530,7 @@ impl TaskEngine {
     ///   4. Schedule the task for computation (and its dependencies).
     ///   5. Wait for computation to complete.
     ///   6. Return the output.
-    pub async fn read_task<T>(
-        &self,
-        id: TaskId,
-    ) -> Result<Arc<T>, TaskError>
+    pub async fn read_task<T>(&self, id: TaskId) -> Result<Arc<T>, TaskError>
     where
         T: Serialize + DeserializeOwned + Send + Sync + 'static,
     {
@@ -540,9 +547,9 @@ impl TaskEngine {
                     trace!("Task cache expired (TTL): {}", id);
                 } else {
                     trace!("Task cache hit: {}", id);
-                    let value: T = output.deserialize().map_err(|e| {
-                        TaskError::DeserializationFailed(e.to_string())
-                    })?;
+                    let value: T = output
+                        .deserialize()
+                        .map_err(|e| TaskError::DeserializationFailed(e.to_string()))?;
                     return Ok(Arc::new(value));
                 }
             }
@@ -555,9 +562,9 @@ impl TaskEngine {
                         trace!("Remote cache expired (TTL): {}", id);
                     } else {
                         trace!("Remote cache hit: {}", id);
-                        let value: T = output.deserialize().map_err(|e| {
-                            TaskError::DeserializationFailed(e.to_string())
-                        })?;
+                        let value: T = output
+                            .deserialize()
+                            .map_err(|e| TaskError::DeserializationFailed(e.to_string()))?;
                         return Ok(Arc::new(value));
                     }
                 }
@@ -573,13 +580,14 @@ impl TaskEngine {
 
         // 4. Read the computed output
         if let Some(output) = self.backend.get(&id) {
-            let value: T = output.deserialize().map_err(|e| {
-                TaskError::DeserializationFailed(e.to_string())
-            })?;
+            let value: T = output
+                .deserialize()
+                .map_err(|e| TaskError::DeserializationFailed(e.to_string()))?;
             Ok(Arc::new(value))
         } else {
             Err(TaskError::ComputationFailed(format!(
-                "Task {} was computed but output not found", id
+                "Task {} was computed but output not found",
+                id
             )))
         }
     }
@@ -591,9 +599,9 @@ impl TaskEngine {
     where
         T: Serialize + DeserializeOwned + Send + Sync + 'static,
     {
-        self.backend.get(&id).and_then(|output| {
-            output.deserialize::<T>().ok().map(Arc::new)
-        })
+        self.backend
+            .get(&id)
+            .and_then(|output| output.deserialize::<T>().ok().map(Arc::new))
     }
 
     /// G5.10: Compute tasks for multiple environments in parallel.
@@ -668,7 +676,10 @@ impl TaskEngine {
             } else {
                 computing.insert(id);
                 let notify = Arc::new(Notify::new());
-                self.task_notify.lock().unwrap_or_else(|e| e.into_inner()).insert(id, notify);
+                self.task_notify
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(id, notify);
                 None // We're the one computing — don't wait, proceed
             }
         };
@@ -685,7 +696,9 @@ impl TaskEngine {
 
         // Execute the task via the registry (looks up executor by ID).
         // Install read tracker before async execution to capture implicit file deps.
-        let read_tracking = self.read_tracking_enabled.load(std::sync::atomic::Ordering::Relaxed);
+        let read_tracking = self
+            .read_tracking_enabled
+            .load(std::sync::atomic::Ordering::Relaxed);
         if read_tracking {
             read_tracker::install_tracker();
         }
@@ -694,9 +707,8 @@ impl TaskEngine {
         // Tasks inherit the caller's environment unless they explicitly override.
         // The environment is set to Shared by default; tasks that need a specific
         // environment use `run_with_environment()` inside their executor.
-        let result = environment::with_environment(Environment::Shared, || {
-            self.registry.execute(&id, self)
-        });
+        let result =
+            environment::with_environment(Environment::Shared, || self.registry.execute(&id, self));
 
         // The executor returns a future — we need to await it.
         // The read tracker is thread-local, so it captures reads on the
@@ -722,25 +734,21 @@ impl TaskEngine {
 
             match second_output {
                 Ok(second) => {
-                    if first_output.data != second.data || first_output.output_hash != second.output_hash {
+                    if first_output.data != second.data
+                        || first_output.output_hash != second.output_hash
+                    {
                         let first_str = String::from_utf8_lossy(&first_output.data);
                         let second_str = String::from_utf8_lossy(&second.data);
                         let diff = compute_diff(&first_str, &second_str);
-                        tracing::error!(
-                            "Determinism violation for task {}:\n{}",
-                            id,
-                            diff
-                        );
-                        return Err(TaskError::DeterminismViolation {
-                            task_id: id,
-                            diff,
-                        });
+                        tracing::error!("Determinism violation for task {}:\n{}", id, diff);
+                        return Err(TaskError::DeterminismViolation { task_id: id, diff });
                     }
                 }
                 Err(e) => {
                     tracing::warn!(
                         "Determinism check: second execution of task {} failed: {}",
-                        id, e
+                        id,
+                        e
                     );
                 }
             }
@@ -813,8 +821,15 @@ impl TaskEngine {
 
         // Notify waiters
         {
-            self.computing.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
-            let notify = self.task_notify.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
+            self.computing
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&id);
+            let notify = self
+                .task_notify
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&id);
             if let Some(notify) = notify {
                 notify.notify_waiters();
             }
@@ -847,7 +862,12 @@ impl TaskEngine {
         let mut count = 0;
         let tasks_to_invalidate: Vec<TaskId> = {
             let index = self.read_index.read().unwrap_or_else(|e| e.into_inner());
-            index.get(path).cloned().unwrap_or_default().into_iter().collect()
+            index
+                .get(path)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .collect()
         };
 
         for task_id in &tasks_to_invalidate {
@@ -859,29 +879,38 @@ impl TaskEngine {
         }
 
         if count > 0 {
-            info!("Invalidated {} tasks via file read index: {:?}", count, path);
+            info!(
+                "Invalidated {} tasks via file read index: {:?}",
+                count, path
+            );
         }
         count
     }
 
     /// Enable read tracking for subsequent task computations.
     pub fn enable_read_tracking(&self) {
-        self.read_tracking_enabled.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.read_tracking_enabled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Disable read tracking for subsequent task computations.
     pub fn disable_read_tracking(&self) {
-        self.read_tracking_enabled.store(false, std::sync::atomic::Ordering::Relaxed);
+        self.read_tracking_enabled
+            .store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Whether read tracking is enabled.
     pub fn is_read_tracking_enabled(&self) -> bool {
-        self.read_tracking_enabled.load(std::sync::atomic::Ordering::Relaxed)
+        self.read_tracking_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Get the file read index (for debugging/inspection).
     pub fn read_index(&self) -> HashMap<PathBuf, HashSet<TaskId>> {
-        self.read_index.read().unwrap_or_else(|e| e.into_inner()).clone()
+        self.read_index
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Get all dirty tasks that are covered by an active query.
@@ -889,7 +918,10 @@ impl TaskEngine {
     /// This is the demand-driven part: we only schedule tasks that are both
     /// dirty AND needed by an active query.
     pub fn dirty_tasks_for_active_queries(&self) -> HashSet<TaskId> {
-        let queries = self.active_queries.read().unwrap_or_else(|e| e.into_inner());
+        let queries = self
+            .active_queries
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
         let mut needed: HashSet<TaskId> = HashSet::new();
 
         for query in queries.values() {
@@ -923,7 +955,10 @@ impl TaskEngine {
     /// This is a topological sort of the dirty tasks, grouped by "wave":
     /// - Wave 0: tasks with no dirty dependencies
     /// - Wave N: tasks whose dirty dependencies are all in waves 0..N-1
-    pub fn batch_schedule(&self, dirty_tasks: &HashSet<TaskId>) -> Result<Vec<Vec<TaskId>>, TaskError> {
+    pub fn batch_schedule(
+        &self,
+        dirty_tasks: &HashSet<TaskId>,
+    ) -> Result<Vec<Vec<TaskId>>, TaskError> {
         if dirty_tasks.is_empty() {
             return Ok(Vec::new());
         }
@@ -952,10 +987,7 @@ impl TaskEngine {
             if ready.is_empty() {
                 // Circular dependency among remaining dirty tasks — return an error
                 // instead of silently scheduling them together.
-                error!(
-                    "Cycle detected among {} dirty tasks",
-                    remaining.len()
-                );
+                error!("Cycle detected among {} dirty tasks", remaining.len());
                 return Err(TaskError::CycleDetected {
                     tasks: remaining.iter().copied().collect(),
                 });
@@ -978,7 +1010,10 @@ impl TaskEngine {
     /// closer to the final output, so errors are discovered sooner.
     ///
     /// Returns a flat Vec of task IDs in priority order (highest priority first).
-    pub fn priority_schedule(&self, dirty_tasks: &HashSet<TaskId>) -> Result<Vec<TaskId>, TaskError> {
+    pub fn priority_schedule(
+        &self,
+        dirty_tasks: &HashSet<TaskId>,
+    ) -> Result<Vec<TaskId>, TaskError> {
         let batches = self.batch_schedule(dirty_tasks)?;
 
         // Compute depth for each task (distance from root).
@@ -1049,7 +1084,10 @@ impl TaskEngine {
         // Collect tasks near active query roots — these are likely to be needed
         let mut proximity_set: HashSet<TaskId> = HashSet::new();
         {
-            let queries = self.active_queries.read().unwrap_or_else(|e| e.into_inner());
+            let queries = self
+                .active_queries
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
             for query in queries.values() {
                 for &root in &query.roots {
                     // Add the root and its transitive deps
@@ -1168,21 +1206,13 @@ impl TaskEngine {
         let all_tasks = self.dep_graph.all_tasks();
         for task in &all_tasks {
             let label = task.short_hex();
-            mermaid.push_str(&format!(
-                "  {}[\"{}\"]\n",
-                task.to_hex(),
-                label
-            ));
+            mermaid.push_str(&format!("  {}[\"{}\"]\n", task.to_hex(), label));
         }
 
         for task in &all_tasks {
             let deps = self.dep_graph.dependencies(task);
             for dep in &deps {
-                mermaid.push_str(&format!(
-                    "  {} --> {}\n",
-                    dep.to_hex(),
-                    task.to_hex()
-                ));
+                mermaid.push_str(&format!("  {} --> {}\n", dep.to_hex(), task.to_hex()));
             }
         }
 
@@ -1260,7 +1290,14 @@ impl SchedulerTrace {
     }
 
     /// Record a complete event with a known duration.
-    pub fn complete(&mut self, name: &str, pid: u32, tid: u32, dur_micros: u64, args: Option<serde_json::Value>) {
+    pub fn complete(
+        &mut self,
+        name: &str,
+        pid: u32,
+        tid: u32,
+        dur_micros: u64,
+        args: Option<serde_json::Value>,
+    ) {
         let ts = self.start_time.elapsed().as_micros() as u64;
         self.events.push(TraceEvent {
             name: name.to_string(),
@@ -1343,7 +1380,8 @@ fn compute_diff(first: &str, second: &str) -> String {
         // Binary data that differs but isn't line-structured
         diff.push_str(&format!(
             "  Output data differs (first {} bytes vs second {} bytes)",
-            first.len(), second.len()
+            first.len(),
+            second.len()
         ));
     }
 
@@ -1438,9 +1476,9 @@ impl TaskEngineBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::task::Task;
-    use crate::registry::{TaskRegistry, TaskExecutor};
     use crate::backend::StoredOutput;
+    use crate::registry::{TaskExecutor, TaskRegistry};
+    use crate::task::Task;
 
     #[tokio::test]
     async fn engine_computes_simple_task() {
@@ -1448,13 +1486,17 @@ mod tests {
 
         // Register a simple task: "greet" → "hello world"
         let task_id = TaskId::compute("greet", b"");
-        registry.register(task_id, "greet".to_string(), TaskExecutor::sync(|| {
-            Ok(StoredOutput::new(
-                TaskId::compute("greet", b""),
-                &"hello world".to_string(),
-                vec![],
-            )?)
-        }));
+        registry.register(
+            task_id,
+            "greet".to_string(),
+            TaskExecutor::sync(|| {
+                Ok(StoredOutput::new(
+                    TaskId::compute("greet", b""),
+                    &"hello world".to_string(),
+                    vec![],
+                )?)
+            }),
+        );
 
         let engine = TaskEngine::new(registry, TaskBackend::new(MemoryBackend::new()));
 
@@ -1470,14 +1512,18 @@ mod tests {
         let call_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let call_count_clone = call_count.clone();
 
-        registry.register(task_id, "compute_value".to_string(), TaskExecutor::sync(move || {
-            call_count_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            Ok(StoredOutput::new(
-                TaskId::compute("compute_value", b""),
-                &42u32,
-                vec![],
-            )?)
-        }));
+        registry.register(
+            task_id,
+            "compute_value".to_string(),
+            TaskExecutor::sync(move || {
+                call_count_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(StoredOutput::new(
+                    TaskId::compute("compute_value", b""),
+                    &42u32,
+                    vec![],
+                )?)
+            }),
+        );
 
         let engine = TaskEngine::new(registry, TaskBackend::new(MemoryBackend::new()));
 
@@ -1497,37 +1543,51 @@ mod tests {
     async fn engine_invalidate_marks_dirty() {
         let registry = TaskRegistry::new();
         let task_id = TaskId::compute("invalidate_test", b"");
-        registry.register(task_id, "invalidate_test".to_string(), TaskExecutor::sync(|| {
-            Ok(StoredOutput::new(
-                TaskId::compute("invalidate_test", b""),
-                &"value".to_string(),
-                vec![],
-            )?)
-        }));
+        registry.register(
+            task_id,
+            "invalidate_test".to_string(),
+            TaskExecutor::sync(|| {
+                Ok(StoredOutput::new(
+                    TaskId::compute("invalidate_test", b""),
+                    &"value".to_string(),
+                    vec![],
+                )?)
+            }),
+        );
 
         let engine = TaskEngine::new(registry, TaskBackend::new(MemoryBackend::new()));
 
         // Compute the task
         let task: Task<String> = Task::from_id(task_id);
         let _ = task.read(&engine).await.unwrap();
-        assert_eq!(engine.dependency_graph().status(&task_id), TaskStatus::Clean);
+        assert_eq!(
+            engine.dependency_graph().status(&task_id),
+            TaskStatus::Clean
+        );
 
         // Invalidate
         engine.invalidate(task_id);
-        assert_eq!(engine.dependency_graph().status(&task_id), TaskStatus::Dirty);
+        assert_eq!(
+            engine.dependency_graph().status(&task_id),
+            TaskStatus::Dirty
+        );
     }
 
     #[tokio::test]
     async fn engine_stats_track_tasks() {
         let registry = TaskRegistry::new();
         let task_id = TaskId::compute("stats_test", b"");
-        registry.register(task_id, "stats_test".to_string(), TaskExecutor::sync(|| {
-            Ok(StoredOutput::new(
-                TaskId::compute("stats_test", b""),
-                &"value".to_string(),
-                vec![],
-            )?)
-        }));
+        registry.register(
+            task_id,
+            "stats_test".to_string(),
+            TaskExecutor::sync(|| {
+                Ok(StoredOutput::new(
+                    TaskId::compute("stats_test", b""),
+                    &"value".to_string(),
+                    vec![],
+                )?)
+            }),
+        );
 
         let engine = TaskEngine::new(registry, TaskBackend::new(MemoryBackend::new()));
 
@@ -1543,13 +1603,17 @@ mod tests {
     async fn verify_determinism_passes_for_deterministic_task() {
         let registry = TaskRegistry::new();
         let task_id = TaskId::compute("det_test", b"");
-        registry.register(task_id, "det_test".to_string(), TaskExecutor::sync(|| {
-            Ok(StoredOutput::new(
-                TaskId::compute("det_test", b""),
-                &42u32,
-                vec![],
-            )?)
-        }));
+        registry.register(
+            task_id,
+            "det_test".to_string(),
+            TaskExecutor::sync(|| {
+                Ok(StoredOutput::new(
+                    TaskId::compute("det_test", b""),
+                    &42u32,
+                    vec![],
+                )?)
+            }),
+        );
 
         let engine = TaskEngine::new(registry, TaskBackend::new(MemoryBackend::new()))
             .with_verify_determinism();
@@ -1565,14 +1629,18 @@ mod tests {
         let task_id = TaskId::compute("nondet_test", b"");
         let counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let counter_clone = counter.clone();
-        registry.register(task_id, "nondet_test".to_string(), TaskExecutor::sync(move || {
-            let val = counter_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(StoredOutput::new(
-                TaskId::compute("nondet_test", b""),
-                &val,
-                vec![],
-            )?)
-        }));
+        registry.register(
+            task_id,
+            "nondet_test".to_string(),
+            TaskExecutor::sync(move || {
+                let val = counter_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(StoredOutput::new(
+                    TaskId::compute("nondet_test", b""),
+                    &val,
+                    vec![],
+                )?)
+            }),
+        );
 
         let engine = TaskEngine::new(registry, TaskBackend::new(MemoryBackend::new()))
             .with_verify_determinism();
@@ -1587,7 +1655,10 @@ mod tests {
     #[test]
     fn compute_diff_shows_line_differences() {
         let diff = compute_diff("hello\nworld\n", "hello\nrust\n");
-        assert!(diff.contains("- L2: world"), "diff should show removed line");
+        assert!(
+            diff.contains("- L2: world"),
+            "diff should show removed line"
+        );
         assert!(diff.contains("+ L2: rust"), "diff should show added line");
     }
 
@@ -1606,7 +1677,10 @@ mod tests {
         // We test the fallback by passing identical strings — the diff
         // will be empty, triggering the binary fallback.
         let diff = compute_diff("same", "same");
-        assert!(diff.contains("Output data differs"), "should show binary diff info for identical strings");
+        assert!(
+            diff.contains("Output data differs"),
+            "should show binary diff info for identical strings"
+        );
     }
 
     #[tokio::test]
@@ -1615,14 +1689,18 @@ mod tests {
         let task_id = TaskId::compute("non_cacheable_test", b"");
         let call_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let call_count_clone = call_count.clone();
-        registry.register(task_id, "non_cacheable_test".to_string(), TaskExecutor::sync(move || {
-            call_count_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            Ok(StoredOutput::new_non_cacheable(
-                TaskId::compute("non_cacheable_test", b""),
-                &42u32,
-                vec![],
-            )?)
-        }));
+        registry.register(
+            task_id,
+            "non_cacheable_test".to_string(),
+            TaskExecutor::sync(move || {
+                call_count_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(StoredOutput::new_non_cacheable(
+                    TaskId::compute("non_cacheable_test", b""),
+                    &42u32,
+                    vec![],
+                )?)
+            }),
+        );
 
         let engine = TaskEngine::new(registry, TaskBackend::new(MemoryBackend::new()));
 
@@ -1634,7 +1712,11 @@ mod tests {
         // Second read — should recompute since output was not cached
         let result2 = task.read(&engine).await.unwrap();
         assert_eq!(*result2, 42);
-        assert_eq!(call_count.load(std::sync::atomic::Ordering::Relaxed), 2, "Non-cacheable task should recompute on every read");
+        assert_eq!(
+            call_count.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "Non-cacheable task should recompute on every read"
+        );
     }
 
     #[tokio::test]
@@ -1645,15 +1727,39 @@ mod tests {
         let task_c = TaskId::compute("batch_c", b"");
 
         // Register tasks: A and B are independent, C depends on A
-        registry.register(task_a, "batch_a".to_string(), TaskExecutor::sync(|| {
-            Ok(StoredOutput::new(TaskId::compute("batch_a", b""), &1u32, vec![])?)
-        }));
-        registry.register(task_b, "batch_b".to_string(), TaskExecutor::sync(|| {
-            Ok(StoredOutput::new(TaskId::compute("batch_b", b""), &2u32, vec![])?)
-        }));
-        registry.register(task_c, "batch_c".to_string(), TaskExecutor::sync(move || {
-            Ok(StoredOutput::new(TaskId::compute("batch_c", b""), &3u32, vec![task_a])?)
-        }));
+        registry.register(
+            task_a,
+            "batch_a".to_string(),
+            TaskExecutor::sync(|| {
+                Ok(StoredOutput::new(
+                    TaskId::compute("batch_a", b""),
+                    &1u32,
+                    vec![],
+                )?)
+            }),
+        );
+        registry.register(
+            task_b,
+            "batch_b".to_string(),
+            TaskExecutor::sync(|| {
+                Ok(StoredOutput::new(
+                    TaskId::compute("batch_b", b""),
+                    &2u32,
+                    vec![],
+                )?)
+            }),
+        );
+        registry.register(
+            task_c,
+            "batch_c".to_string(),
+            TaskExecutor::sync(move || {
+                Ok(StoredOutput::new(
+                    TaskId::compute("batch_c", b""),
+                    &3u32,
+                    vec![task_a],
+                )?)
+            }),
+        );
 
         let engine = TaskEngine::new(registry, TaskBackend::new(MemoryBackend::new()));
 
@@ -1680,10 +1786,22 @@ mod tests {
         // Batch 0 should contain A and B (independent)
         // Batch 1 should contain C (depends on A)
         assert_eq!(batches.len(), 2, "Should have 2 batches");
-        assert!(batches[0].contains(&task_a), "Batch 0 should contain task_a");
-        assert!(batches[0].contains(&task_b), "Batch 0 should contain task_b");
-        assert!(!batches[0].contains(&task_c), "Batch 0 should not contain task_c");
-        assert!(batches[1].contains(&task_c), "Batch 1 should contain task_c");
+        assert!(
+            batches[0].contains(&task_a),
+            "Batch 0 should contain task_a"
+        );
+        assert!(
+            batches[0].contains(&task_b),
+            "Batch 0 should contain task_b"
+        );
+        assert!(
+            !batches[0].contains(&task_c),
+            "Batch 0 should not contain task_c"
+        );
+        assert!(
+            batches[1].contains(&task_c),
+            "Batch 1 should contain task_c"
+        );
     }
 
     #[test]
@@ -1704,23 +1822,53 @@ mod tests {
         let leaf1 = TaskId::compute("prio_leaf1", b"");
         let leaf2 = TaskId::compute("prio_leaf2", b"");
 
-        registry.register(leaf1, "prio_leaf1".to_string(), TaskExecutor::sync(|| {
-            Ok(StoredOutput::new(TaskId::compute("prio_leaf1", b""), &1u32, vec![])?)
-        }));
-        registry.register(leaf2, "prio_leaf2".to_string(), TaskExecutor::sync(|| {
-            Ok(StoredOutput::new(TaskId::compute("prio_leaf2", b""), &2u32, vec![])?)
-        }));
-        registry.register(mid, "prio_mid".to_string(), TaskExecutor::sync(|| {
-            Ok(StoredOutput::new(TaskId::compute("prio_mid", b""), &3u32, vec![
-                TaskId::compute("prio_leaf1", b""),
-                TaskId::compute("prio_leaf2", b""),
-            ])?)
-        }));
-        registry.register(root, "prio_root".to_string(), TaskExecutor::sync(|| {
-            Ok(StoredOutput::new(TaskId::compute("prio_root", b""), &4u32, vec![
-                TaskId::compute("prio_mid", b""),
-            ])?)
-        }));
+        registry.register(
+            leaf1,
+            "prio_leaf1".to_string(),
+            TaskExecutor::sync(|| {
+                Ok(StoredOutput::new(
+                    TaskId::compute("prio_leaf1", b""),
+                    &1u32,
+                    vec![],
+                )?)
+            }),
+        );
+        registry.register(
+            leaf2,
+            "prio_leaf2".to_string(),
+            TaskExecutor::sync(|| {
+                Ok(StoredOutput::new(
+                    TaskId::compute("prio_leaf2", b""),
+                    &2u32,
+                    vec![],
+                )?)
+            }),
+        );
+        registry.register(
+            mid,
+            "prio_mid".to_string(),
+            TaskExecutor::sync(|| {
+                Ok(StoredOutput::new(
+                    TaskId::compute("prio_mid", b""),
+                    &3u32,
+                    vec![
+                        TaskId::compute("prio_leaf1", b""),
+                        TaskId::compute("prio_leaf2", b""),
+                    ],
+                )?)
+            }),
+        );
+        registry.register(
+            root,
+            "prio_root".to_string(),
+            TaskExecutor::sync(|| {
+                Ok(StoredOutput::new(
+                    TaskId::compute("prio_root", b""),
+                    &4u32,
+                    vec![TaskId::compute("prio_mid", b"")],
+                )?)
+            }),
+        );
 
         let engine = TaskEngine::new(registry, TaskBackend::new(MemoryBackend::new()));
 
@@ -1752,14 +1900,21 @@ mod tests {
         assert_eq!(scheduled.len(), 4, "Should schedule all 4 tasks");
 
         // Verify root is last (it's in the last batch)
-        assert_eq!(*scheduled.last().unwrap(), root, "Root should be in the last batch");
+        assert_eq!(
+            *scheduled.last().unwrap(),
+            root,
+            "Root should be in the last batch"
+        );
     }
 
     #[test]
     fn ttl_output_expires_after_ttl() {
         let id = TaskId::compute("ttl_test", b"input");
         let output = StoredOutput::new_with_ttl(id, &42u32, vec![], 1).unwrap();
-        assert!(!output.is_expired(), "Output should not be expired immediately");
+        assert!(
+            !output.is_expired(),
+            "Output should not be expired immediately"
+        );
 
         // Create an output that's already expired
         let expired_output = StoredOutput {
@@ -1771,7 +1926,10 @@ mod tests {
             expires_at: 1, // expired in the past (Unix epoch + 1 sec)
             read_dependencies: vec![],
         };
-        assert!(expired_output.is_expired(), "Output with past expires_at should be expired");
+        assert!(
+            expired_output.is_expired(),
+            "Output with past expires_at should be expired"
+        );
     }
 
     #[test]
@@ -1790,12 +1948,28 @@ mod tests {
         let task_a_hex = task_a.to_hex();
         let task_b_hex = task_b.to_hex();
 
-        registry.register(task_a, "vis_a".to_string(), TaskExecutor::sync(|| {
-            Ok(StoredOutput::new(TaskId::compute("vis_a", b""), &1u32, vec![])?)
-        }));
-        registry.register(task_b, "vis_b".to_string(), TaskExecutor::sync(|| {
-            Ok(StoredOutput::new(TaskId::compute("vis_b", b""), &2u32, vec![TaskId::compute("vis_a", b"")])?)
-        }));
+        registry.register(
+            task_a,
+            "vis_a".to_string(),
+            TaskExecutor::sync(|| {
+                Ok(StoredOutput::new(
+                    TaskId::compute("vis_a", b""),
+                    &1u32,
+                    vec![],
+                )?)
+            }),
+        );
+        registry.register(
+            task_b,
+            "vis_b".to_string(),
+            TaskExecutor::sync(|| {
+                Ok(StoredOutput::new(
+                    TaskId::compute("vis_b", b""),
+                    &2u32,
+                    vec![TaskId::compute("vis_a", b"")],
+                )?)
+            }),
+        );
 
         let engine = TaskEngine::new(registry, TaskBackend::new(MemoryBackend::new()));
         // Compute tasks to populate the dep graph
@@ -1803,9 +1977,20 @@ mod tests {
         let _ = task.read(&engine).await.unwrap();
 
         let dot = engine.visualize_dot();
-        assert!(dot.contains("digraph task_graph"), "DOT output should contain digraph header");
-        assert!(dot.contains(&task_a_hex[..]), "DOT output should contain task_a node: {}", dot);
-        assert!(dot.contains(&task_b_hex[..]), "DOT output should contain task_b node: {}", dot);
+        assert!(
+            dot.contains("digraph task_graph"),
+            "DOT output should contain digraph header"
+        );
+        assert!(
+            dot.contains(&task_a_hex[..]),
+            "DOT output should contain task_a node: {}",
+            dot
+        );
+        assert!(
+            dot.contains(&task_b_hex[..]),
+            "DOT output should contain task_b node: {}",
+            dot
+        );
         assert!(dot.contains("->"), "DOT output should contain edges");
     }
 
@@ -1815,12 +2000,28 @@ mod tests {
         let task_a = TaskId::compute("mermaid_a", b"");
         let task_b = TaskId::compute("mermaid_b", b"");
 
-        registry.register(task_a, "mermaid_a".to_string(), TaskExecutor::sync(|| {
-            Ok(StoredOutput::new(TaskId::compute("mermaid_a", b""), &1u32, vec![])?)
-        }));
-        registry.register(task_b, "mermaid_b".to_string(), TaskExecutor::sync(|| {
-            Ok(StoredOutput::new(TaskId::compute("mermaid_b", b""), &2u32, vec![TaskId::compute("mermaid_a", b"")])?)
-        }));
+        registry.register(
+            task_a,
+            "mermaid_a".to_string(),
+            TaskExecutor::sync(|| {
+                Ok(StoredOutput::new(
+                    TaskId::compute("mermaid_a", b""),
+                    &1u32,
+                    vec![],
+                )?)
+            }),
+        );
+        registry.register(
+            task_b,
+            "mermaid_b".to_string(),
+            TaskExecutor::sync(|| {
+                Ok(StoredOutput::new(
+                    TaskId::compute("mermaid_b", b""),
+                    &2u32,
+                    vec![TaskId::compute("mermaid_a", b"")],
+                )?)
+            }),
+        );
 
         let engine = TaskEngine::new(registry, TaskBackend::new(MemoryBackend::new()));
         // Compute tasks to populate the dep graph
@@ -1828,8 +2029,14 @@ mod tests {
         let _ = task.read(&engine).await.unwrap();
 
         let mermaid = engine.visualize_mermaid();
-        assert!(mermaid.starts_with("graph LR"), "Mermaid output should start with graph LR");
-        assert!(mermaid.contains("-->"), "Mermaid output should contain edges");
+        assert!(
+            mermaid.starts_with("graph LR"),
+            "Mermaid output should start with graph LR"
+        );
+        assert!(
+            mermaid.contains("-->"),
+            "Mermaid output should contain edges"
+        );
     }
 
     #[test]
@@ -1853,10 +2060,22 @@ mod tests {
         assert!(json.starts_with("["), "JSON should be an array");
         assert!(json.contains("\"ph\":\"B\""), "Should contain begin event");
         assert!(json.contains("\"ph\":\"E\""), "Should contain end event");
-        assert!(json.contains("\"ph\":\"X\""), "Should contain complete event");
-        assert!(json.contains("\"ph\":\"i\""), "Should contain instant event");
-        assert!(json.contains("\"name\":\"parse_js\""), "Should contain task name");
-        assert!(json.contains("\"cat\":\"task\""), "Should contain task category");
+        assert!(
+            json.contains("\"ph\":\"X\""),
+            "Should contain complete event"
+        );
+        assert!(
+            json.contains("\"ph\":\"i\""),
+            "Should contain instant event"
+        );
+        assert!(
+            json.contains("\"name\":\"parse_js\""),
+            "Should contain task name"
+        );
+        assert!(
+            json.contains("\"cat\":\"task\""),
+            "Should contain task category"
+        );
     }
 
     #[test]
@@ -1873,7 +2092,10 @@ mod tests {
         let engine = TaskEngine::new(registry, TaskBackend::new(MemoryBackend::new()));
         let id = TaskId::compute("sequential_test", b"");
         engine.set_parallel(id, false);
-        assert!(!engine.is_parallel(&id), "After set_parallel(false), should be false");
+        assert!(
+            !engine.is_parallel(&id),
+            "After set_parallel(false), should be false"
+        );
     }
 
     #[test]
@@ -1897,14 +2119,29 @@ mod tests {
 
         // Visualize for Client env — should include client + shared, exclude server
         let dot = engine.visualize_dot_for_env(Environment::Client);
-        assert!(dot.contains(&task_client.to_hex()[..]), "Should contain client task");
-        assert!(dot.contains(&task_shared.to_hex()[..]), "Should contain shared task");
-        assert!(!dot.contains(&task_server.to_hex()[..]), "Should NOT contain server task");
+        assert!(
+            dot.contains(&task_client.to_hex()[..]),
+            "Should contain client task"
+        );
+        assert!(
+            dot.contains(&task_shared.to_hex()[..]),
+            "Should contain shared task"
+        );
+        assert!(
+            !dot.contains(&task_server.to_hex()[..]),
+            "Should NOT contain server task"
+        );
 
         // Visualize for Server env — should include server + shared, exclude client
         let dot_server = engine.visualize_dot_for_env(Environment::Server);
-        assert!(dot_server.contains(&task_server.to_hex()[..]), "Should contain server task");
-        assert!(!dot_server.contains(&task_client.to_hex()[..]), "Should NOT contain client task");
+        assert!(
+            dot_server.contains(&task_server.to_hex()[..]),
+            "Should contain server task"
+        );
+        assert!(
+            !dot_server.contains(&task_client.to_hex()[..]),
+            "Should NOT contain client task"
+        );
     }
 
     #[test]
@@ -1944,10 +2181,25 @@ mod tests {
         engine.restore_checkpoint(&cp);
 
         // Verify state is restored
-        assert_eq!(engine.dep_graph.status(&id_a), TaskStatus::Dirty, "Status should be restored to Dirty");
-        assert_eq!(engine.get_ttl(&id_a), Some(300), "TTL should be restored to 300");
-        assert!(!engine.is_parallel(&id_b), "Parallel flag should be restored to false");
-        assert_eq!(engine.get_task_env(&id_a), Some(Environment::Client), "Env should be restored to Client");
+        assert_eq!(
+            engine.dep_graph.status(&id_a),
+            TaskStatus::Dirty,
+            "Status should be restored to Dirty"
+        );
+        assert_eq!(
+            engine.get_ttl(&id_a),
+            Some(300),
+            "TTL should be restored to 300"
+        );
+        assert!(
+            !engine.is_parallel(&id_b),
+            "Parallel flag should be restored to false"
+        );
+        assert_eq!(
+            engine.get_task_env(&id_a),
+            Some(Environment::Client),
+            "Env should be restored to Client"
+        );
     }
 
     #[test]
@@ -1965,8 +2217,13 @@ mod tests {
         assert!(json.contains("Clean"), "JSON should contain status");
         assert!(json.contains("60"), "JSON should contain TTL");
 
-        let restored: SchedulerCheckpoint = serde_json::from_str(&json).expect("Should deserialize from JSON");
-        assert_eq!(restored.task_ttls.len(), 1, "Restored checkpoint should have 1 TTL");
+        let restored: SchedulerCheckpoint =
+            serde_json::from_str(&json).expect("Should deserialize from JSON");
+        assert_eq!(
+            restored.task_ttls.len(),
+            1,
+            "Restored checkpoint should have 1 TTL"
+        );
     }
 
     #[test]
@@ -2004,7 +2261,10 @@ mod tests {
         let pos_a = spec.iter().position(|t| *t == a).unwrap();
         let pos_b = spec.iter().position(|t| *t == b).unwrap();
 
-        assert!(pos_root < pos_c, "root should be scheduled before c (proximity)");
+        assert!(
+            pos_root < pos_c,
+            "root should be scheduled before c (proximity)"
+        );
         assert!(pos_a < pos_c, "a should be scheduled before c (proximity)");
         assert!(pos_b < pos_c, "b should be scheduled before c (proximity)");
     }
@@ -2028,20 +2288,28 @@ mod tests {
         let client_id = TaskId::compute("transform", b"client-module");
         let server_id = TaskId::compute("transform", b"server-module");
 
-        registry.register(client_id, "transform_client".to_string(), TaskExecutor::sync(|| {
-            Ok(StoredOutput::new(
-                TaskId::compute("transform", b"client-module"),
-                &"client-output".to_string(),
-                vec![],
-            )?)
-        }));
-        registry.register(server_id, "transform_server".to_string(), TaskExecutor::sync(|| {
-            Ok(StoredOutput::new(
-                TaskId::compute("transform", b"server-module"),
-                &"server-output".to_string(),
-                vec![],
-            )?)
-        }));
+        registry.register(
+            client_id,
+            "transform_client".to_string(),
+            TaskExecutor::sync(|| {
+                Ok(StoredOutput::new(
+                    TaskId::compute("transform", b"client-module"),
+                    &"client-output".to_string(),
+                    vec![],
+                )?)
+            }),
+        );
+        registry.register(
+            server_id,
+            "transform_server".to_string(),
+            TaskExecutor::sync(|| {
+                Ok(StoredOutput::new(
+                    TaskId::compute("transform", b"server-module"),
+                    &"server-output".to_string(),
+                    vec![],
+                )?)
+            }),
+        );
 
         let engine = TaskEngine::new(registry, TaskBackend::new(MemoryBackend::new()));
 
@@ -2050,7 +2318,10 @@ mod tests {
             (server_id, crate::environment::Environment::Server),
         ];
 
-        let results = engine.read_tasks_for_environments::<String>(tasks).await.unwrap();
+        let results = engine
+            .read_tasks_for_environments::<String>(tasks)
+            .await
+            .unwrap();
 
         assert_eq!(results.len(), 2);
         let outputs: std::collections::HashMap<TaskId, String> = results
@@ -2066,18 +2337,25 @@ mod tests {
         let registry = TaskRegistry::new();
         let task_id = TaskId::compute("test", b"env-meta");
 
-        registry.register(task_id, "test".to_string(), TaskExecutor::sync(|| {
-            Ok(StoredOutput::new(
-                TaskId::compute("test", b"env-meta"),
-                &42i32,
-                vec![],
-            )?)
-        }));
+        registry.register(
+            task_id,
+            "test".to_string(),
+            TaskExecutor::sync(|| {
+                Ok(StoredOutput::new(
+                    TaskId::compute("test", b"env-meta"),
+                    &42i32,
+                    vec![],
+                )?)
+            }),
+        );
 
         let engine = TaskEngine::new(registry, TaskBackend::new(MemoryBackend::new()));
 
         let tasks = vec![(task_id, crate::environment::Environment::Edge)];
-        let _results = engine.read_tasks_for_environments::<i32>(tasks).await.unwrap();
+        let _results = engine
+            .read_tasks_for_environments::<i32>(tasks)
+            .await
+            .unwrap();
 
         // Verify environment metadata was set
         let env = engine.get_task_env(&task_id).unwrap();

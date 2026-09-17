@@ -163,9 +163,8 @@ fn auto_dark_mode(css: &str) -> String {
     // The selector group excludes `@` so at-rule preludes are not captured
     // (they're also filtered below by checking the preceding character).
     static RULE_VAR_RE: OnceLock<Regex> = OnceLock::new();
-    let re = RULE_VAR_RE.get_or_init(|| {
-        Regex::new(r"([^{}@]+)\{([^{}]*--[a-zA-Z_][\w-]*\s*:[^}]*)\}").unwrap()
-    });
+    let re = RULE_VAR_RE
+        .get_or_init(|| Regex::new(r"([^{}@]+)\{([^{}]*--[a-zA-Z_][\w-]*\s*:[^}]*)\}").unwrap());
 
     let mut blocks: Vec<(String, Vec<String>)> = Vec::new();
 
@@ -318,11 +317,7 @@ fn invert_color_lightness(value: &str) -> String {
             let l: f64 = cap[3].parse().unwrap_or(0.0);
             let dark_l = (100.0 - l).clamp(0.0, 100.0);
             if let Some(alpha) = cap.get(4) {
-                return format!(
-                    "hsla({}, {}%, {}%, {})",
-                    h, s, dark_l,
-                    alpha.as_str()
-                );
+                return format!("hsla({}, {}%, {}%, {})", h, s, dark_l, alpha.as_str());
             }
             return format!("hsl({}, {}%, {}%)", h, s, dark_l);
         }
@@ -399,11 +394,7 @@ fn hsl_to_rgb(h: f64, s: f64, l: f64) -> (u8, u8, u8) {
         };
         (c * 255.0).round().clamp(0.0, 255.0) as u8
     };
-    (
-        channel(h + 1.0 / 3.0),
-        channel(h),
-        channel(h - 1.0 / 3.0),
-    )
+    (channel(h + 1.0 / 3.0), channel(h), channel(h - 1.0 / 3.0))
 }
 
 // ── Feature 68: CSS custom properties optimization ────────────────────
@@ -679,9 +670,7 @@ fn parse_css_items(css: &str) -> Vec<CssItem> {
                 while j < n && depth > 0 {
                     match chars[j] {
                         '"' | '\'' => j = skip_css_string(&chars, j),
-                        '/' if j + 1 < n && chars[j + 1] == '*' => {
-                            j = skip_css_comment(&chars, j)
-                        }
+                        '/' if j + 1 < n && chars[j + 1] == '*' => j = skip_css_comment(&chars, j),
                         '{' => {
                             depth += 1;
                             j += 1;
@@ -925,7 +914,10 @@ mod tests {
 
     #[test]
     fn test_invert_hsl() {
-        assert_eq!(invert_color_lightness("hsl(210, 50%, 40%)"), "hsl(210, 50%, 60%)");
+        assert_eq!(
+            invert_color_lightness("hsl(210, 50%, 40%)"),
+            "hsl(210, 50%, 60%)"
+        );
     }
 
     #[test]

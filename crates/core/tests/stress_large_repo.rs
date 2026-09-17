@@ -32,7 +32,11 @@ const NUM_MODULES: usize = 5_000;
 /// without needing 5,000 real files on disk.
 fn synthetic_module_source(index: usize) -> String {
     let mut src = String::new();
-    let num_imports = if index == 0 { 0 } else { (index % 5).min(index) };
+    let num_imports = if index == 0 {
+        0
+    } else {
+        (index % 5).min(index)
+    };
     for i in 0..num_imports {
         let dep = index.saturating_sub(i + 1);
         src.push_str(&format!("import {{ value{dep} }} from \"./mod{dep}\";\n"));

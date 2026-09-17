@@ -677,7 +677,10 @@ document.addEventListener("click", function(e) {
             // Phase 3c: Populate caches from parallel results
             for (module_id, output) in parallel_results {
                 let Some(module) = self.modules.get(&module_id) else {
-                    warn!("Module {:?} vanished between transform and cache write", module_id);
+                    warn!(
+                        "Module {:?} vanished between transform and cache write",
+                        module_id
+                    );
                     continue;
                 };
                 let cache_key = module.content_hash;
@@ -1660,7 +1663,8 @@ document.addEventListener("click", function(e) {
 
     /// Generate a default index.html when the project doesn't have one.
     fn generate_default_html(css_links: &str, module_preloads: &str, script_tags: &str) -> String {
-        let mut html = String::from("<!DOCTYPE html>\n<html>\n  <head>\n    <meta charset=\"utf-8\" />\n");
+        let mut html =
+            String::from("<!DOCTYPE html>\n<html>\n  <head>\n    <meta charset=\"utf-8\" />\n");
         if !css_links.is_empty() {
             html.push_str(css_links);
             html.push('\n');
@@ -2672,8 +2676,7 @@ mod tests {
 
     #[test]
     fn remove_entry_script_tags_matches_with_and_without_leading_slash() {
-        let template =
-            r#"<body><script type="module" src="src/index.tsx"></script></body>"#;
+        let template = r#"<body><script type="module" src="src/index.tsx"></script></body>"#;
         let entries = vec!["/src/index.tsx".to_string()];
         let result = remove_entry_script_tags(template, &entries);
         assert!(!result.contains("script"));

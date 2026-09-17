@@ -11,8 +11,7 @@ fn main() {
     // Invoke `zig build` if the static library artifact is missing or stale.
     let lib_path = lib_dir.join("libpledge_native.a");
     if !lib_path.exists() {
-        let zig_executable =
-            std::env::var("ZIG_EXECUTABLE").unwrap_or_else(|_| "zig".to_string());
+        let zig_executable = std::env::var("ZIG_EXECUTABLE").unwrap_or_else(|_| "zig".to_string());
         let status = std::process::Command::new(&zig_executable)
             .arg("build")
             .current_dir(&root)

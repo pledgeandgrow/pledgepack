@@ -160,9 +160,7 @@ impl Optimizer {
                 module_source_has_side_effects(&source)
             };
 
-            if has_sx
-                && let Ok(mut sx) = side_effects.lock()
-            {
+            if has_sx && let Ok(mut sx) = side_effects.lock() {
                 sx.insert(*id);
             }
         });
@@ -389,8 +387,7 @@ impl Optimizer {
             if !chunk_modules.is_empty() {
                 // Convert to a HashSet for O(1) membership tests when removing
                 // these modules from other chunks (avoids O(n²) Vec::contains).
-                let chunk_module_set: HashSet<ModuleId> =
-                    chunk_modules.iter().copied().collect();
+                let chunk_module_set: HashSet<ModuleId> = chunk_modules.iter().copied().collect();
                 // Remove these modules from other chunks to avoid duplication
                 for chunk in &mut self.chunks {
                     chunk.modules.retain(|m| !chunk_module_set.contains(m));
@@ -460,11 +457,10 @@ impl Optimizer {
                     }
                     if entry_module_set.contains(&id) {
                         // Find the entry chunk that owns this entry module.
-                        if let Some(idx) = entry_indices.iter().find(|&&i| {
-                            self.chunks
-                                .get(i)
-                                .is_some_and(|c| c.modules.contains(&id))
-                        }) {
+                        if let Some(idx) = entry_indices
+                            .iter()
+                            .find(|&&i| self.chunks.get(i).is_some_and(|c| c.modules.contains(&id)))
+                        {
                             target_entries.insert(*idx);
                         }
                         continue;
@@ -592,7 +588,7 @@ fn module_source_has_side_effects(source: &str) -> bool {
         "(function ()",
         "(function(",
         "!function(",
-        "!function (" ,
+        "!function (",
         "void function",
     ];
     if IIFE_PATTERNS.iter().any(|p| source.contains(p)) {
@@ -664,9 +660,7 @@ fn module_source_has_side_effects(source: &str) -> bool {
             }
             // Arrow-function default exports (`export default () => {}`,
             // `export default async () => {}`) are declarations, not calls.
-            if (rest.starts_with('(') || rest.starts_with("async "))
-                && rest.contains("=>")
-            {
+            if (rest.starts_with('(') || rest.starts_with("async ")) && rest.contains("=>") {
                 continue;
             }
             // `export default foo` (identifier) — not a side effect.

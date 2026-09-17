@@ -53,15 +53,7 @@ pub const VALID_IMAGE_FIELDS: &[&str] = &[
 
 /// Valid framework values.
 pub const VALID_FRAMEWORKS: &[&str] = &[
-    "react",
-    "vue",
-    "svelte",
-    "solid",
-    "next",
-    "tanstack",
-    "astro",
-    "pledge",
-    "auto",
+    "react", "vue", "svelte", "solid", "next", "tanstack", "astro", "pledge", "auto",
 ];
 
 /// Valid output format values.

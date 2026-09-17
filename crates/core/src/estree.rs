@@ -10,9 +10,9 @@
 //! 2. We control the output format exactly, matching what Babel/ESLint expect.
 //! 3. No additional feature flag or compile-time dependency on oxc/serde.
 
-use serde_json::{json, Value};
 use oxc::ast::ast::*;
 use oxc::ast_visit::Visit;
+use serde_json::{Value, json};
 
 /// Convert an Oxc `Program` to ESTree-compatible JSON.
 pub fn program_to_estree(program: &Program<'_>) -> Value {
@@ -38,9 +38,16 @@ impl EstreeConverter {
     fn convert_statement(&mut self, stmt: &Statement) -> Value {
         match stmt {
             Statement::ImportDeclaration(decl) => {
-                let specifiers = decl.specifiers.as_ref().map(|specs| {
-                    specs.iter().map(|s| self.convert_import_specifier(s)).collect::<Vec<_>>()
-                }).unwrap_or_default();
+                let specifiers = decl
+                    .specifiers
+                    .as_ref()
+                    .map(|specs| {
+                        specs
+                            .iter()
+                            .map(|s| self.convert_import_specifier(s))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
                 json!({
                     "type": "ImportDeclaration",
                     "specifiers": specifiers,
@@ -84,16 +91,14 @@ impl EstreeConverter {
                     "declarations": decl.declarations.iter().map(|d| self.convert_var_declarator(d)).collect::<Vec<_>>(),
                 })
             }
-            Statement::FunctionDeclaration(decl) => {
-                self.convert_function(
-                    "FunctionDeclaration",
-                    decl.id.as_ref(),
-                    &decl.params,
-                    decl.body.as_deref(),
-                    decl.r#async,
-                    decl.generator,
-                )
-            }
+            Statement::FunctionDeclaration(decl) => self.convert_function(
+                "FunctionDeclaration",
+                decl.id.as_ref(),
+                &decl.params,
+                decl.body.as_deref(),
+                decl.r#async,
+                decl.generator,
+            ),
             Statement::ClassDeclaration(decl) => {
                 self.convert_class("ClassDeclaration", decl.id.as_ref(), &decl.body)
             }
@@ -296,16 +301,14 @@ impl EstreeConverter {
                     "source": self.convert_expression(&import.source),
                 })
             }
-            Expression::FunctionExpression(func) => {
-                self.convert_function(
-                    "FunctionExpression",
-                    func.id.as_ref(),
-                    &func.params,
-                    func.body.as_deref(),
-                    func.r#async,
-                    func.generator,
-                )
-            }
+            Expression::FunctionExpression(func) => self.convert_function(
+                "FunctionExpression",
+                func.id.as_ref(),
+                &func.params,
+                func.body.as_deref(),
+                func.r#async,
+                func.generator,
+            ),
             Expression::ClassExpression(cls) => {
                 self.convert_class("ClassExpression", cls.id.as_ref(), &cls.body)
             }
@@ -463,16 +466,14 @@ impl EstreeConverter {
                     "declarations": d.declarations.iter().map(|dd| self.convert_var_declarator(dd)).collect::<Vec<_>>(),
                 })
             }
-            Declaration::FunctionDeclaration(d) => {
-                self.convert_function(
-                    "FunctionDeclaration",
-                    d.id.as_ref(),
-                    &d.params,
-                    d.body.as_deref(),
-                    d.r#async,
-                    d.generator,
-                )
-            }
+            Declaration::FunctionDeclaration(d) => self.convert_function(
+                "FunctionDeclaration",
+                d.id.as_ref(),
+                &d.params,
+                d.body.as_deref(),
+                d.r#async,
+                d.generator,
+            ),
             Declaration::ClassDeclaration(d) => {
                 self.convert_class("ClassDeclaration", d.id.as_ref(), &d.body)
             }
@@ -515,7 +516,11 @@ impl Visit<'_> for EstreeConverter {
     fn visit_program(&mut self, program: &Program<'_>) {
         for stmt in &program.body {
             let converted = self.convert_statement(stmt);
-            eprintln!("pushing: {:?} (is_null={})", converted["type"], converted.is_null());
+            eprintln!(
+                "pushing: {:?} (is_null={})",
+                converted["type"],
+                converted.is_null()
+            );
             self.body.push(converted);
         }
     }
@@ -530,8 +535,9 @@ mod tests {
 
     fn parse_to_estree(source: &str) -> Value {
         let allocator = Allocator::default();
-        let ParserReturn { program, panicked, .. } =
-            Parser::new(&allocator, source, SourceType::mjs()).parse();
+        let ParserReturn {
+            program, panicked, ..
+        } = Parser::new(&allocator, source, SourceType::mjs()).parse();
         assert!(!panicked, "parser panicked");
         program_to_estree(&program)
     }
@@ -540,9 +546,18 @@ mod tests {
     fn debug_parse() {
         let source = "import { foo } from 'bar';";
         let allocator = Allocator::default();
-        let ParserReturn { program, panicked, diagnostics, .. } =
-            Parser::new(&allocator, source, SourceType::mjs()).parse();
-        eprintln!("panicked: {}, diagnostics: {}, body_len: {}", panicked, diagnostics.len(), program.body.len());
+        let ParserReturn {
+            program,
+            panicked,
+            diagnostics,
+            ..
+        } = Parser::new(&allocator, source, SourceType::mjs()).parse();
+        eprintln!(
+            "panicked: {}, diagnostics: {}, body_len: {}",
+            panicked,
+            diagnostics.len(),
+            program.body.len()
+        );
         if !diagnostics.is_empty() {
             eprintln!("first diagnostic: {:?}", diagnostics[0]);
         }
@@ -575,9 +590,18 @@ mod tests {
         let ast = parse_to_estree("console.log('hi');");
         assert_eq!(ast["body"][0]["type"], "ExpressionStatement");
         assert_eq!(ast["body"][0]["expression"]["type"], "CallExpression");
-        assert_eq!(ast["body"][0]["expression"]["callee"]["type"], "MemberExpression");
-        assert_eq!(ast["body"][0]["expression"]["callee"]["object"]["name"], "console");
-        assert_eq!(ast["body"][0]["expression"]["callee"]["property"]["name"], "log");
+        assert_eq!(
+            ast["body"][0]["expression"]["callee"]["type"],
+            "MemberExpression"
+        );
+        assert_eq!(
+            ast["body"][0]["expression"]["callee"]["object"]["name"],
+            "console"
+        );
+        assert_eq!(
+            ast["body"][0]["expression"]["callee"]["property"]["name"],
+            "log"
+        );
         assert_eq!(ast["body"][0]["expression"]["callee"]["computed"], false);
     }
 
@@ -590,8 +614,14 @@ mod tests {
     #[test]
     fn converts_arrow_function() {
         let ast = parse_to_estree("const f = () => 1;");
-        assert_eq!(ast["body"][0]["declarations"][0]["init"]["type"], "ArrowFunctionExpression");
-        assert_eq!(ast["body"][0]["declarations"][0]["init"]["expression"], true);
+        assert_eq!(
+            ast["body"][0]["declarations"][0]["init"]["type"],
+            "ArrowFunctionExpression"
+        );
+        assert_eq!(
+            ast["body"][0]["declarations"][0]["init"]["expression"],
+            true
+        );
     }
 
     #[test]

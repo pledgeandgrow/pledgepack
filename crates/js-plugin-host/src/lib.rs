@@ -204,7 +204,11 @@ impl JsPluginHost {
                 path.display()
             );
         }
-        info!("Plugin {}: signature verified ({})", path.display(), sig.signer_identity);
+        info!(
+            "Plugin {}: signature verified ({})",
+            path.display(),
+            sig.signer_identity
+        );
         Ok(())
     }
 
@@ -386,7 +390,10 @@ impl JsPluginHost {
                 "#,
             );
             if let Err(e) = self.context.with(|ctx| ctx.eval::<(), _>(js_code.as_str())) {
-                warn!("[plugin:{}] {} execution error: {}", plugin.name, hook_name, e);
+                warn!(
+                    "[plugin:{}] {} execution error: {}",
+                    plugin.name, hook_name, e
+                );
             }
         }
     }
@@ -645,7 +652,10 @@ impl JsPluginHost {
                 }
                 Ok(None) => {}
                 Err(e) => {
-                    warn!("[plugin:{}] renderChunk execution error: {}", plugin.name, e);
+                    warn!(
+                        "[plugin:{}] renderChunk execution error: {}",
+                        plugin.name, e
+                    );
                 }
             }
         }
@@ -712,7 +722,10 @@ impl JsPluginHost {
                 }
                 Ok(None) => {}
                 Err(e) => {
-                    warn!("[plugin:{}] handleHotUpdate execution error: {}", plugin.name, e);
+                    warn!(
+                        "[plugin:{}] handleHotUpdate execution error: {}",
+                        plugin.name, e
+                    );
                 }
             }
         }
@@ -1030,9 +1043,15 @@ mod tests {
         // that would have caught the buildStart/buildEnd/generateBundle bug
         // before it shipped.
         let matrix = hook_support_matrix();
-        assert_eq!(matrix.len(), pledgepack_core::plugin_system::PLUGIN_HOOK_NAMES.len());
+        assert_eq!(
+            matrix.len(),
+            pledgepack_core::plugin_system::PLUGIN_HOOK_NAMES.len()
+        );
         for (hook, supported) in &matrix {
-            assert!(*supported, "js-plugin-host claims to support hook '{hook}' but host_supports_hook() says no");
+            assert!(
+                *supported,
+                "js-plugin-host claims to support hook '{hook}' but host_supports_hook() says no"
+            );
         }
     }
 

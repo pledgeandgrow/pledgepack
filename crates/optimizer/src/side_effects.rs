@@ -24,9 +24,7 @@ use oxc::span::SourceType;
 pub fn has_side_effects_ast(source: &str, source_type: SourceType) -> bool {
     let allocator = Allocator::default();
     let ParserReturn {
-        program,
-        panicked,
-        ..
+        program, panicked, ..
     } = Parser::new(&allocator, source, source_type).parse();
 
     if panicked {
@@ -86,8 +84,7 @@ impl SideEffectDetector {
                 }
             }
 
-            Statement::FunctionDeclaration(_)
-            | Statement::ClassDeclaration(_) => {}
+            Statement::FunctionDeclaration(_) | Statement::ClassDeclaration(_) => {}
 
             Statement::ExpressionStatement(expr_stmt) => {
                 // Top-level expression — could be a call, assignment, etc.
@@ -311,7 +308,9 @@ mod tests {
 
     #[test]
     fn pure_multiple_declarations() {
-        assert!(!has_sx("const a = 1; const b = 2; function f() {} class C {}"));
+        assert!(!has_sx(
+            "const a = 1; const b = 2; function f() {} class C {}"
+        ));
     }
 
     #[test]

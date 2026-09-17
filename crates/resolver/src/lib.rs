@@ -1072,7 +1072,11 @@ mod tests {
         let resolver = Resolver::new(dir.path().to_path_buf(), vec![".js".into()], vec![]);
         let importer = dir.path().join("index.js");
         let result = resolver.resolve("some-pkg", &importer);
-        assert!(result.is_ok(), "pnpm virtual-store fallback failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "pnpm virtual-store fallback failed: {:?}",
+            result.err()
+        );
         assert!(result.unwrap().ends_with("index.js"));
     }
 
@@ -1082,10 +1086,7 @@ mod tests {
         // workspace root's node_modules, not its own — exercises the
         // "go up one directory" loop in `resolve_node_module`.
         let dir = tempfile::tempdir().unwrap();
-        let root_pkg = dir
-            .path()
-            .join("node_modules")
-            .join("hoisted-dep");
+        let root_pkg = dir.path().join("node_modules").join("hoisted-dep");
         std::fs::create_dir_all(&root_pkg).unwrap();
         std::fs::write(
             root_pkg.join("package.json"),
@@ -1100,7 +1101,11 @@ mod tests {
         let resolver = Resolver::new(dir.path().to_path_buf(), vec![".js".into()], vec![]);
         let importer = package_dir.join("index.js");
         let result = resolver.resolve("hoisted-dep", &importer);
-        assert!(result.is_ok(), "failed to walk up to root node_modules: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "failed to walk up to root node_modules: {:?}",
+            result.err()
+        );
     }
 
     // ─── Goal 56: Windows long-path handling ────────────────────────────
@@ -1128,7 +1133,11 @@ mod tests {
         let resolver = Resolver::new(dir.path().to_path_buf(), vec![".js".into()], vec![]);
         let importer = nested.join("index.js");
         let result = resolver.resolve("./deep.js", &importer);
-        assert!(result.is_ok(), "failed to resolve a long path: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "failed to resolve a long path: {:?}",
+            result.err()
+        );
     }
 
     // ─── Goal 55: circular imports — resolver-level scope ───────────────
@@ -1146,8 +1155,16 @@ mod tests {
     #[test]
     fn resolving_both_directions_of_an_import_cycle_terminates() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("a.js"), "import './b.js'; export const a = 1;").unwrap();
-        std::fs::write(dir.path().join("b.js"), "import './a.js'; export const b = 2;").unwrap();
+        std::fs::write(
+            dir.path().join("a.js"),
+            "import './b.js'; export const a = 1;",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("b.js"),
+            "import './a.js'; export const b = 2;",
+        )
+        .unwrap();
 
         let resolver = Resolver::new(dir.path().to_path_buf(), vec![".js".into()], vec![]);
         let a = dir.path().join("a.js");

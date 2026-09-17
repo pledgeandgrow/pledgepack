@@ -22,8 +22,8 @@ use crate::config::PledgeConfig;
 use crate::module::ModuleKind;
 use anyhow::Result;
 
-pub use js::detect_dynamic_imports_from_program;
 pub use env::generate_env_dts;
+pub use js::detect_dynamic_imports_from_program;
 
 /// Output of transforming a single module
 pub struct TransformOutput {

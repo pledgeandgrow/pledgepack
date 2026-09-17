@@ -7,7 +7,7 @@
 // — those are real gaps, not silently dropped (see this goal's entry in
 // PRODUCTION-READINESS-100.md for the scope note).
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use pledgepack_core::config::PledgeConfig;
 use pledgepack_core::module::ModuleKind;
 use pledgepack_core::transform::transform;
@@ -131,8 +131,14 @@ fn bench_transform_ts(c: &mut Criterion) {
         &MEDIUM_TS,
         |b, source| {
             b.iter(|| {
-                transform(source, ModuleKind::TypeScript, "repository.ts", false, &config)
-                    .unwrap()
+                transform(
+                    source,
+                    ModuleKind::TypeScript,
+                    "repository.ts",
+                    false,
+                    &config,
+                )
+                .unwrap()
             });
         },
     );

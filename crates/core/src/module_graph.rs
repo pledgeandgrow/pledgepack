@@ -103,11 +103,7 @@ impl SerializableModuleGraph {
     /// circular imports), but a warning is logged so the issue is visible.
     pub fn add_dependency(&mut self, from: ModuleId, to: ModuleId) {
         if from != to && self.can_reach(to, from) {
-            warn!(
-                "Circular dependency detected: {:?} -> {:?}",
-                from,
-                to
-            );
+            warn!("Circular dependency detected: {:?} -> {:?}", from, to);
         }
         if let Some(module) = self.modules.get_mut(&from)
             && !module.dependencies.contains(&to)
@@ -133,8 +129,7 @@ impl SerializableModuleGraph {
         if from != to && self.can_reach(to, from) {
             warn!(
                 "Circular dynamic dependency detected: {:?} -> {:?}",
-                from,
-                to
+                from, to
             );
         }
         if let Some(module) = self.modules.get_mut(&from)

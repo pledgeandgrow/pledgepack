@@ -17,9 +17,8 @@
 // 4. Memory usage estimation
 
 use pledgepack_task_system::{
-    Task, TaskId, TaskEngine, TaskRegistry, TaskExecutor,
-    StoredOutput, MemoryBackend, TaskBackend,
-    DependencyGraph,
+    DependencyGraph, MemoryBackend, StoredOutput, Task, TaskBackend, TaskEngine, TaskExecutor,
+    TaskId, TaskRegistry,
 };
 use std::time::Instant;
 
@@ -192,7 +191,10 @@ fn large_scale_dirty_propagation() {
     graph.mark_dirty(dirty_leaf);
 
     let prop_time = prop_start.elapsed();
-    println!("  Dirty propagation (1 leaf → root, {} tasks): {:?}", LEAVES, prop_time);
+    println!(
+        "  Dirty propagation (1 leaf → root, {} tasks): {:?}",
+        LEAVES, prop_time
+    );
 
     assert!(
         prop_time.as_secs() < 5,
@@ -204,7 +206,10 @@ fn large_scale_dirty_propagation() {
 /// G3.5: Test TaskId computation at scale — 100k IDs should be fast.
 #[test]
 fn large_scale_task_id_computation() {
-    println!("\n  G3.5: TaskId computation benchmark — {} IDs", NUM_LEAF_TASKS);
+    println!(
+        "\n  G3.5: TaskId computation benchmark — {} IDs",
+        NUM_LEAF_TASKS
+    );
 
     let start = Instant::now();
     let mut ids = Vec::with_capacity(NUM_LEAF_TASKS);
@@ -247,9 +252,7 @@ async fn large_scale_engine_cache_hits() {
         registry.register(
             task_id,
             format!("cached_fn_{}", i),
-            TaskExecutor::sync(move || {
-                Ok(StoredOutput::new(task_id, &output_val, vec![])?)
-            }),
+            TaskExecutor::sync(move || Ok(StoredOutput::new(task_id, &output_val, vec![])?)),
         );
     }
     let register_time = register_start.elapsed();
@@ -267,7 +270,10 @@ async fn large_scale_engine_cache_hits() {
         assert_eq!(*result, i as u64);
     }
     let first_read_time = first_read_start.elapsed();
-    println!("  First read (compute + cache) {} tasks: {:?}", NUM_TASKS, first_read_time);
+    println!(
+        "  First read (compute + cache) {} tasks: {:?}",
+        NUM_TASKS, first_read_time
+    );
 
     // Second read (should all be cache hits)
     let second_read_start = Instant::now();
@@ -278,7 +284,10 @@ async fn large_scale_engine_cache_hits() {
         assert_eq!(*result, i as u64);
     }
     let second_read_time = second_read_start.elapsed();
-    println!("  Second read (cache hits) {} tasks: {:?}", NUM_TASKS, second_read_time);
+    println!(
+        "  Second read (cache hits) {} tasks: {:?}",
+        NUM_TASKS, second_read_time
+    );
 
     // Cache hits should be significantly faster than first reads
     // (generous assertion for CI environments)

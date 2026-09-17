@@ -38,8 +38,10 @@ fn validate_object_url(url: &str) -> Result<()> {
 }
 
 fn check_no_shell_metachars(url: &str) -> Result<()> {
-    const SHELL_METACHARS: &[char] = &[';', '|', '&', '$', '`', '(', ')', '<', '>', '\n', '\r', '*',
-        '?', '[', ']', '{', '}', '!', '#', '~', '"', '\'', '\\', ' '];
+    const SHELL_METACHARS: &[char] = &[
+        ';', '|', '&', '$', '`', '(', ')', '<', '>', '\n', '\r', '*', '?', '[', ']', '{', '}', '!',
+        '#', '~', '"', '\'', '\\', ' ',
+    ];
     if url.contains(SHELL_METACHARS) {
         bail!("URL contains forbidden shell metacharacters: {}", url);
     }
@@ -186,11 +188,7 @@ impl RemoteCache {
                 }
             }
             Ok(response) => {
-                debug!(
-                    "Remote cache miss (status {}): {}",
-                    response.status(),
-                    key
-                );
+                debug!("Remote cache miss (status {}): {}", response.status(), key);
                 Ok(None)
             }
             Err(e) => {
@@ -242,14 +240,7 @@ impl RemoteCache {
         validate_object_url(&s3_url)?;
 
         let output = std::process::Command::new("aws")
-            .args([
-                "s3",
-                "cp",
-                &s3_url,
-                "-",
-                "--region",
-                region,
-            ])
+            .args(["s3", "cp", &s3_url, "-", "--region", region])
             .output();
 
         match output {
@@ -373,11 +364,7 @@ impl RemoteCache {
         std::fs::write(&temp_file, &data)?;
 
         let output = std::process::Command::new("gsutil")
-            .args([
-                "cp",
-                &temp_file.to_string_lossy(),
-                &gs_url,
-            ])
+            .args(["cp", &temp_file.to_string_lossy(), &gs_url])
             .output();
 
         let _ = std::fs::remove_file(&temp_file);

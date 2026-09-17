@@ -45,7 +45,11 @@ fn test_plugin_loads() {
     require_test_plugin!();
     let path = test_plugin_path();
     let plugin = WasmPlugin::load_from_file(&path);
-    assert!(plugin.is_ok(), "Failed to load test plugin: {:?}", plugin.err());
+    assert!(
+        plugin.is_ok(),
+        "Failed to load test plugin: {:?}",
+        plugin.err()
+    );
 
     let plugin = plugin.unwrap();
     assert_eq!(plugin.name(), "test-plugin");
@@ -63,7 +67,9 @@ fn test_plugin_resolve_id_virtual() {
     let mut plugin = WasmPlugin::load_from_file(&path).unwrap();
 
     // Should resolve virtual:test-plugin
-    let result = plugin.resolve_id("virtual:test-plugin", None, false, None).unwrap();
+    let result = plugin
+        .resolve_id("virtual:test-plugin", None, false, None)
+        .unwrap();
     assert!(result.is_some());
     let output = result.unwrap();
     assert_eq!(output.id, "\0virtual:test-plugin");
@@ -130,10 +136,15 @@ fn test_plugin_transform_ts() {
     let mut plugin = WasmPlugin::load_from_file(&path).unwrap();
 
     // Should transform .ts files too
-    let result = plugin.transform("const x: number = 1;", "test.ts", None).unwrap();
+    let result = plugin
+        .transform("const x: number = 1;", "test.ts", None)
+        .unwrap();
     assert!(result.is_some());
     let output = result.unwrap();
-    assert_eq!(output.code, "// transformed by test-plugin\nconst x: number = 1;");
+    assert_eq!(
+        output.code,
+        "// transformed by test-plugin\nconst x: number = 1;"
+    );
 }
 
 #[test]
@@ -143,7 +154,9 @@ fn test_plugin_transform_css_passthrough() {
     let mut plugin = WasmPlugin::load_from_file(&path).unwrap();
 
     // Should NOT transform .css files
-    let result = plugin.transform(".foo { color: red; }", "test.css", None).unwrap();
+    let result = plugin
+        .transform(".foo { color: red; }", "test.css", None)
+        .unwrap();
     assert!(result.is_none());
 }
 
@@ -154,7 +167,9 @@ fn test_plugin_transform_index_html_passthrough() {
     let mut plugin = WasmPlugin::load_from_file(&path).unwrap();
 
     // Should NOT transform HTML (plugin doesn't implement this hook)
-    let result = plugin.transform_index_html("<html></html>", "index.html").unwrap();
+    let result = plugin
+        .transform_index_html("<html></html>", "index.html")
+        .unwrap();
     assert!(result.is_none());
 }
 
@@ -180,7 +195,9 @@ fn host_resolve_id_through_plugin() {
     let mut host = WasmPluginHost::new().unwrap();
     host.load_plugin(&path).unwrap();
 
-    let result = host.resolve_id("virtual:test-plugin", None, false, None).unwrap();
+    let result = host
+        .resolve_id("virtual:test-plugin", None, false, None)
+        .unwrap();
     assert!(result.is_some());
     assert_eq!(result.unwrap().id, "\0virtual:test-plugin");
 }

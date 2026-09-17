@@ -274,7 +274,6 @@ pub fn extract_vanilla_extract(source: &str, file_path: &str) -> ExtractionResul
     // Pattern: style({ color: 'red', ... })
     let mut search_pos = 0;
     while let Some(abs_pos) = find_outside_strings(&code, "style(", search_pos) {
-
         let (obj_str, full_end, has_match) = {
             let after = &code[abs_pos + 6..];
             if let Some(brace) = after.find('{') {
@@ -317,7 +316,6 @@ pub fn extract_vanilla_extract(source: &str, file_path: &str) -> ExtractionResul
     // Pattern: globalStyle(':root', { color: 'red' })
     search_pos = 0;
     while let Some(abs_pos) = find_outside_strings(&code, "globalStyle(", search_pos) {
-
         let (selector, obj_str, full_end, has_match) = {
             let after = &code[abs_pos + 12..];
             let selector_end = after.find(',').unwrap_or(after.find(')').unwrap_or(0));

@@ -124,14 +124,12 @@ impl Environment {
     /// G5.9: Get the name of a custom environment, or the standard name for built-in environments.
     pub fn name(&self) -> String {
         match self {
-            Environment::Custom(id) => {
-                registry()
-                    .read()
-                    .unwrap()
-                    .get(id)
-                    .cloned()
-                    .unwrap_or_else(|| format!("custom-{}", id))
-            }
+            Environment::Custom(id) => registry()
+                .read()
+                .unwrap()
+                .get(id)
+                .cloned()
+                .unwrap_or_else(|| format!("custom-{}", id)),
             other => other.as_str().to_string(),
         }
     }
@@ -149,7 +147,9 @@ impl Environment {
             if existing != name {
                 tracing::error!(
                     "Environment hash collision: '{}' and '{}' both hash to {}",
-                    existing, name, id
+                    existing,
+                    name,
+                    id
                 );
                 // Still use the existing entry to avoid corruption
             }
@@ -306,7 +306,9 @@ pub struct EnvironmentPluginRegistry {
 impl EnvironmentPluginRegistry {
     /// Create a new empty registry.
     pub fn new() -> Self {
-        Self { plugins: Vec::new() }
+        Self {
+            plugins: Vec::new(),
+        }
     }
 
     /// Register a custom environment plugin.
@@ -426,7 +428,10 @@ mod tests {
     fn register_custom_different_names_differ() {
         let env1 = Environment::register_custom("deno");
         let env2 = Environment::register_custom("bun");
-        assert_ne!(env1, env2, "Different names should produce different Environments");
+        assert_ne!(
+            env1, env2,
+            "Different names should produce different Environments"
+        );
     }
 
     #[test]
@@ -441,27 +446,44 @@ mod tests {
     fn custom_environment_is_custom() {
         let env = Environment::register_custom("test-env");
         assert!(env.is_custom(), "Custom environment should be detected");
-        assert!(!Environment::Client.is_custom(), "Built-in should not be custom");
+        assert!(
+            !Environment::Client.is_custom(),
+            "Built-in should not be custom"
+        );
     }
 
     #[test]
     fn custom_environment_name_lookup() {
         let env = Environment::register_custom("my-custom-env");
-        assert_eq!(env.name(), "my-custom-env", "Registered name should be looked up");
+        assert_eq!(
+            env.name(),
+            "my-custom-env",
+            "Registered name should be looked up"
+        );
     }
 
     #[test]
     fn custom_environment_name_fallback() {
         let env = Environment::custom("unregistered-env");
         // Not registered, so name falls back to custom-{id}
-        assert!(env.name().starts_with("custom-"), "Unregistered should fall back");
+        assert!(
+            env.name().starts_with("custom-"),
+            "Unregistered should fall back"
+        );
     }
 
     #[test]
     fn custom_environment_differs_from_builtins() {
         let env = Environment::register_custom("client");
-        assert_ne!(env, Environment::Client, "Custom 'client' should differ from builtin Client");
-        assert!(env.is_custom(), "Should be custom even if name matches builtin");
+        assert_ne!(
+            env,
+            Environment::Client,
+            "Custom 'client' should differ from builtin Client"
+        );
+        assert!(
+            env.is_custom(),
+            "Should be custom even if name matches builtin"
+        );
     }
 
     #[test]
@@ -501,8 +523,7 @@ mod tests {
 
     #[test]
     fn g5_12_environment_plugin_matches_alias() {
-        let plugin = EnvironmentPlugin::new("workerd")
-            .with_alias("cloudflare");
+        let plugin = EnvironmentPlugin::new("workerd").with_alias("cloudflare");
         assert!(plugin.matches_alias("cloudflare"));
         assert!(!plugin.matches_alias("deno"));
     }

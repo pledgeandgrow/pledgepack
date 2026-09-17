@@ -44,12 +44,7 @@ const MAX_RESPONSE_SIZE: usize = 100 * 1024 * 1024;
 /// keeps no insertion order and the `lru` crate is not a dependency, so we
 /// evict the first key yielded by the map's iterator. Existing keys are
 /// refreshed in place without counting against the limit.
-fn bounded_insert<V>(
-    map: &mut HashMap<String, V>,
-    key: String,
-    value: V,
-    max_entries: usize,
-) {
+fn bounded_insert<V>(map: &mut HashMap<String, V>, key: String, value: V, max_entries: usize) {
     if !map.contains_key(&key) && map.len() >= max_entries {
         // Evict an entry to make room (approximate eviction — see doc comment)
         if let Some(evict_key) = map.keys().next().cloned() {
@@ -497,38 +492,52 @@ pub async fn serve(engine: BuildEngine, config: &PledgeConfig) -> Result<()> {
                 .br(true)
                 .quality(tower_http::CompressionLevel::Fastest),
         )
-        .layer(tower_http::limit::RequestBodyLimitLayer::new(10 * 1024 * 1024))
-        .layer(tower_http::set_header::SetResponseHeaderLayer::if_not_present(
-            header::X_FRAME_OPTIONS,
-            HeaderValue::from_static("DENY"),
+        .layer(tower_http::limit::RequestBodyLimitLayer::new(
+            10 * 1024 * 1024,
         ))
-        .layer(tower_http::set_header::SetResponseHeaderLayer::if_not_present(
-            header::X_CONTENT_TYPE_OPTIONS,
-            HeaderValue::from_static("nosniff"),
-        ))
-        .layer(tower_http::set_header::SetResponseHeaderLayer::if_not_present(
-            HeaderName::from_static("referrer-policy"),
-            HeaderValue::from_static("strict-origin-when-cross-origin"),
-        ))
-        .layer(tower_http::set_header::SetResponseHeaderLayer::if_not_present(
-            header::CONTENT_SECURITY_POLICY,
-            csp_header_value,
-        ))
-        .layer(tower_http::set_header::SetResponseHeaderLayer::if_not_present(
-            HeaderName::from_static("x-pledgepack-schema-version"),
-            // PRODUCTION-READINESS-100.md goal 81: stamped on every
-            // response (not just `/__pledge_router`) so any consumer can
-            // check compatibility without depending on a specific route's
-            // response shape. `/__pledge_router` itself returns a
-            // JavaScript module, not JSON, so a body-embedded version
-            // field wasn't a good fit there — a header works regardless of
-            // content type. Computed from the same
-            // `pledgepack_core::PLEDGESTACK_MANIFEST_SCHEMA_VERSION`
-            // constant `RouteManifest::SCHEMA_VERSION` re-exports, so the
-            // two surfaces can't drift apart.
-            HeaderValue::from_str(&pledgepack_core::PLEDGESTACK_MANIFEST_SCHEMA_VERSION.to_string())
+        .layer(
+            tower_http::set_header::SetResponseHeaderLayer::if_not_present(
+                header::X_FRAME_OPTIONS,
+                HeaderValue::from_static("DENY"),
+            ),
+        )
+        .layer(
+            tower_http::set_header::SetResponseHeaderLayer::if_not_present(
+                header::X_CONTENT_TYPE_OPTIONS,
+                HeaderValue::from_static("nosniff"),
+            ),
+        )
+        .layer(
+            tower_http::set_header::SetResponseHeaderLayer::if_not_present(
+                HeaderName::from_static("referrer-policy"),
+                HeaderValue::from_static("strict-origin-when-cross-origin"),
+            ),
+        )
+        .layer(
+            tower_http::set_header::SetResponseHeaderLayer::if_not_present(
+                header::CONTENT_SECURITY_POLICY,
+                csp_header_value,
+            ),
+        )
+        .layer(
+            tower_http::set_header::SetResponseHeaderLayer::if_not_present(
+                HeaderName::from_static("x-pledgepack-schema-version"),
+                // PRODUCTION-READINESS-100.md goal 81: stamped on every
+                // response (not just `/__pledge_router`) so any consumer can
+                // check compatibility without depending on a specific route's
+                // response shape. `/__pledge_router` itself returns a
+                // JavaScript module, not JSON, so a body-embedded version
+                // field wasn't a good fit there — a header works regardless of
+                // content type. Computed from the same
+                // `pledgepack_core::PLEDGESTACK_MANIFEST_SCHEMA_VERSION`
+                // constant `RouteManifest::SCHEMA_VERSION` re-exports, so the
+                // two surfaces can't drift apart.
+                HeaderValue::from_str(
+                    &pledgepack_core::PLEDGESTACK_MANIFEST_SCHEMA_VERSION.to_string(),
+                )
                 .unwrap_or_else(|_| HeaderValue::from_static("0")),
-        ))
+            ),
+        )
         .layer(cors_layer);
 
     // Access-token gate (goal 18): only added when a token is actually
@@ -1017,7 +1026,12 @@ async fn index_handler(State(state): State<Arc<DevServerState>>) -> impl IntoRes
                             ),
                         };
                     let import_map = generate_import_map(&state.config);
-                    shell_generator::generate_html_shell(&html_attrs, &head_content, "", &import_map)
+                    shell_generator::generate_html_shell(
+                        &html_attrs,
+                        &head_content,
+                        "",
+                        &import_map,
+                    )
                 }
             } else {
                 // Auto-generate HTML shell from layout.tsx (no static index.html needed)
@@ -2185,7 +2199,13 @@ __existing.textContent = __css;
 
     // JS/TS files: rewrite imports and add HMR boundary
     let transformed = rewrite_imports(&transform_output.code, &path, &state.config.resolve_alias);
-    serve_js_module(&path, &transformed, transform_output.source_map.as_deref(), &state).await
+    serve_js_module(
+        &path,
+        &transformed,
+        transform_output.source_map.as_deref(),
+        &state,
+    )
+    .await
 }
 
 /// Serve a JS module with HMR polyfill, dependency tracking, and source maps
@@ -3601,11 +3621,7 @@ async fn public_dir_handler(
         // Check If-None-Match for conditional request — return 304 if ETag matches
         if let Some(if_none_match) = request_headers.get("if-none-match") {
             if if_none_match == etag.as_bytes() {
-                return (
-                    StatusCode::NOT_MODIFIED,
-                    [(header::ETAG, etag.as_str())],
-                )
-                    .into_response();
+                return (StatusCode::NOT_MODIFIED, [(header::ETAG, etag.as_str())]).into_response();
             }
         }
 

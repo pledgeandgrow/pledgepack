@@ -75,7 +75,9 @@ pub fn inject_sri_into_html(html: &str, out_dir: &Path) -> String {
     // whole build over a CSS-selector-syntax detail unrelated to the user's
     // code. See PRODUCTION-READINESS-100.md goal 20.
     let Ok(script_sel) = Selector::parse("script[src]") else {
-        warn!("SRI: failed to parse internal selector 'script[src]', skipping script SRI injection");
+        warn!(
+            "SRI: failed to parse internal selector 'script[src]', skipping script SRI injection"
+        );
         return html.to_string();
     };
     for element in document.select(&script_sel) {
@@ -121,10 +123,7 @@ pub fn inject_sri_into_html(html: &str, out_dir: &Path) -> String {
             continue;
         };
         // Skip external URLs — cannot compute SRI without local file access
-        if href.starts_with("http://")
-            || href.starts_with("https://")
-            || href.starts_with("//")
-        {
+        if href.starts_with("http://") || href.starts_with("https://") || href.starts_with("//") {
             continue;
         }
         match safe_path_within(out_dir, href) {
@@ -200,7 +199,9 @@ impl CspGenerator {
                     }
                 }
             }
-            Err(_) => warn!("CSP: failed to parse internal selector 'script', skipping inline-script hashing"),
+            Err(_) => warn!(
+                "CSP: failed to parse internal selector 'script', skipping inline-script hashing"
+            ),
         }
 
         // Inline styles: <style> tags

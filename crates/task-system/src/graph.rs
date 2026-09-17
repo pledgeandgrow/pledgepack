@@ -79,17 +79,26 @@ impl DependencyGraph {
 
     /// Get all tasks that depend on `task` (direct dependents).
     pub fn dependents(&self, task: &TaskId) -> HashSet<TaskId> {
-        self.dependents.get(task).map(|r| r.clone()).unwrap_or_default()
+        self.dependents
+            .get(task)
+            .map(|r| r.clone())
+            .unwrap_or_default()
     }
 
     /// Get all tasks that `task` depends on (direct dependencies).
     pub fn dependencies(&self, task: &TaskId) -> HashSet<TaskId> {
-        self.dependencies.get(task).map(|r| r.clone()).unwrap_or_default()
+        self.dependencies
+            .get(task)
+            .map(|r| r.clone())
+            .unwrap_or_default()
     }
 
     /// Get the status of a task.
     pub fn status(&self, task: &TaskId) -> TaskStatus {
-        self.status.get(task).map(|r| *r).unwrap_or(TaskStatus::Pending)
+        self.status
+            .get(task)
+            .map(|r| *r)
+            .unwrap_or(TaskStatus::Pending)
     }
 
     /// Set the status of a task.
@@ -367,7 +376,11 @@ impl AggregationGraph {
     ///
     /// Returns the aggregation node for the queried task, or None if the task
     /// is not in the dependency graph.
-    pub fn query_subtree(&self, task: TaskId, dep_graph: &DependencyGraph) -> Option<AggregationNode> {
+    pub fn query_subtree(
+        &self,
+        task: TaskId,
+        dep_graph: &DependencyGraph,
+    ) -> Option<AggregationNode> {
         // Mark as queried
         {
             let mut queried = self.queried.lock().unwrap();
@@ -416,9 +429,9 @@ impl AggregationGraph {
             let mut next_remaining = Vec::new();
             for &t in &remaining {
                 let deps = dep_graph.dependencies(&t);
-                let all_deps_ready = deps.iter().all(|d| {
-                    processed.contains(d) || !visited_set.contains(d)
-                });
+                let all_deps_ready = deps
+                    .iter()
+                    .all(|d| processed.contains(d) || !visited_set.contains(d));
                 if all_deps_ready {
                     self.update_subtree_count(t, dep_graph);
                     processed.insert(t);
@@ -432,7 +445,8 @@ impl AggregationGraph {
         // Cycle detection: if tasks remain unprocessed, a cycle exists in the
         // queried subtree. Aggregation counts for these tasks will be stale.
         if !remaining.is_empty() {
-            self.has_cycle.store(true, std::sync::atomic::Ordering::Relaxed);
+            self.has_cycle
+                .store(true, std::sync::atomic::Ordering::Relaxed);
             tracing::error!(
                 "Cycle detected in aggregation graph (query_subtree): {} tasks remain unprocessed",
                 remaining.len()
@@ -510,9 +524,9 @@ impl AggregationGraph {
                 let deps = dep_graph.dependencies(&task);
                 // A dep is ready if it's processed OR not in the rebuild set
                 // (deps outside the rebuild set still have valid counts from previous build)
-                let all_deps_ready = deps.iter().all(|d| {
-                    processed.contains(d) || !rebuild_set.contains(d)
-                });
+                let all_deps_ready = deps
+                    .iter()
+                    .all(|d| processed.contains(d) || !rebuild_set.contains(d));
                 if all_deps_ready {
                     self.update_subtree_count(task, dep_graph);
                     processed.insert(task);
@@ -526,7 +540,8 @@ impl AggregationGraph {
         // Cycle detection: if tasks remain unprocessed, a cycle exists among
         // the affected tasks. Aggregation counts for these tasks will be stale.
         if !remaining.is_empty() {
-            self.has_cycle.store(true, std::sync::atomic::Ordering::Relaxed);
+            self.has_cycle
+                .store(true, std::sync::atomic::Ordering::Relaxed);
             tracing::error!(
                 "Cycle detected in aggregation graph (incremental_rebuild): {} tasks remain unprocessed",
                 remaining.len()
@@ -555,7 +570,9 @@ impl AggregationGraph {
             for &task in &remaining {
                 let deps = dep_graph.dependencies(&task);
                 // Check if all deps are processed (or don't exist in the graph)
-                let all_deps_processed = deps.iter().all(|d| processed.contains(d) || !all_tasks.contains(d));
+                let all_deps_processed = deps
+                    .iter()
+                    .all(|d| processed.contains(d) || !all_tasks.contains(d));
                 if all_deps_processed {
                     self.update_subtree_count(task, dep_graph);
                     processed.insert(task);
@@ -569,7 +586,8 @@ impl AggregationGraph {
         // Cycle detection: if tasks remain unprocessed, a cycle exists in the
         // dependency graph. Aggregation counts for these tasks will be stale.
         if !remaining.is_empty() {
-            self.has_cycle.store(true, std::sync::atomic::Ordering::Relaxed);
+            self.has_cycle
+                .store(true, std::sync::atomic::Ordering::Relaxed);
             tracing::error!(
                 "Cycle detected in aggregation graph: {} tasks remain unprocessed",
                 remaining.len()
@@ -763,7 +781,10 @@ impl AggregationGraph {
 
     /// G3.8: Get total compute time for a subtree.
     pub fn subtree_compute_ms(&self, task: &TaskId) -> u64 {
-        self.nodes.get(task).map(|r| r.total_compute_ms).unwrap_or(0)
+        self.nodes
+            .get(task)
+            .map(|r| r.total_compute_ms)
+            .unwrap_or(0)
     }
 
     /// G3.8: Get cached count for a subtree.
@@ -835,7 +856,11 @@ impl AggregationGraph {
         // Draw nodes
         for (id, node) in &all_nodes {
             if let Some(&(x, y)) = positions.get(id) {
-                let color = if node.dirty_count > 0 { "#FFB6C1" } else { "#90EE90" };
+                let color = if node.dirty_count > 0 {
+                    "#FFB6C1"
+                } else {
+                    "#90EE90"
+                };
                 let label = id.short_hex();
                 svg.push_str(&format!(
                     "  <rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" fill=\"{}\" stroke=\"#333\" rx=\"4\"/>\n",
@@ -1036,8 +1061,16 @@ mod tests {
 
         // Get metrics summary
         let metrics = agg_graph.get_metrics(&a).expect("node should exist");
-        assert!(metrics.contains("compute_ms=100"), "metrics should contain compute time: {}", metrics);
-        assert!(metrics.contains("cached=1"), "metrics should contain cached count: {}", metrics);
+        assert!(
+            metrics.contains("compute_ms=100"),
+            "metrics should contain compute time: {}",
+            metrics
+        );
+        assert!(
+            metrics.contains("cached=1"),
+            "metrics should contain cached count: {}",
+            metrics
+        );
     }
 
     #[test]
@@ -1063,20 +1096,45 @@ mod tests {
         agg_graph.build_from(&dep_graph);
 
         // Verify initial state
-        assert_eq!(agg_graph.subtree_total_count(&a), 3, "a subtree should have 3 tasks");
-        assert_eq!(agg_graph.subtree_total_count(&d), 2, "d subtree should have 2 tasks");
-        assert_eq!(agg_graph.subtree_dirty_count(&d), 0, "d should be clean initially");
+        assert_eq!(
+            agg_graph.subtree_total_count(&a),
+            3,
+            "a subtree should have 3 tasks"
+        );
+        assert_eq!(
+            agg_graph.subtree_total_count(&d),
+            2,
+            "d subtree should have 2 tasks"
+        );
+        assert_eq!(
+            agg_graph.subtree_dirty_count(&d),
+            0,
+            "d should be clean initially"
+        );
 
         // Mark c as dirty — only c, b, a should be affected
         dep_graph.set_status(c, TaskStatus::Dirty);
         agg_graph.incremental_rebuild(&[c], &dep_graph);
 
         // a and b should now have dirty_count > 0
-        assert!(agg_graph.subtree_dirty_count(&a) > 0, "a should have dirty count after incremental rebuild");
-        assert!(agg_graph.subtree_dirty_count(&b) > 0, "b should have dirty count after incremental rebuild");
-        assert!(agg_graph.subtree_dirty_count(&c) > 0, "c should have dirty count");
+        assert!(
+            agg_graph.subtree_dirty_count(&a) > 0,
+            "a should have dirty count after incremental rebuild"
+        );
+        assert!(
+            agg_graph.subtree_dirty_count(&b) > 0,
+            "b should have dirty count after incremental rebuild"
+        );
+        assert!(
+            agg_graph.subtree_dirty_count(&c) > 0,
+            "c should have dirty count"
+        );
         // d should be unaffected
-        assert_eq!(agg_graph.subtree_dirty_count(&d), 0, "d should still be clean (unaffected)");
+        assert_eq!(
+            agg_graph.subtree_dirty_count(&d),
+            0,
+            "d should still be clean (unaffected)"
+        );
     }
 
     #[test]
@@ -1101,10 +1159,21 @@ mod tests {
         agg_graph.incremental_rebuild(&[c], &dep_graph);
 
         // c should now exist in the aggregation graph
-        assert!(agg_graph.get(&c).is_some(), "c should be added by incremental rebuild");
-        assert_eq!(agg_graph.subtree_total_count(&c), 3, "c subtree should have 3 tasks (c + a + b)");
+        assert!(
+            agg_graph.get(&c).is_some(),
+            "c should be added by incremental rebuild"
+        );
+        assert_eq!(
+            agg_graph.subtree_total_count(&c),
+            3,
+            "c subtree should have 3 tasks (c + a + b)"
+        );
         // a should be unaffected (still 2)
-        assert_eq!(agg_graph.subtree_total_count(&a), 2, "a subtree should still have 2 tasks");
+        assert_eq!(
+            agg_graph.subtree_total_count(&a),
+            2,
+            "a subtree should still have 2 tasks"
+        );
     }
 
     #[test]
@@ -1126,8 +1195,14 @@ mod tests {
         assert!(svg.contains("<rect"), "SVG should contain rectangle nodes");
         assert!(svg.contains("<text"), "SVG should contain text labels");
         assert!(svg.contains("<line"), "SVG should contain edges");
-        assert!(svg.contains("total="), "SVG should contain total count metric");
-        assert!(svg.contains("dirty="), "SVG should contain dirty count metric");
+        assert!(
+            svg.contains("total="),
+            "SVG should contain total count metric"
+        );
+        assert!(
+            svg.contains("dirty="),
+            "SVG should contain dirty count metric"
+        );
     }
 
     #[test]
@@ -1144,10 +1219,16 @@ mod tests {
         agg_graph.build_from(&dep_graph);
 
         let html = agg_graph.visualize_html();
-        assert!(html.starts_with("<!DOCTYPE html>"), "HTML should start with DOCTYPE");
+        assert!(
+            html.starts_with("<!DOCTYPE html>"),
+            "HTML should start with DOCTYPE"
+        );
         assert!(html.contains("<svg"), "HTML should contain SVG");
         assert!(html.contains("</html>"), "HTML should end with </html>");
-        assert!(html.contains("Aggregation Graph"), "HTML should contain title");
+        assert!(
+            html.contains("Aggregation Graph"),
+            "HTML should contain title"
+        );
     }
 
     #[test]
@@ -1178,16 +1259,27 @@ mod tests {
         assert!(!agg_graph.is_queried(&d), "d should not be queried");
 
         // a's subtree should have 3 tasks (a + b + c)
-        assert_eq!(agg_graph.subtree_total_count(&a), 3, "a subtree should have 3 tasks");
+        assert_eq!(
+            agg_graph.subtree_total_count(&a),
+            3,
+            "a subtree should have 3 tasks"
+        );
 
         // d should not have an aggregation node
-        assert!(agg_graph.get(&d).is_none(), "d should not have a node (not queried)");
+        assert!(
+            agg_graph.get(&d).is_none(),
+            "d should not have a node (not queried)"
+        );
 
         // Query d — now it should have a node
         let node_d = agg_graph.query_subtree(d, &dep_graph);
         assert!(node_d.is_some(), "Should return node for d after query");
         assert_eq!(agg_graph.queried_count(), 2, "Should have 2 queried tasks");
-        assert_eq!(agg_graph.subtree_total_count(&d), 1, "d subtree should have 1 task");
+        assert_eq!(
+            agg_graph.subtree_total_count(&d),
+            1,
+            "d subtree should have 1 task"
+        );
     }
 
     #[test]
@@ -1210,7 +1302,11 @@ mod tests {
         // Second query for same task — should reuse, not create new
         let node2 = agg_graph.query_subtree(a, &dep_graph).unwrap();
         assert_eq!(node2.total_count, 2, "Reused node should have same count");
-        assert_eq!(agg_graph.queried_count(), 1, "Should still have 1 queried task");
+        assert_eq!(
+            agg_graph.queried_count(),
+            1,
+            "Should still have 1 queried task"
+        );
     }
 
     #[test]
@@ -1231,26 +1327,57 @@ mod tests {
         agg_graph.build_from(&dep_graph);
 
         // Before compaction: 3 nodes
-        assert!(agg_graph.get(&a).is_some(), "a should exist before compaction");
-        assert!(agg_graph.get(&b).is_some(), "b should exist before compaction");
-        assert!(agg_graph.get(&c).is_some(), "c should exist before compaction");
-        assert_eq!(agg_graph.subtree_total_count(&a), 3, "a subtree should have 3 tasks");
+        assert!(
+            agg_graph.get(&a).is_some(),
+            "a should exist before compaction"
+        );
+        assert!(
+            agg_graph.get(&b).is_some(),
+            "b should exist before compaction"
+        );
+        assert!(
+            agg_graph.get(&c).is_some(),
+            "c should exist before compaction"
+        );
+        assert_eq!(
+            agg_graph.subtree_total_count(&a),
+            3,
+            "a subtree should have 3 tasks"
+        );
 
         // Compact a's subtree
         let removed = agg_graph.compact(a, &dep_graph);
         assert_eq!(removed, 2, "Should remove 2 child nodes (b and c)");
 
         // After compaction: only a remains, b and c removed
-        assert!(agg_graph.get(&a).is_some(), "a should still exist after compaction");
-        assert!(agg_graph.get(&b).is_none(), "b should be removed after compaction");
-        assert!(agg_graph.get(&c).is_none(), "c should be removed after compaction");
+        assert!(
+            agg_graph.get(&a).is_some(),
+            "a should still exist after compaction"
+        );
+        assert!(
+            agg_graph.get(&b).is_none(),
+            "b should be removed after compaction"
+        );
+        assert!(
+            agg_graph.get(&c).is_none(),
+            "c should be removed after compaction"
+        );
 
         // a should still have correct aggregated counts
         let node_a = agg_graph.get(&a).unwrap();
-        assert_eq!(node_a.total_count, 3, "Compacted node should preserve total_count");
-        assert_eq!(node_a.dirty_count, 0, "Compacted node should preserve dirty_count");
+        assert_eq!(
+            node_a.total_count, 3,
+            "Compacted node should preserve total_count"
+        );
+        assert_eq!(
+            node_a.dirty_count, 0,
+            "Compacted node should preserve dirty_count"
+        );
         assert!(node_a.compacted, "Node should be marked compacted");
-        assert!(node_a.children.is_empty(), "Compacted node should have no children");
+        assert!(
+            node_a.children.is_empty(),
+            "Compacted node should have no children"
+        );
     }
 
     #[test]
@@ -1269,7 +1396,10 @@ mod tests {
         // Subtree is dirty — compaction should do nothing
         let removed = agg_graph.compact(a, &dep_graph);
         assert_eq!(removed, 0, "Should not compact dirty subtree");
-        assert!(agg_graph.get(&b).is_some(), "b should still exist (not compacted)");
+        assert!(
+            agg_graph.get(&b).is_some(),
+            "b should still exist (not compacted)"
+        );
     }
 
     #[test]
@@ -1293,6 +1423,10 @@ mod tests {
 
         let removed = agg_graph.compact_all(&dep_graph);
         assert_eq!(removed, 2, "Should remove 2 child nodes total (b and d)");
-        assert_eq!(agg_graph.compacted_count(), 2, "Should have 2 compacted root nodes");
+        assert_eq!(
+            agg_graph.compacted_count(),
+            2,
+            "Should have 2 compacted root nodes"
+        );
     }
 }

@@ -174,11 +174,7 @@ impl PledgepackPluginImports for PluginState {
         // resolver, so we return None (not resolved). The plugin should fall
         // back to its own resolution logic. Future: wire this to the engine
         // via a callback channel so the host can delegate resolution.
-        tracing::trace!(
-            "resolve_import called: {} from {}",
-            specifier,
-            importer
-        );
+        tracing::trace!("resolve_import called: {} from {}", specifier, importer);
         None
     }
 }
@@ -190,8 +186,7 @@ fn restricted_wasi_ctx() -> WasiCtx {
     // This matches the sandbox documentation above, which states that
     // stdin/stdout/stderr are discarded. Inheriting stdio would let a
     // plugin pollute the host process's output streams.
-    WasiCtxBuilder::new()
-        .build()
+    WasiCtxBuilder::new().build()
 }
 
 impl WasmPlugin {
@@ -223,8 +218,9 @@ impl WasmPlugin {
             .map_err(|e| anyhow::anyhow!("Failed to read plugin file {}: {}", path.display(), e))?;
 
         // Compile the component (validates against the WIT contract)
-        let component = wasmtime::component::Component::new(engine, &bytes)
-            .map_err(|e| anyhow::anyhow!("Failed to compile WASM component {}: {}", path.display(), e))?;
+        let component = wasmtime::component::Component::new(engine, &bytes).map_err(|e| {
+            anyhow::anyhow!("Failed to compile WASM component {}: {}", path.display(), e)
+        })?;
 
         // Create the store with plugin state
         // The store owns the plugin's memory — this is the sandbox boundary
@@ -236,14 +232,16 @@ impl WasmPlugin {
         // limiter's closure borrows the `StoreLimits` already built into
         // `PluginState::new` — `Store::limiter` requires a reference into
         // existing state, not a value constructed fresh inside the closure).
-        store.set_fuel(DEFAULT_FUEL)
+        store
+            .set_fuel(DEFAULT_FUEL)
             .map_err(|e| anyhow::anyhow!("Failed to set fuel limit: {}", e))?;
         store.limiter(|state| &mut state.limits);
 
         // Create a linker with restricted WASI imports.
         // The plugin gets `wasi:cli/environment` and `wasi:cli/exit` (required
         // by wit-bindgen runtime) but NO filesystem or network access.
-        let mut linker: wasmtime::component::Linker<PluginState> = wasmtime::component::Linker::new(engine);
+        let mut linker: wasmtime::component::Linker<PluginState> =
+            wasmtime::component::Linker::new(engine);
         wasmtime_wasi::add_to_linker_sync(&mut linker)
             .map_err(|e| anyhow::anyhow!("Failed to add WASI to linker: {}", e))?;
 
@@ -258,8 +256,14 @@ impl WasmPlugin {
             .map_err(|e| anyhow::anyhow!("Failed to add host imports to linker: {}", e))?;
 
         // Instantiate the component
-        let instance = PledgepackPlugin::instantiate(&mut store, &component, &linker)
-            .map_err(|e| anyhow::anyhow!("Failed to instantiate WASM component {}: {}", path.display(), e))?;
+        let instance =
+            PledgepackPlugin::instantiate(&mut store, &component, &linker).map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to instantiate WASM component {}: {}",
+                    path.display(),
+                    e
+                )
+            })?;
 
         // Call the plugin-metadata hook to get the plugin's name and capabilities
         let metadata = instance
@@ -410,9 +414,7 @@ impl WasmPlugin {
         }
         self.refill_fuel();
 
-        let input = LoadInput {
-            id: id.to_string(),
-        };
+        let input = LoadInput { id: id.to_string() };
 
         let result = self
             .instance
@@ -471,11 +473,7 @@ impl WasmPlugin {
     }
 
     /// Call the `transform-index-html` hook.
-    pub fn transform_index_html(
-        &mut self,
-        html: &str,
-        path: &str,
-    ) -> Result<Option<HtmlOutput>> {
+    pub fn transform_index_html(&mut self, html: &str, path: &str) -> Result<Option<HtmlOutput>> {
         if !self.has_transform_index_html() {
             return Ok(None);
         }
@@ -753,8 +751,9 @@ impl WasmPluginHost {
         })?;
 
         if let Some(ref verifier) = self.signing_verifier {
-            let wasm_bytes = std::fs::read(path)
-                .map_err(|e| anyhow::anyhow!("Failed to read plugin file {}: {}", path.display(), e))?;
+            let wasm_bytes = std::fs::read(path).map_err(|e| {
+                anyhow::anyhow!("Failed to read plugin file {}: {}", path.display(), e)
+            })?;
             let actual_hash = blake3::hash(&wasm_bytes).to_hex().to_string();
             if actual_hash != sidecar.signature.wasm_hash {
                 anyhow::bail!(
@@ -770,7 +769,11 @@ impl WasmPluginHost {
                     path.display()
                 );
             }
-            info!("Plugin {}: signature verified ({})", path.display(), sidecar.signature.signer_identity);
+            info!(
+                "Plugin {}: signature verified ({})",
+                path.display(),
+                sidecar.signature.signer_identity
+            );
         }
 
         if let Some(ref auditor) = self.capability_auditor
@@ -826,7 +829,9 @@ impl WasmPluginHost {
     /// Check if any loaded plugin has enforce: "post" or default (post).
     /// Item 5: Plugin ordering for WASM plugins.
     pub fn has_post_plugin(&self) -> bool {
-        self.plugins.iter().any(|p| p.has_transform() && p.is_post_plugin())
+        self.plugins
+            .iter()
+            .any(|p| p.has_transform() && p.is_post_plugin())
     }
 
     // ─── Hook Orchestration ───────────────────────────────────────────
@@ -1164,8 +1169,11 @@ impl WasmPluginHostBridge {
     /// Item 5: Plugin ordering for WASM plugins.
     pub fn pre_transform_closure(
         self: Arc<Self>,
-    ) -> Arc<dyn Fn(&str, &str) -> Option<pledgepack_core::task_transform::PluginTransformResult> + Send + Sync>
-    {
+    ) -> Arc<
+        dyn Fn(&str, &str) -> Option<pledgepack_core::task_transform::PluginTransformResult>
+            + Send
+            + Sync,
+    > {
         if !self.has_pre_plugin() {
             return Arc::new(|_code, _id| None);
         }
@@ -1218,8 +1226,11 @@ impl WasmPluginHostBridge {
     /// the result. If no plugins transform the code, returns `None`.
     pub fn transform_closure(
         self: Arc<Self>,
-    ) -> Arc<dyn Fn(&str, &str) -> Option<pledgepack_core::task_transform::PluginTransformResult> + Send + Sync>
-    {
+    ) -> Arc<
+        dyn Fn(&str, &str) -> Option<pledgepack_core::task_transform::PluginTransformResult>
+            + Send
+            + Sync,
+    > {
         Arc::new(move |code: &str, id: &str| {
             let mut host = self.host.lock();
             match host.transform(code, id, None) {
@@ -1261,7 +1272,9 @@ impl WasmPluginHostBridge {
         is_entry: bool,
         kind: Option<&str>,
     ) -> Result<Option<ResolveIdOutput>> {
-        self.host.lock().resolve_id(source, importer, is_entry, kind)
+        self.host
+            .lock()
+            .resolve_id(source, importer, is_entry, kind)
     }
 
     /// Run `load` on all plugins (thread-safe, first non-null wins).
@@ -1271,7 +1284,11 @@ impl WasmPluginHostBridge {
 
     /// G7.4: Check if any loaded plugin has a render-chunk hook.
     pub fn has_render_chunk(&self) -> bool {
-        self.host.lock().plugins().iter().any(|p| p.has_render_chunk())
+        self.host
+            .lock()
+            .plugins()
+            .iter()
+            .any(|p| p.has_render_chunk())
     }
 
     /// G7.4: Run `render-chunk` on all plugins (thread-safe, chain).
@@ -1286,11 +1303,7 @@ impl WasmPluginHostBridge {
 
     /// Run `handle-hot-update` on all plugins (thread-safe, first `Some`
     /// wins). See PRODUCTION-READINESS-100.md goal 43.
-    pub fn handle_hot_update(
-        &self,
-        file: &str,
-        timestamp: u64,
-    ) -> Result<Option<HotUpdateOutput>> {
+    pub fn handle_hot_update(&self, file: &str, timestamp: u64) -> Result<Option<HotUpdateOutput>> {
         self.host.lock().handle_hot_update(file, timestamp)
     }
 }
@@ -1325,7 +1338,9 @@ impl WasmPluginHost {
     pub fn compose_plugins(&self, steps: &[CompositionStep]) -> Result<CompositionPlan> {
         let mut sorted_steps = steps.to_vec();
         sorted_steps.sort_by_key(|s| s.order);
-        Ok(CompositionPlan { steps: sorted_steps })
+        Ok(CompositionPlan {
+            steps: sorted_steps,
+        })
     }
 }
 
@@ -1492,7 +1507,10 @@ impl PluginInstancePool {
         self.active
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let instance = self.available.lock().pop();
-        PoolSlot { pool: self, instance }
+        PoolSlot {
+            pool: self,
+            instance,
+        }
     }
 
     /// Release an instance back to the pool's cache (without going through a
@@ -1671,13 +1689,7 @@ impl PluginCommunicationChannel {
     }
 
     /// Send a message from one plugin to another.
-    pub fn send(
-        &self,
-        from: &str,
-        to: &str,
-        message_type: &str,
-        payload: &[u8],
-    ) {
+    pub fn send(&self, from: &str, to: &str, message_type: &str, payload: &[u8]) {
         let msg = PluginMessage {
             from_plugin: from.to_string(),
             to_plugin: to.to_string(),
@@ -1715,11 +1727,7 @@ impl PluginCompiler {
     }
 
     /// Get the compile command for a given language.
-    pub fn compile_command(
-        lang: &str,
-        source: &str,
-        output: &str,
-    ) -> Result<Vec<String>> {
+    pub fn compile_command(lang: &str, source: &str, output: &str) -> Result<Vec<String>> {
         match lang {
             "rust" => Ok(vec![
                 "cargo".to_string(),
@@ -1894,9 +1902,15 @@ mod tests {
         // parity — verify the matrix actually says so, rather than trusting
         // the doc comment.
         let matrix = hook_support_matrix();
-        assert_eq!(matrix.len(), pledgepack_core::plugin_system::PLUGIN_HOOK_NAMES.len());
+        assert_eq!(
+            matrix.len(),
+            pledgepack_core::plugin_system::PLUGIN_HOOK_NAMES.len()
+        );
         for (hook, supported) in &matrix {
-            assert!(*supported, "wasm-plugin-host claims to support hook '{hook}' but host_supports_hook() says no");
+            assert!(
+                *supported,
+                "wasm-plugin-host claims to support hook '{hook}' but host_supports_hook() says no"
+            );
         }
     }
 
@@ -1931,7 +1945,10 @@ mod tests {
 
         fn write_plugin_file(dir: &std::path::Path, content: &[u8]) -> std::path::PathBuf {
             let path = dir.join("plugin.wasm");
-            std::fs::File::create(&path).unwrap().write_all(content).unwrap();
+            std::fs::File::create(&path)
+                .unwrap()
+                .write_all(content)
+                .unwrap();
             path
         }
 
@@ -1999,7 +2016,9 @@ mod tests {
 
             let mut verifier = PluginSigningVerifier::new();
             verifier.trust_key("@pledgelabs", &hex::encode(verifying_key.to_bytes()));
-            let host = WasmPluginHost::new().unwrap().with_signing_verifier(verifier);
+            let host = WasmPluginHost::new()
+                .unwrap()
+                .with_signing_verifier(verifier);
             host.check_plugin_trust(&plugin_path).unwrap();
         }
 
@@ -2068,7 +2087,9 @@ mod tests {
     #[test]
     fn empty_host_transform_index_html_returns_input_unchanged() {
         let mut host = WasmPluginHost::new().unwrap();
-        let (html, tags) = host.transform_index_html("<html></html>", "index.html").unwrap();
+        let (html, tags) = host
+            .transform_index_html("<html></html>", "index.html")
+            .unwrap();
         assert_eq!(html, "<html></html>");
         assert!(tags.is_empty());
     }
@@ -2264,7 +2285,12 @@ mod tests {
     #[test]
     fn g7_14_plugin_communication_channel() {
         let mut channel = PluginCommunicationChannel::new();
-        channel.send("@pledge/css-modules", "@pledge/minify", "transform_done", b"result_data");
+        channel.send(
+            "@pledge/css-modules",
+            "@pledge/minify",
+            "transform_done",
+            b"result_data",
+        );
         let messages = channel.recv("@pledge/minify");
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].from_plugin, "@pledge/css-modules");

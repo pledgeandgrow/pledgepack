@@ -133,10 +133,7 @@ pub fn analyze_build(engine: &BuildEngine) -> Result<BundleAnalysis> {
             _ => "unknown",
         };
 
-        let deps = cached
-            .as_ref()
-            .map(|c| c.deps.clone())
-            .unwrap_or_default();
+        let deps = cached.as_ref().map(|c| c.deps.clone()).unwrap_or_default();
 
         let is_css = cached.as_ref().map(|c| c.is_css).unwrap_or(false);
         let is_worker = cached.as_ref().map(|c| c.is_worker).unwrap_or(false);

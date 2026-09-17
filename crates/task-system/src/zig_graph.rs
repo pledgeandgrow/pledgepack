@@ -99,7 +99,8 @@ impl ZigTaskGraph {
     pub fn add_edge(&self, parent: TaskId, child: TaskId) {
         self.add_task(parent);
         self.add_task(child);
-        self.handle.add_dependency(parent.as_bytes(), child.as_bytes());
+        self.handle
+            .add_dependency(parent.as_bytes(), child.as_bytes());
     }
 
     /// Add multiple dependency edges at once.
@@ -124,7 +125,8 @@ impl ZigTaskGraph {
 
     /// Set the status of a task.
     pub fn set_status(&self, id: TaskId, status: crate::graph::TaskStatus) {
-        self.handle.set_status(id.as_bytes(), ZigTaskStatus::from(status) as u8);
+        self.handle
+            .set_status(id.as_bytes(), ZigTaskStatus::from(status) as u8);
     }
 
     /// Get the status of a task.
@@ -151,7 +153,9 @@ impl ZigTaskGraph {
         // Use a large buffer; the Zig side will fill up to this capacity.
         // TODO: Query required size from Zig side for dynamic allocation.
         const MAX_INVALIDATION: usize = 65536;
-        let ids = self.handle.get_invalidation_set(id.as_bytes(), MAX_INVALIDATION);
+        let ids = self
+            .handle
+            .get_invalidation_set(id.as_bytes(), MAX_INVALIDATION);
         ids.into_iter().map(TaskId::from_bytes).collect()
     }
 

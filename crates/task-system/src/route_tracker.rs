@@ -110,16 +110,16 @@ impl RouteTracker {
         let mut routes = self.routes.write().await;
         let mut module_map = self.module_to_routes.write().await;
 
-        let entry = routes.entry(route_path.to_string()).or_insert_with(|| {
-            RouteEntry {
+        let entry = routes
+            .entry(route_path.to_string())
+            .or_insert_with(|| RouteEntry {
                 path: route_path.to_string(),
                 modules: HashSet::new(),
                 last_accessed: now,
                 is_active: false,
                 is_prefetched: false,
                 visit_count: 0,
-            }
-        });
+            });
 
         entry.last_accessed = now;
         entry.modules.insert(module_path.to_string());
@@ -145,16 +145,16 @@ impl RouteTracker {
         let now = current_millis();
         let mut routes = self.routes.write().await;
 
-        let entry = routes.entry(route_path.to_string()).or_insert_with(|| {
-            RouteEntry {
+        let entry = routes
+            .entry(route_path.to_string())
+            .or_insert_with(|| RouteEntry {
                 path: route_path.to_string(),
                 modules: HashSet::new(),
                 last_accessed: now,
                 is_active: true,
                 is_prefetched: false,
                 visit_count: 0,
-            }
-        });
+            });
 
         entry.is_active = true;
         entry.last_accessed = now;
@@ -169,7 +169,10 @@ impl RouteTracker {
             }
         }
 
-        info!("Route '{}' marked active (visits: {})", route_path, entry.visit_count);
+        info!(
+            "Route '{}' marked active (visits: {})",
+            route_path, entry.visit_count
+        );
     }
 
     /// Mark a route as inactive (user navigated away).
@@ -189,16 +192,16 @@ impl RouteTracker {
         let now = current_millis();
         let mut routes = self.routes.write().await;
 
-        let entry = routes.entry(route_path.to_string()).or_insert_with(|| {
-            RouteEntry {
+        let entry = routes
+            .entry(route_path.to_string())
+            .or_insert_with(|| RouteEntry {
                 path: route_path.to_string(),
                 modules: HashSet::new(),
                 last_accessed: now,
                 is_active: false,
                 is_prefetched: true,
                 visit_count: 0,
-            }
-        });
+            });
 
         entry.is_prefetched = true;
         entry.last_accessed = now;
@@ -232,7 +235,11 @@ impl RouteTracker {
 
     /// Get all modules for a route.
     pub async fn modules_for_route(&self, route_path: &str) -> Option<HashSet<String>> {
-        self.routes.read().await.get(route_path).map(|e| e.modules.clone())
+        self.routes
+            .read()
+            .await
+            .get(route_path)
+            .map(|e| e.modules.clone())
     }
 
     /// Get all active routes.
@@ -306,8 +313,7 @@ impl RouteTracker {
         let mut evicted = Vec::new();
 
         // Check if we need to evict
-        if routes.len() <= self.config.max_routes
-            && total_modules <= self.config.max_total_modules
+        if routes.len() <= self.config.max_routes && total_modules <= self.config.max_total_modules
         {
             return evicted;
         }
@@ -366,7 +372,12 @@ impl RouteTracker {
 
     /// Get the total number of tracked modules across all routes.
     pub async fn total_modules(&self) -> usize {
-        self.routes.read().await.values().map(|e| e.modules.len()).sum()
+        self.routes
+            .read()
+            .await
+            .values()
+            .map(|e| e.modules.len())
+            .sum()
     }
 
     /// G6.10: Get the number of modules shared across multiple routes.
@@ -465,7 +476,9 @@ mod tests {
         let tracker = RouteTracker::with_defaults();
 
         tracker.record_module("/blog", "/src/pages/blog.tsx").await;
-        tracker.record_module("/blog", "/src/components/Post.tsx").await;
+        tracker
+            .record_module("/blog", "/src/components/Post.tsx")
+            .await;
 
         assert_eq!(
             tracker.route_for_module("/src/pages/blog.tsx").await,
@@ -600,9 +613,21 @@ mod tests {
         tracker.record_module("/about", "/src/shared.tsx").await;
 
         // shared.tsx is used by both routes
-        assert_eq!(tracker.shared_modules_count().await, 1, "Should have 1 shared module");
-        assert_eq!(tracker.unique_modules_count().await, 3, "Should have 3 unique modules");
-        assert_eq!(tracker.total_modules().await, 4, "Should have 4 total module references");
+        assert_eq!(
+            tracker.shared_modules_count().await,
+            1,
+            "Should have 1 shared module"
+        );
+        assert_eq!(
+            tracker.unique_modules_count().await,
+            3,
+            "Should have 3 unique modules"
+        );
+        assert_eq!(
+            tracker.total_modules().await,
+            4,
+            "Should have 4 total module references"
+        );
 
         let routes = tracker.routes_for_module("/src/shared.tsx").await;
         assert_eq!(routes.len(), 2, "shared.tsx should be in 2 routes");
@@ -637,18 +662,29 @@ mod tests {
         // One inactive route should be evicted (not /keep which is active)
         assert!(!evicted.is_empty(), "Should evict at least one route");
         for (route, _) in &evicted {
-            assert_ne!(route.as_str(), "/keep", "Active route should not be evicted");
+            assert_ne!(
+                route.as_str(),
+                "/keep",
+                "Active route should not be evicted"
+            );
         }
 
         // /src/shared.tsx should NOT be fully evicted — it's still used by /keep
         let routes_for_shared = tracker.routes_for_module("/src/shared.tsx").await;
-        assert!(routes_for_shared.contains("/keep"), "shared.tsx should still be tracked for /keep");
+        assert!(
+            routes_for_shared.contains("/keep"),
+            "shared.tsx should still be tracked for /keep"
+        );
 
         // The evicted route's exclusive module should be fully removed
         for (_, exclusive_modules) in &evicted {
             for module in exclusive_modules {
                 let routes = tracker.routes_for_module(module).await;
-                assert!(routes.is_empty(), "Exclusive module {} should be fully evicted", module);
+                assert!(
+                    routes.is_empty(),
+                    "Exclusive module {} should be fully evicted",
+                    module
+                );
             }
         }
     }

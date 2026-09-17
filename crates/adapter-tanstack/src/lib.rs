@@ -216,21 +216,39 @@ mod tests {
     #[test]
     fn discovers_index_and_static_routes() {
         let tmp = tempfile::tempdir().unwrap();
-        write_route(tmp.path(), "src/routes/index.tsx", "export default () => null;");
-        write_route(tmp.path(), "src/routes/about.tsx", "export default () => null;");
+        write_route(
+            tmp.path(),
+            "src/routes/index.tsx",
+            "export default () => null;",
+        );
+        write_route(
+            tmp.path(),
+            "src/routes/about.tsx",
+            "export default () => null;",
+        );
 
         let mut adapter = TanStackAdapter::new(tmp.path());
         adapter.discover_routes().unwrap();
 
         let paths: Vec<&str> = adapter.routes.iter().map(|r| r.path.as_str()).collect();
-        assert!(paths.contains(&"/"), "expected index route '/', got {paths:?}");
-        assert!(paths.contains(&"/about"), "expected '/about' route, got {paths:?}");
+        assert!(
+            paths.contains(&"/"),
+            "expected index route '/', got {paths:?}"
+        );
+        assert!(
+            paths.contains(&"/about"),
+            "expected '/about' route, got {paths:?}"
+        );
     }
 
     #[test]
     fn discovers_dynamic_param_routes() {
         let tmp = tempfile::tempdir().unwrap();
-        write_route(tmp.path(), "src/routes/posts/$id.tsx", "export default () => null;");
+        write_route(
+            tmp.path(),
+            "src/routes/posts/$id.tsx",
+            "export default () => null;",
+        );
 
         let mut adapter = TanStackAdapter::new(tmp.path());
         adapter.discover_routes().unwrap();
@@ -247,20 +265,39 @@ mod tests {
     #[test]
     fn discovers_root_and_nested_layout_routes() {
         let tmp = tempfile::tempdir().unwrap();
-        write_route(tmp.path(), "src/routes/__root.tsx", "export default () => null;");
-        write_route(tmp.path(), "src/routes/dashboard/layout.tsx", "export default () => null;");
-        write_route(tmp.path(), "src/routes/dashboard/index.tsx", "export default () => null;");
+        write_route(
+            tmp.path(),
+            "src/routes/__root.tsx",
+            "export default () => null;",
+        );
+        write_route(
+            tmp.path(),
+            "src/routes/dashboard/layout.tsx",
+            "export default () => null;",
+        );
+        write_route(
+            tmp.path(),
+            "src/routes/dashboard/index.tsx",
+            "export default () => null;",
+        );
 
         let mut adapter = TanStackAdapter::new(tmp.path());
         adapter.discover_routes().unwrap();
 
-        let root = adapter.routes.iter().find(|r| r.file.ends_with("__root.tsx")).unwrap();
+        let root = adapter
+            .routes
+            .iter()
+            .find(|r| r.file.ends_with("__root.tsx"))
+            .unwrap();
         assert!(root.is_layout);
 
         let layout = adapter
             .routes
             .iter()
-            .find(|r| r.file.ends_with("dashboard/layout.tsx") || r.file.ends_with("dashboard\\layout.tsx"))
+            .find(|r| {
+                r.file.ends_with("dashboard/layout.tsx")
+                    || r.file.ends_with("dashboard\\layout.tsx")
+            })
             .unwrap();
         assert!(layout.is_layout);
 
@@ -284,8 +321,16 @@ mod tests {
     #[test]
     fn route_tree_codegen_includes_every_discovered_route() {
         let tmp = tempfile::tempdir().unwrap();
-        write_route(tmp.path(), "src/routes/index.tsx", "export default () => null;");
-        write_route(tmp.path(), "src/routes/about.tsx", "export default () => null;");
+        write_route(
+            tmp.path(),
+            "src/routes/index.tsx",
+            "export default () => null;",
+        );
+        write_route(
+            tmp.path(),
+            "src/routes/about.tsx",
+            "export default () => null;",
+        );
 
         let mut adapter = TanStackAdapter::new(tmp.path());
         adapter.discover_routes().unwrap();
@@ -305,13 +350,18 @@ mod tests {
     #[test]
     fn route_manifest_is_valid_json_matching_discovered_routes() {
         let tmp = tempfile::tempdir().unwrap();
-        write_route(tmp.path(), "src/routes/posts/$id.tsx", "export default () => null;");
+        write_route(
+            tmp.path(),
+            "src/routes/posts/$id.tsx",
+            "export default () => null;",
+        );
 
         let mut adapter = TanStackAdapter::new(tmp.path());
         adapter.discover_routes().unwrap();
         let manifest = adapter.generate_route_manifest();
 
-        let parsed: serde_json::Value = serde_json::from_str(&manifest).expect("manifest must be valid JSON");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&manifest).expect("manifest must be valid JSON");
         let arr = parsed.as_array().expect("manifest must be a JSON array");
         assert_eq!(arr.len(), adapter.routes.len());
         assert_eq!(arr[0]["path"], "/posts/:id");

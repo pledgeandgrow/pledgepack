@@ -1264,9 +1264,8 @@ async fn main() -> Result<()> {
 
             // SPA fallback: serve index.html for any route that doesn't match a static file
             let index_path = out_dir.join("index.html");
-            let serve_dir =
-                tower_http::services::ServeDir::new(&out_dir)
-                    .fallback(tower_http::services::ServeFile::new(index_path));
+            let serve_dir = tower_http::services::ServeDir::new(&out_dir)
+                .fallback(tower_http::services::ServeFile::new(index_path));
             let app = axum::Router::new().fallback_service(serve_dir);
 
             let addr = format!("127.0.0.1:{}", port);
@@ -1473,8 +1472,9 @@ async fn main() -> Result<()> {
                 // Re-inject framework dependencies (cache may have stale package.json)
                 let deps = framework_deps(&template);
                 let pkg_path = project_dir.join("package.json");
-                let mut pkg: serde_json::Value =
-                    serde_json::from_str(&std::fs::read_to_string(&pkg_path).unwrap_or_else(|_| "{}".to_string()))?;
+                let mut pkg: serde_json::Value = serde_json::from_str(
+                    &std::fs::read_to_string(&pkg_path).unwrap_or_else(|_| "{}".to_string()),
+                )?;
                 if let Some(obj) = pkg.as_object_mut() {
                     obj.insert("dependencies".to_string(), deps);
                 }
@@ -2400,7 +2400,10 @@ export default defineConfig({
                         println!("\r  \x1b[32m✓\x1b[0m Dependencies installed ({})    ", pm);
                     }
                     _ => {
-                        eprintln!("\r  \x1b[33m⚠\x1b[0m Auto-install failed — run `{}` manually    ", install_cmd);
+                        eprintln!(
+                            "\r  \x1b[33m⚠\x1b[0m Auto-install failed — run `{}` manually    ",
+                            install_cmd
+                        );
                     }
                 }
             }
@@ -2830,9 +2833,8 @@ export default defineConfig({
 
             // SPA fallback: serve index.html for any route that doesn't match a static file
             let index_path = out_dir.join("index.html");
-            let serve_dir =
-                tower_http::services::ServeDir::new(&out_dir)
-                    .fallback(tower_http::services::ServeFile::new(index_path));
+            let serve_dir = tower_http::services::ServeDir::new(&out_dir)
+                .fallback(tower_http::services::ServeFile::new(index_path));
             let app = axum::Router::new().fallback_service(serve_dir);
 
             let addr = format!("127.0.0.1:{}", port);
@@ -3231,9 +3233,7 @@ export default defineConfig({
                                 total_skipped = 0;
                                 for test_file in &test_files {
                                     let rel = pledgepack_core::normalize_path(
-                                        test_file
-                                            .strip_prefix(&config.root)
-                                            .unwrap_or(test_file),
+                                        test_file.strip_prefix(&config.root).unwrap_or(test_file),
                                     );
                                     let summary = match pledgepack_js_plugin_host::test_runner::run_test_file_with_config(
                                             test_file,
@@ -3663,11 +3663,7 @@ export default defineConfig({
                 if output.status.success() {
                     println!("  \x1b[90mUpdating via npm...\x1b[0m");
                     let status = std::process::Command::new("npm")
-                        .args([
-                            "install",
-                            "-g",
-                            &format!("pledgepack@{}", target_version),
-                        ])
+                        .args(["install", "-g", &format!("pledgepack@{}", target_version)])
                         .status();
                     if status.map(|s| s.success()).unwrap_or(false) {
                         println!(
@@ -3897,7 +3893,10 @@ mod tests {
     fn global_root_and_config_flags_are_optional_and_apply_to_subcommands() {
         let cli = parse(&["--root", "/tmp/proj", "--config", "custom.json", "doctor"]).unwrap();
         assert_eq!(cli.root.as_deref().map(|p| p.as_str()), Some("/tmp/proj"));
-        assert_eq!(cli.config.as_deref().map(|p| p.as_str()), Some("custom.json"));
+        assert_eq!(
+            cli.config.as_deref().map(|p| p.as_str()),
+            Some("custom.json")
+        );
         assert!(matches!(cli.command, Commands::Doctor));
     }
 
@@ -3927,7 +3926,13 @@ mod tests {
     fn dev_defaults_when_no_flags_given() {
         let cli = parse(&["dev"]).unwrap();
         match cli.command {
-            Commands::Dev { port, host, open, https, socket } => {
+            Commands::Dev {
+                port,
+                host,
+                open,
+                https,
+                socket,
+            } => {
                 assert_eq!(port, None);
                 assert_eq!(host, None);
                 assert!(!open);
@@ -3940,9 +3945,18 @@ mod tests {
 
     #[test]
     fn dev_parses_short_and_long_flags() {
-        let cli = parse(&["dev", "-p", "4000", "--host", "0.0.0.0", "--open", "--https"]).unwrap();
+        let cli = parse(&[
+            "dev", "-p", "4000", "--host", "0.0.0.0", "--open", "--https",
+        ])
+        .unwrap();
         match cli.command {
-            Commands::Dev { port, host, open, https, .. } => {
+            Commands::Dev {
+                port,
+                host,
+                open,
+                https,
+                ..
+            } => {
                 assert_eq!(port, Some(4000));
                 assert_eq!(host.as_deref(), Some("0.0.0.0"));
                 assert!(open);
@@ -3964,7 +3978,16 @@ mod tests {
     fn build_boolean_flags_default_false() {
         let cli = parse(&["build"]).unwrap();
         match cli.command {
-            Commands::Build { no_sourcemap, profile, watch, verify, type_check, check_budgets, codegen, .. } => {
+            Commands::Build {
+                no_sourcemap,
+                profile,
+                watch,
+                verify,
+                type_check,
+                check_budgets,
+                codegen,
+                ..
+            } => {
                 assert!(!no_sourcemap);
                 assert!(!profile);
                 assert!(!watch);
@@ -3980,11 +4003,25 @@ mod tests {
     #[test]
     fn build_accepts_out_dir_and_env_and_multiple_flags_together() {
         let cli = parse(&[
-            "build", "--out-dir", "dist", "--env", "staging", "--watch", "--verify", "--type-check",
+            "build",
+            "--out-dir",
+            "dist",
+            "--env",
+            "staging",
+            "--watch",
+            "--verify",
+            "--type-check",
         ])
         .unwrap();
         match cli.command {
-            Commands::Build { out_dir, env, watch, verify, type_check, .. } => {
+            Commands::Build {
+                out_dir,
+                env,
+                watch,
+                verify,
+                type_check,
+                ..
+            } => {
                 assert_eq!(out_dir.as_deref().map(|p| p.as_str()), Some("dist"));
                 assert_eq!(env.as_deref(), Some("staging"));
                 assert!(watch);
@@ -4001,7 +4038,11 @@ mod tests {
     fn create_with_no_args_leaves_template_and_name_unset() {
         let cli = parse(&["create"]).unwrap();
         match cli.command {
-            Commands::Create { template, name, flash } => {
+            Commands::Create {
+                template,
+                name,
+                flash,
+            } => {
                 assert_eq!(template, None);
                 assert_eq!(name, None);
                 assert!(!flash);
@@ -4014,7 +4055,11 @@ mod tests {
     fn create_positional_args_map_to_template_then_name() {
         let cli = parse(&["create", "react", "my-app", "--flash"]).unwrap();
         match cli.command {
-            Commands::Create { template, name, flash } => {
+            Commands::Create {
+                template,
+                name,
+                flash,
+            } => {
                 assert_eq!(template.as_deref(), Some("react"));
                 assert_eq!(name.as_deref(), Some("my-app"));
                 assert!(flash);
@@ -4100,8 +4145,14 @@ mod tests {
 
     #[test]
     fn parameterless_subcommands_parse() {
-        assert!(matches!(parse(&["doctor"]).unwrap().command, Commands::Doctor));
-        assert!(matches!(parse(&["config"]).unwrap().command, Commands::Config));
+        assert!(matches!(
+            parse(&["doctor"]).unwrap().command,
+            Commands::Doctor
+        ));
+        assert!(matches!(
+            parse(&["config"]).unwrap().command,
+            Commands::Config
+        ));
         assert!(matches!(
             parse(&["generate-env-types"]).unwrap().command,
             Commands::GenerateEnvTypes
@@ -4113,13 +4164,22 @@ mod tests {
     #[test]
     fn framework_deps_maps_known_templates_to_their_packages() {
         assert_eq!(framework_deps("react")["react"], template_versions::REACT);
-        assert_eq!(framework_deps("solid")["solid-js"], template_versions::SOLID);
+        assert_eq!(
+            framework_deps("solid")["solid-js"],
+            template_versions::SOLID
+        );
         assert_eq!(framework_deps("vue")["vue"], template_versions::VUE);
-        assert_eq!(framework_deps("svelte")["svelte"], template_versions::SVELTE);
+        assert_eq!(
+            framework_deps("svelte")["svelte"],
+            template_versions::SVELTE
+        );
         // "pledge", "next", and "tanstack" all use the React runtime.
         assert_eq!(framework_deps("pledge")["react"], template_versions::REACT);
         assert_eq!(framework_deps("next")["react"], template_versions::REACT);
-        assert_eq!(framework_deps("tanstack")["react"], template_versions::REACT);
+        assert_eq!(
+            framework_deps("tanstack")["react"],
+            template_versions::REACT
+        );
     }
 
     #[test]
@@ -4135,7 +4195,10 @@ mod tests {
         assert_eq!(tailwind["postcss"], template_versions::POSTCSS);
         assert_eq!(tailwind["autoprefixer"], template_versions::AUTOPREFIXER);
 
-        assert_eq!(css_framework_dev_deps("unocss")["unocss"], template_versions::UNOCSS);
+        assert_eq!(
+            css_framework_dev_deps("unocss")["unocss"],
+            template_versions::UNOCSS
+        );
         assert_eq!(
             css_framework_dev_deps("panda-css")["@pandacss/dev"],
             template_versions::PANDA_CSS

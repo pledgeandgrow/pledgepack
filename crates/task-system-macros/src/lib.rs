@@ -37,7 +37,7 @@
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::{format_ident, quote};
-use syn::{parse_macro_input, FnArg, ItemFn, Pat, ReturnType, Type};
+use syn::{FnArg, ItemFn, Pat, ReturnType, Type, parse_macro_input};
 
 /// The #[task] attribute macro.
 ///
@@ -122,7 +122,12 @@ fn parse_duration_str(s: &str) -> Option<u64> {
     if s.is_empty() {
         return None;
     }
-    let (num_part, unit) = if s.chars().last().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+    let (num_part, unit) = if s
+        .chars()
+        .last()
+        .map(|c| c.is_ascii_digit())
+        .unwrap_or(false)
+    {
         // Pure number — seconds
         return s.parse().ok();
     } else {
@@ -154,7 +159,12 @@ const fn fnv1a_64(s: &str) -> u64 {
     hash
 }
 
-fn expand_task(mut input_fn: ItemFn, cacheable: bool, ttl_secs: Option<u64>, parallel: bool) -> syn::Result<TokenStream2> {
+fn expand_task(
+    mut input_fn: ItemFn,
+    cacheable: bool,
+    ttl_secs: Option<u64>,
+    parallel: bool,
+) -> syn::Result<TokenStream2> {
     // 1. Extract function metadata (clone to avoid borrow conflicts)
     let fn_name = input_fn.sig.ident.clone();
     let fn_name_str = fn_name.to_string();
@@ -169,7 +179,11 @@ fn expand_task(mut input_fn: ItemFn, cacheable: bool, ttl_secs: Option<u64>, par
 
     // G2.16: Check for self/Receiver arguments — now supported via trait method tasks.
     // We detect `&self` or `&mut self` and handle them specially.
-    let has_self = input_fn.sig.inputs.iter().any(|arg| matches!(arg, FnArg::Receiver(_)));
+    let has_self = input_fn
+        .sig
+        .inputs
+        .iter()
+        .any(|arg| matches!(arg, FnArg::Receiver(_)));
 
     // G2.7: Check for missing return type.
     if matches!(input_fn.sig.output, ReturnType::Default) {
@@ -273,8 +287,8 @@ fn expand_task(mut input_fn: ItemFn, cacheable: bool, ttl_secs: Option<u64>, par
     } else {
         return_type_str.clone()
     };
-    let output_type_tokens: Type = syn::parse_str(&output_type_str)
-        .unwrap_or_else(|_| syn::parse_str("()").unwrap());
+    let output_type_tokens: Type =
+        syn::parse_str(&output_type_str).unwrap_or_else(|_| syn::parse_str("()").unwrap());
 
     // G2.14: Generate a const for the Zig-accelerated hashing hot path.
     // The proc macro generates a flag indicating that this task uses
@@ -286,9 +300,11 @@ fn expand_task(mut input_fn: ItemFn, cacheable: bool, ttl_secs: Option<u64>, par
     // G2.15: Include generic params in the function ID string for content-addressing.
     // Different instantiations of a generic task get different task IDs.
     let fn_id_with_generics = if has_generics {
-        let generic_str: String = generic_params.iter().map(|p| {
-            type_to_string_generic(p)
-        }).collect::<Vec<_>>().join(",");
+        let generic_str: String = generic_params
+            .iter()
+            .map(|p| type_to_string_generic(p))
+            .collect::<Vec<_>>()
+            .join(",");
         format!("{}<{}>", fn_name_str, generic_str)
     } else {
         fn_name_str.clone()
@@ -315,8 +331,8 @@ fn expand_task(mut input_fn: ItemFn, cacheable: bool, ttl_secs: Option<u64>, par
 
     // Rewrite the return type: Task<T> → T, or keep as-is if not Task<T>
     if return_type_normalized.starts_with("Task<") {
-        let inner_type: Type = syn::parse_str(&output_type_str)
-            .unwrap_or_else(|_| syn::parse_str("()").unwrap());
+        let inner_type: Type =
+            syn::parse_str(&output_type_str).unwrap_or_else(|_| syn::parse_str("()").unwrap());
         input_fn.sig.output = ReturnType::Type(
             syn::Token![->](proc_macro2::Span::call_site()),
             Box::new(inner_type),

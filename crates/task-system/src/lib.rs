@@ -62,30 +62,41 @@
 #![warn(missing_docs)]
 #![warn(clippy::all)]
 
-pub mod task;
 pub mod backend;
-pub mod graph;
-pub mod registry;
 pub mod engine;
-#[cfg(feature = "zig-graph")]
-pub mod zig_graph;
 pub mod environment;
+pub mod graph;
 pub mod read_tracker;
+pub mod registry;
 pub mod route_tracker;
+pub mod task;
 #[cfg(feature = "task-trace")]
 pub mod task_trace;
+#[cfg(feature = "zig-graph")]
+pub mod zig_graph;
 
 // Re-export the most commonly used types at the crate root.
-pub use task::{Task, TaskId, AnyTask, TaskInput, compute_task_id, compute_task_id_compact, TaskDebug, TaskEffect, NoEffect, HasEffect, TaskVersion, V1, V2, TaskVerify};
-pub use backend::{TaskBackend, MemoryBackend, DiskBackend, StoredOutput};
-pub use graph::{DependencyGraph, AggregationGraph, AggregationNode, TaskStatus};
-pub use registry::{TaskRegistry, TaskExecutor};
-pub use engine::{TaskEngine, TaskEngineBuilder, TaskError, TaskEngineStats, ActiveQuery, SchedulerTrace};
+pub use backend::{DiskBackend, MemoryBackend, StoredOutput, TaskBackend};
+pub use engine::{
+    ActiveQuery, SchedulerTrace, TaskEngine, TaskEngineBuilder, TaskEngineStats, TaskError,
+};
+pub use environment::{
+    Environment, EnvironmentPlugin, EnvironmentPluginRegistry, current_environment,
+    run_with_environment,
+};
+pub use graph::{AggregationGraph, AggregationNode, DependencyGraph, TaskStatus};
+pub use read_tracker::{
+    ReadTracker, collect_tracker, install_tracker, is_tracking, read as tracked_read,
+    read_to_string as tracked_read_to_string, record_read,
+};
+pub use registry::{TaskExecutor, TaskRegistry};
+pub use route_tracker::{RouteEntry, RouteTracker, RouteTrackerConfig};
+pub use task::{
+    AnyTask, HasEffect, NoEffect, Task, TaskDebug, TaskEffect, TaskId, TaskInput, TaskVerify,
+    TaskVersion, V1, V2, compute_task_id, compute_task_id_compact,
+};
 #[cfg(feature = "zig-graph")]
 pub use zig_graph::{ZigTaskGraph, ZigTaskStatus};
-pub use environment::{Environment, current_environment, run_with_environment, EnvironmentPlugin, EnvironmentPluginRegistry};
-pub use read_tracker::{ReadTracker, record_read, read_to_string as tracked_read_to_string, read as tracked_read, is_tracking, install_tracker, collect_tracker};
-pub use route_tracker::{RouteTracker, RouteEntry, RouteTrackerConfig};
 
 // Re-export the proc macro.
 pub use pledgepack_task_system_macros::task;

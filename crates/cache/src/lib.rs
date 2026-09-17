@@ -149,7 +149,11 @@ impl FunctionCache {
                 tracing::debug!("Failed to remove cache dir {:?}: {}", self.cache_dir, e);
             }
             if let Err(e) = std::fs::create_dir_all(&self.cache_dir) {
-                tracing::warn!("Failed to recreate cache directory {:?}: {}", self.cache_dir, e);
+                tracing::warn!(
+                    "Failed to recreate cache directory {:?}: {}",
+                    self.cache_dir,
+                    e
+                );
             }
         }
     }
@@ -211,9 +215,13 @@ pub struct CacheStats {
 }
 
 /// Helper to compute a cache key
-pub fn make_key(content_hash: u64, function_id: &str, params: &(impl serde::Serialize + std::fmt::Debug)) -> CacheKey {
-    let params_bytes =
-        bincode::serde::encode_to_vec(params, bincode::config::standard()).unwrap_or_else(|e| {
+pub fn make_key(
+    content_hash: u64,
+    function_id: &str,
+    params: &(impl serde::Serialize + std::fmt::Debug),
+) -> CacheKey {
+    let params_bytes = bincode::serde::encode_to_vec(params, bincode::config::standard())
+        .unwrap_or_else(|e| {
             tracing::warn!("Failed to serialize cache params: {}", e);
             // Use debug representation as fallback to avoid hash collision
             format!("{:?}", params).into_bytes()

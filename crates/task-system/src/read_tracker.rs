@@ -53,7 +53,9 @@ impl ReadTracker {
             let abs = if path.as_ref().is_absolute() {
                 path.as_ref().to_path_buf()
             } else {
-                std::env::current_dir().unwrap_or_default().join(path.as_ref())
+                std::env::current_dir()
+                    .unwrap_or_default()
+                    .join(path.as_ref())
             };
             // Canonicalize to handle symlinks and relative paths consistently.
             // Falls back to the non-canonical absolute path if canonicalization
@@ -150,7 +152,8 @@ pub fn install_tracker() {
 /// Returns the tracker with all recorded file reads. If no tracker was
 /// installed, returns an empty tracker.
 pub fn collect_tracker() -> ReadTracker {
-    CURRENT_READ_TRACKER.with(|cell| cell.borrow_mut().take())
+    CURRENT_READ_TRACKER
+        .with(|cell| cell.borrow_mut().take())
         .unwrap_or_default()
 }
 
@@ -199,10 +202,22 @@ mod tests {
         assert_eq!(reads.len(), 2);
         // On Windows, /foo/bar.ts is not absolute, so it gets joined with cwd.
         // Check that the paths end with the expected components.
-        let has_bar = reads.iter().any(|p| p.to_string_lossy().ends_with("foo/bar.ts"));
-        let has_baz = reads.iter().any(|p| p.to_string_lossy().ends_with("foo/baz.tsx"));
-        assert!(has_bar, "Expected a path ending with foo/bar.ts, got: {:?}", reads);
-        assert!(has_baz, "Expected a path ending with foo/baz.tsx, got: {:?}", reads);
+        let has_bar = reads
+            .iter()
+            .any(|p| p.to_string_lossy().ends_with("foo/bar.ts"));
+        let has_baz = reads
+            .iter()
+            .any(|p| p.to_string_lossy().ends_with("foo/baz.tsx"));
+        assert!(
+            has_bar,
+            "Expected a path ending with foo/bar.ts, got: {:?}",
+            reads
+        );
+        assert!(
+            has_baz,
+            "Expected a path ending with foo/baz.tsx, got: {:?}",
+            reads
+        );
     }
 
     #[test]
@@ -224,10 +239,24 @@ mod tests {
         assert_eq!(result, 42);
         assert_eq!(tracker.len(), 2);
         // On Windows, paths are joined with cwd. Check by suffix.
-        let has_some = tracker.reads().iter().any(|p| p.to_string_lossy().ends_with("some/file.ts"));
-        let has_other = tracker.reads().iter().any(|p| p.to_string_lossy().ends_with("other/file.css"));
-        assert!(has_some, "Expected a path ending with some/file.ts, got: {:?}", tracker.reads());
-        assert!(has_other, "Expected a path ending with other/file.css, got: {:?}", tracker.reads());
+        let has_some = tracker
+            .reads()
+            .iter()
+            .any(|p| p.to_string_lossy().ends_with("some/file.ts"));
+        let has_other = tracker
+            .reads()
+            .iter()
+            .any(|p| p.to_string_lossy().ends_with("other/file.css"));
+        assert!(
+            has_some,
+            "Expected a path ending with some/file.ts, got: {:?}",
+            tracker.reads()
+        );
+        assert!(
+            has_other,
+            "Expected a path ending with other/file.css, got: {:?}",
+            tracker.reads()
+        );
     }
 
     #[test]
@@ -251,9 +280,7 @@ mod tests {
         let mut file = std::fs::File::create(&file_path).unwrap();
         writeln!(file, "hello world").unwrap();
 
-        let (_result, tracker) = with_read_tracker(|| {
-            read_to_string(&file_path).unwrap()
-        });
+        let (_result, tracker) = with_read_tracker(|| read_to_string(&file_path).unwrap());
 
         // record_read canonicalizes the path, so compare against the
         // canonical version of the file path.

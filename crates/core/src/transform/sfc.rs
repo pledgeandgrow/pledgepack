@@ -192,8 +192,8 @@ fn extract_sfc_blocks(source: &str, tag: &str) -> Vec<(Option<String>, String)> 
         let mut pos = content_start;
         let mut found_close = None;
         while depth > 0 && pos < source.len() {
-            let next_open = find_open_tag(source, pos, &open_prefix)
-                .map(|(s, cs, sc, _)| (s, cs, sc));
+            let next_open =
+                find_open_tag(source, pos, &open_prefix).map(|(s, cs, sc, _)| (s, cs, sc));
             let next_close = source[pos..].find(&close_tag).map(|p| pos + p);
             match (next_open, next_close) {
                 (Some((op, cs, sc)), Some(cl)) if op < cl => {
@@ -551,8 +551,7 @@ fn nodes_to_render_calls(nodes: &[HtmlNode], depth: usize) -> String {
                             let true_expr = node_to_render_call_opts(node, depth + 1, true);
                             let false_expr =
                                 node_to_render_call_opts(&nodes[i + 1], depth + 1, false);
-                            items
-                                .push(format!("({}) ? {} : {}", cond, true_expr, false_expr));
+                            items.push(format!("({}) ? {} : {}", cond, true_expr, false_expr));
                             i += 2;
                             continue;
                         }
@@ -780,11 +779,12 @@ fn push_v_model_props(
         val_expr = format!("Number({})", val_expr);
     }
 
-    let is_component = tag.chars().next().map(|c| c.is_uppercase()).unwrap_or(false);
-    let is_checkbox = tag == "input"
-        && attrs
-            .iter()
-            .any(|(n, v)| n == "type" && v == "checkbox");
+    let is_component = tag
+        .chars()
+        .next()
+        .map(|c| c.is_uppercase())
+        .unwrap_or(false);
+    let is_checkbox = tag == "input" && attrs.iter().any(|(n, v)| n == "type" && v == "checkbox");
     let is_select = tag == "select";
 
     if is_component {
@@ -1249,10 +1249,7 @@ fn render_svelte_nodes_into(
     for node in nodes.iter() {
         if let HtmlNode::Text(t) = node {
             let trimmed = t.trim();
-            if trimmed.starts_with("{#")
-                || trimmed.starts_with("{:")
-                || trimmed.starts_with("{/")
-            {
+            if trimmed.starts_with("{#") || trimmed.starts_with("{:") || trimmed.starts_with("{/") {
                 // TODO: nested control flow inside {#if}/{#each}.
                 continue;
             }

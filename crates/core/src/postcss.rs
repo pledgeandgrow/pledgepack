@@ -532,8 +532,7 @@ pub fn process_css(
     // handles full source map generation separately).
     if config.source_map {
         let source_map = generate_postcss_source_map(file_path);
-        let encoded =
-            base64_url_safe_encode(&source_map);
+        let encoded = base64_url_safe_encode(&source_map);
         result.push_str(&format!(
             "\n/*# sourceMappingURL=data:application/json;charset=utf-8;base64,{} */\n",
             encoded
@@ -559,8 +558,7 @@ fn generate_postcss_source_map(file_path: &str) -> String {
 /// Base64-encode a string using the URL-safe alphabet (no padding) for
 /// embedding in a data URI.
 fn base64_url_safe_encode(input: &str) -> String {
-    const ALPHABET: &[u8] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let bytes = input.as_bytes();
     let mut result = String::new();
     let mut i = 0;

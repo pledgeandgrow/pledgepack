@@ -6,8 +6,8 @@
 use crate::config::WebhookConfig;
 use hmac::Mac;
 use serde::{Deserialize, Serialize};
-use tracing::info;
 use thiserror::Error;
+use tracing::info;
 
 /// Build event payload sent to webhook endpoints
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,10 +37,7 @@ pub enum WebhookError {
 }
 
 /// Send build event webhook
-pub async fn send_webhook(
-    config: &WebhookConfig,
-    event: BuildEvent,
-) -> Result<(), WebhookError> {
+pub async fn send_webhook(config: &WebhookConfig, event: BuildEvent) -> Result<(), WebhookError> {
     if !config.enabled {
         return Ok(());
     }
@@ -85,9 +82,7 @@ pub async fn send_webhook(
             .timeout_global(Some(std::time::Duration::from_secs(10)))
             .build()
             .new_agent();
-        let mut req = agent
-            .post(&url)
-            .header("Content-Type", "application/json");
+        let mut req = agent.post(&url).header("Content-Type", "application/json");
 
         if let Some(ref sig) = signature {
             req = req.header("X-Webhook-Signature", sig);

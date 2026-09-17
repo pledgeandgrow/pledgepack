@@ -165,9 +165,16 @@ fn generate_css_module_map(css: &str, file_path: &str) -> Vec<(String, String)> 
         // Check for class selector: . preceded by selector boundary
         if chars[i] == '.' {
             let prev = if i > 0 { chars[i - 1] } else { '\n' };
-            let is_selector_start = prev == '{' || prev == '}' || prev == ','
-                || prev == ' ' || prev == '\n' || prev == '\t' || prev == '>'
-                || prev == '+' || prev == '~' || i == 0;
+            let is_selector_start = prev == '{'
+                || prev == '}'
+                || prev == ','
+                || prev == ' '
+                || prev == '\n'
+                || prev == '\t'
+                || prev == '>'
+                || prev == '+'
+                || prev == '~'
+                || i == 0;
 
             if is_selector_start {
                 let start = i + 1;
@@ -180,9 +187,7 @@ fn generate_css_module_map(css: &str, file_path: &str) -> Vec<(String, String)> 
                     if c == '\\' && end + 1 < chars.len() {
                         end += 1;
                         let mut hex_digits = 0;
-                        while end < chars.len()
-                            && chars[end].is_ascii_hexdigit()
-                            && hex_digits < 6
+                        while end < chars.len() && chars[end].is_ascii_hexdigit() && hex_digits < 6
                         {
                             end += 1;
                             hex_digits += 1;
@@ -196,8 +201,16 @@ fn generate_css_module_map(css: &str, file_path: &str) -> Vec<(String, String)> 
                         }
                         continue;
                     }
-                    if c == ':' || c == '[' || c == '{' || c == ' ' || c == '\n'
-                        || c == '\t' || c == '>' || c == '+' || c == '~' || c == ','
+                    if c == ':'
+                        || c == '['
+                        || c == '{'
+                        || c == ' '
+                        || c == '\n'
+                        || c == '\t'
+                        || c == '>'
+                        || c == '+'
+                        || c == '~'
+                        || c == ','
                     {
                         break;
                     }
@@ -205,8 +218,11 @@ fn generate_css_module_map(css: &str, file_path: &str) -> Vec<(String, String)> 
                 }
                 // A hex escape may leave a trailing whitespace terminator in the
                 // captured range — it isn't part of the class name.
-                let class_name: String =
-                    chars[start..end].iter().collect::<String>().trim_end().to_string();
+                let class_name: String = chars[start..end]
+                    .iter()
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string();
                 // Validate: every char must be alphanumeric/-/_ or escaped
                 // (either a backslash itself or the char it escapes).
                 let mut escaped = false;

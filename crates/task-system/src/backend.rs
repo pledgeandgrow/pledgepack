@@ -10,7 +10,7 @@
 
 use crate::task::TaskId;
 use dashmap::DashMap;
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{Serialize, de::DeserializeOwned};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -47,7 +47,11 @@ pub struct StoredOutput {
 
 impl StoredOutput {
     /// Serialize a value into a `StoredOutput`.
-    pub fn new<T: Serialize>(task_id: TaskId, value: &T, dependencies: Vec<TaskId>) -> Result<Self, serde_json::Error> {
+    pub fn new<T: Serialize>(
+        task_id: TaskId,
+        value: &T,
+        dependencies: Vec<TaskId>,
+    ) -> Result<Self, serde_json::Error> {
         let data = serde_json::to_vec(value)?;
         let output_hash = blake3::hash(&data).as_bytes()[..16].try_into().unwrap();
         Ok(StoredOutput {
@@ -215,7 +219,10 @@ impl MemoryBackend {
     pub fn remove(&self, id: &TaskId) {
         self.outputs.remove(id);
         self.output_hashes.remove(id);
-        self.lru.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
+        self.lru
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(id);
     }
 
     /// G4.7: Evict the least recently accessed clean output.
@@ -249,8 +256,14 @@ impl MemoryBackend {
 
     /// G4.7: Touch the LRU counter for a task.
     fn touch_lru(&self, id: TaskId) {
-        let ts = self.lru_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-        self.lru.lock().unwrap_or_else(|e| e.into_inner()).insert(id, ts);
+        let ts = self
+            .lru_counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        self.lru
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id, ts);
     }
 
     /// Number of cached outputs.
@@ -288,7 +301,9 @@ impl DiskBackend {
     pub fn new(cache_dir: PathBuf) -> std::io::Result<Self> {
         let tasks_dir = cache_dir.join("tasks");
         std::fs::create_dir_all(&tasks_dir)?;
-        Ok(DiskBackend { cache_dir: cache_dir.join("tasks") })
+        Ok(DiskBackend {
+            cache_dir: cache_dir.join("tasks"),
+        })
     }
 
     fn path_for(&self, id: &TaskId) -> PathBuf {
@@ -398,7 +413,11 @@ pub struct TaskBackend {
 
 impl TaskBackend {
     pub fn new(memory: MemoryBackend) -> Self {
-        TaskBackend { memory, disk: None, remote: None }
+        TaskBackend {
+            memory,
+            disk: None,
+            remote: None,
+        }
     }
 
     pub fn with_disk(mut self, disk: DiskBackend) -> Self {
@@ -484,11 +503,7 @@ impl TaskBackend {
             let entry = pledgepack_cache::remote::RemoteCacheEntry {
                 code: json,
                 source_map: None,
-                deps: output
-                    .dependencies
-                    .iter()
-                    .map(|d| d.to_hex())
-                    .collect(),
+                deps: output.dependencies.iter().map(|d| d.to_hex()).collect(),
                 created_at: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs())
@@ -516,11 +531,7 @@ impl TaskBackend {
             let entry = pledgepack_cache::remote::RemoteCacheEntry {
                 code: json,
                 source_map: None,
-                deps: output
-                    .dependencies
-                    .iter()
-                    .map(|d| d.to_hex())
-                    .collect(),
+                deps: output.dependencies.iter().map(|d| d.to_hex()).collect(),
                 created_at: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs())
@@ -791,9 +802,15 @@ mod tests {
         let fp1_again = fingerprint_task_id(&id, "v1.0");
 
         // Same version → same fingerprint
-        assert_eq!(fp1, fp1_again, "Same version should produce same fingerprint");
+        assert_eq!(
+            fp1, fp1_again,
+            "Same version should produce same fingerprint"
+        );
         // Different version → different fingerprint
-        assert_ne!(fp1, fp2, "Different versions should produce different fingerprints");
+        assert_ne!(
+            fp1, fp2,
+            "Different versions should produce different fingerprints"
+        );
         // Fingerprint should differ from raw task ID
         assert_ne!(fp1, id, "Fingerprint should differ from raw task ID");
     }

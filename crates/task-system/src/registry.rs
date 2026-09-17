@@ -61,9 +61,7 @@ impl TaskExecutor {
     where
         F: Fn() -> TaskFuture + Send + Sync + 'static,
     {
-        TaskExecutor {
-            inner: Arc::new(f),
-        }
+        TaskExecutor { inner: Arc::new(f) }
     }
 
     /// Execute the task.
@@ -88,12 +86,7 @@ impl TaskRegistry {
     }
 
     /// Register a task executor.
-    pub fn register(
-        &self,
-        id: TaskId,
-        function_name: String,
-        executor: TaskExecutor,
-    ) {
+    pub fn register(&self, id: TaskId, function_name: String, executor: TaskExecutor) {
         self.executors.insert(id, (function_name, executor));
     }
 
@@ -143,9 +136,7 @@ mod tests {
         registry.register(
             id,
             "test".to_string(),
-            TaskExecutor::sync(move || {
-                Ok(StoredOutput::new(id, &"hello".to_string(), vec![])?)
-            }),
+            TaskExecutor::sync(move || Ok(StoredOutput::new(id, &"hello".to_string(), vec![])?)),
         );
 
         // We can't easily test execution without a full TaskEngine,

@@ -123,10 +123,8 @@ pub fn parallel_fetch(
     cache: &crate::remote::RemoteCache,
     keys: &[String],
 ) -> Vec<Option<crate::remote::RemoteCacheEntry>> {
-    let results: Vec<std::sync::Mutex<Option<crate::remote::RemoteCacheEntry>>> = keys
-        .iter()
-        .map(|_| std::sync::Mutex::new(None))
-        .collect();
+    let results: Vec<std::sync::Mutex<Option<crate::remote::RemoteCacheEntry>>> =
+        keys.iter().map(|_| std::sync::Mutex::new(None)).collect();
 
     std::thread::scope(|scope| {
         for (i, key) in keys.iter().enumerate() {

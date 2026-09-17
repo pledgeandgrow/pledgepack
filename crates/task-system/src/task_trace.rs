@@ -82,7 +82,11 @@ mod tests {
 
         let json = end_session();
         assert!(!is_tracing());
-        assert!(json.contains("\"name\":\"test_task\""), "JSON should contain task name: {}", json);
+        assert!(
+            json.contains("\"name\":\"test_task\""),
+            "JSON should contain task name: {}",
+            json
+        );
         assert!(json.contains("\"ph\":\"B\""), "Should contain begin event");
         assert!(json.contains("\"ph\":\"E\""), "Should contain end event");
     }
@@ -92,6 +96,10 @@ mod tests {
         begin_session();
         trace_complete("fast_task", 42);
         let json = end_session();
-        assert!(json.contains("\"dur\":42"), "Should contain duration: {}", json);
+        assert!(
+            json.contains("\"dur\":42"),
+            "Should contain duration: {}",
+            json
+        );
     }
 }

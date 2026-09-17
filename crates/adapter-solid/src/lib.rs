@@ -161,7 +161,10 @@ mod tests {
         assert!(result.is_ok(), "transform failed: {:?}", result.err());
         let code = result.unwrap();
         // Automatic JSX runtime should reference solid-js, not React.
-        assert!(code.contains("solid-js"), "expected a solid-js import, got:\n{code}");
+        assert!(
+            code.contains("solid-js"),
+            "expected a solid-js import, got:\n{code}"
+        );
     }
 
     #[test]
@@ -172,7 +175,10 @@ mod tests {
         let dev = adapter
             .transform(source, ModuleKind::Jsx, "App.jsx", false)
             .unwrap();
-        assert!(dev.contains("import.meta.hot"), "dev build should inject the HMR boundary");
+        assert!(
+            dev.contains("import.meta.hot"),
+            "dev build should inject the HMR boundary"
+        );
         assert!(dev.contains("__pledge_solid_hmr"));
 
         let prod = adapter
@@ -208,15 +214,22 @@ mod tests {
             "Broken.jsx",
             false,
         );
-        assert!(result.is_err(), "malformed source should fail to parse, not silently produce output");
+        assert!(
+            result.is_err(),
+            "malformed source should fail to parse, not silently produce output"
+        );
     }
 
     #[test]
     fn production_output_is_minified() {
         let adapter = SolidAdapter::new();
         let source = "export default function App() {\n  const x = 1;\n  return <div>{x}</div>;\n}";
-        let dev = adapter.transform(source, ModuleKind::Jsx, "App.jsx", false).unwrap();
-        let prod = adapter.transform(source, ModuleKind::Jsx, "App.jsx", true).unwrap();
+        let dev = adapter
+            .transform(source, ModuleKind::Jsx, "App.jsx", false)
+            .unwrap();
+        let prod = adapter
+            .transform(source, ModuleKind::Jsx, "App.jsx", true)
+            .unwrap();
         assert!(
             prod.len() < dev.len(),
             "production output ({} bytes) should be smaller than dev output ({} bytes)",
