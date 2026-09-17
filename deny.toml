@@ -19,6 +19,15 @@ ignore = [
     # oxc and lightningcss. Zero security risk.
     # review-by: 2026-12-15
     "RUSTSEC-2024-0436",
+    # fxhash 0.2.1 — flagged unmaintained (not a vulnerability: no CVE, just an
+    # abandoned repo). Transitive via scraper -> selectors; the latest scraper
+    # (0.27.0) still pulls a selectors version that depends on fxhash, so
+    # there is no upgrade path — the advisory itself says "No safe upgrade is
+    # available!". Non-cryptographic hasher only, not used with untrusted
+    # keys in a way that would enable a HashDoS. Will revisit once selectors
+    # moves off fxhash upstream.
+    # review-by: 2026-12-15
+    "RUSTSEC-2025-0057",
 ]
 
 [licenses]
@@ -66,28 +75,28 @@ allow-wildcard-paths = true
 #
 # Root causes, grouped:
 #
-# (A) wasmtime 28.0.1's own vendored toolchain (cranelift / wasm-tools /
-#     wasmtime-cache) pins an older sibling of a crate this workspace also
-#     uses directly at a newer version. Not fixable without a wasmtime
-#     upgrade; tracked as part of the wasm-plugin-host consolidation work.
+# (A) wasmtime 48.0.2's own vendored toolchain (cranelift / wasm-tools)
+#     pins a newer sibling of a crate this workspace's other dependents
+#     (backtrace/miette, etc.) haven't caught up to yet. Re-check the exact
+#     versions on every wasmtime bump — they drift with each release.
 [[bans.skip]]
 name = "addr2line"
-version = "0.24.2"
+version = "0.25.1"
 [[bans.skip]]
 name = "gimli"
-version = "0.31.1"
-[[bans.skip]]
-name = "object"
-version = "0.36.7"
+version = "0.32.3"
 [[bans.skip]]
 name = "object"
 version = "0.37.3"
 [[bans.skip]]
 name = "wasm-encoder"
-version = "0.221.3"
+version = "0.254.0"
 [[bans.skip]]
 name = "wast"
 version = "35.0.2"
+[[bans.skip]]
+name = "io-lifetimes"
+version = "2.0.4"
 [[bans.skip]]
 name = "windows-sys"
 version = "0.52.0"
@@ -128,10 +137,10 @@ name = "windows_i686_msvc"
 version = "0.52.6"
 [[bans.skip]]
 name = "toml"
-version = "0.8.23"
+version = "0.9.12+spec-1.1.0"
 [[bans.skip]]
 name = "toml_datetime"
-version = "0.6.11"
+version = "0.7.5+spec-1.1.0"
 [[bans.skip]]
 name = "syn"
 version = "3.0.3"
@@ -189,16 +198,13 @@ name = "itertools"
 version = "0.10.5"
 [[bans.skip]]
 name = "itertools"
-version = "0.12.1"
-[[bans.skip]]
-name = "itertools"
 version = "0.14.0"
 [[bans.skip]]
 name = "hashbrown"
 version = "0.14.5"
 [[bans.skip]]
 name = "hashbrown"
-version = "0.15.5"
+version = "0.16.1"
 [[bans.skip]]
 name = "phf"
 version = "0.11.3"
@@ -230,14 +236,6 @@ version = "0.1.14"
 name = "winnow"
 version = "0.7.15"
 [[bans.skip]]
-name = "rustix"
-version = "0.38.44"
-# linux-raw-sys is rustix 0.38's own syscall-binding dependency; it duplicates
-# 1:1 with the rustix skip above.
-[[bans.skip]]
-name = "linux-raw-sys"
-version = "0.4.15"
-[[bans.skip]]
 name = "num-bigint"
 version = "0.4.8"
 [[bans.skip]]
@@ -246,12 +244,6 @@ version = "0.1.0"
 [[bans.skip]]
 name = "miniz_oxide"
 version = "0.8.9"
-[[bans.skip]]
-name = "serde_spanned"
-version = "0.6.9"
-[[bans.skip]]
-name = "foldhash"
-version = "0.1.5"
 [[bans.skip]]
 name = "cssparser"
 version = "0.34.0"
@@ -274,12 +266,6 @@ version = "0.2.17"
 [[bans.skip]]
 name = "derive_more"
 version = "0.99.20"
-[[bans.skip]]
-name = "dirs"
-version = "4.0.0"
-[[bans.skip]]
-name = "dirs-sys"
-version = "0.3.7"
 [[bans.skip]]
 name = "brotli-decompressor"
 version = "4.0.3"
@@ -307,9 +293,6 @@ version = "0.13.4"
 #     but axum 0.8.9 / hyper-util / oxc_transformer each pin their own older
 #     base64 majors transitively — not directly fixable by us, but distinct
 #     from the reqwest case above (no direct pledgepack Cargo.toml conflict).
-[[bans.skip]]
-name = "base64"
-version = "0.21.7"
 [[bans.skip]]
 name = "base64"
 version = "0.22.1"

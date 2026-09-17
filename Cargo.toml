@@ -200,8 +200,8 @@ pledgepack-task-system = { path = "crates/task-system" }
 pledgepack-wasm-plugin-host = { path = "crates/wasm-plugin-host" }
 
 # WASM Component Model plugin host
-wasmtime = "28"
-wasmtime-wasi = "28"
+wasmtime = "48"
+wasmtime-wasi = "48"
 parking_lot = "0.12"
 pledgepack-task-system-macros = { path = "crates/task-system-macros" }
 
