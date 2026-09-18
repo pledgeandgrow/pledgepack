@@ -12,6 +12,18 @@ pub const io = @import("io.zig");
 pub const graph = @import("graph.zig");
 pub const simd = @import("simd.zig");
 
+// Zig 0.16.0's default panic handler pulls in std.debug.SelfInfo (for
+// printing a stack trace on panic), and SelfInfo's Windows implementation
+// has a compile error for aarch64-windows-msvc specifically
+// (`@ptrCast increases pointer alignment` at
+// lib/std/debug/SelfInfo/Windows.zig:670, in the LdrRegisterDllNotification
+// callback cast — a bug in Zig's own stdlib, not this file). This is a
+// static library called via C ABI from Rust; a panic here always indicates
+// a bug worth stopping on hard, and Rust-side backtraces (RUST_BACKTRACE=1)
+// already cover the FFI boundary, so a minimal, trace-free panic handler
+// is sufficient and sidesteps the whole SelfInfo compile path.
+pub const panic = std.debug.simple_panic;
+
 // ─── C ABI exports ───
 
 // Graph operations
