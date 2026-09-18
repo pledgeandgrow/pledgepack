@@ -169,13 +169,27 @@ pub fn format_size(bytes: usize) -> String {
 /// Normalize a path to use forward slashes (cross-platform consistent).
 /// Handles both Windows backslashes and already-normalized paths.
 pub fn normalize_path(path: &std::path::Path) -> String {
-    path.to_string_lossy().replace('\\', "/")
+    normalize_path_str(&path.to_string_lossy())
 }
 
 /// Normalize a path-like string to use forward slashes (cross-platform
 /// consistent). Equivalent to [`normalize_path`] but for string inputs
 /// such as URL paths and module specifiers.
+///
+/// Also strips Windows' `\\?\` extended-length ("verbatim") prefix — added
+/// by `Path::canonicalize()` on Windows, harmless for filesystem APIs but
+/// leaking into every user-facing message built from a canonicalized path
+/// (`why`'s import chains, `generate-env-types`'s success message, etc.) as
+/// a confusing `//?/C:/...` once backslashes are converted to slashes.
 pub fn normalize_path_str(path: &str) -> String {
+    let path = path
+        .strip_prefix(r"\\?\UNC\")
+        .map(|rest| format!(r"\\{rest}"))
+        .unwrap_or_else(|| {
+            path.strip_prefix(r"\\?\")
+                .unwrap_or(path)
+                .to_string()
+        });
     path.replace('\\', "/")
 }
 

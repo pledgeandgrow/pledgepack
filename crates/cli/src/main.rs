@@ -3057,6 +3057,7 @@ export default defineConfig({
                         test_file,
                         &config.test,
                         &config.root,
+                        &config,
                     ) {
                         Ok(s) => s,
                         Err(e) => {
@@ -3239,6 +3240,7 @@ export default defineConfig({
                                             test_file,
                                             &config.test,
                                             &config.root,
+                                            &config,
                                         ) {
                                             Ok(s) => s,
                                             Err(e) => {
@@ -3377,7 +3379,10 @@ export default defineConfig({
             let dts_path = config.root.join("pledge-env.d.ts");
             std::fs::write(&dts_path, &dts)?;
 
-            println!("  \x1b[32m✓\x1b[0m Generated {}\n", dts_path.display());
+            println!(
+                "  \x1b[32m✓\x1b[0m Generated {}\n",
+                pledgepack_core::normalize_path(&dts_path)
+            );
         }
 
         Commands::Completions { shell } => {

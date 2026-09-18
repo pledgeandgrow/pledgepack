@@ -9,14 +9,17 @@ pub const VALID_FIELDS: &[&str] = &[
     "framework",
     "alias",
     "extensions",
+    "resolve",
     "cache",
     "devServer",
     "sourceMaps",
     "resolveAlias",
     "proxy",
     "profile",
+    "target",
     "outputFormat",
     "conditions",
+    "optimize",
     "envPrefix",
     "envDts",
     "htmlEntry",
@@ -25,21 +28,52 @@ pub const VALID_FIELDS: &[&str] = &[
     "image",
     "edgeTarget",
     "plugins",
+    "pluginSecurity",
+    "library",
+    "https",
+    "serverEntry",
+    "nodePolyfills",
+    "define",
+    "watch",
     "appDir",
     "build",
+    "cssPreprocessor",
+    "templates",
+    "languages",
+    "test",
     "webhooks",
     "i18n",
     "css",
     "a11y",
     "encrypt",
     "budgets",
+    "federation",
+    "graphql",
+    "sw",
+    "exports",
+    "presets",
+    "transformPipeline",
+    "workspaces",
+    "security",
+    "base",
 ];
 
 /// Valid devServer fields.
-pub const VALID_DEV_SERVER_FIELDS: &[&str] = &["port", "host", "hmr", "open", "https"];
+pub const VALID_DEV_SERVER_FIELDS: &[&str] = &[
+    "port",
+    "host",
+    "hmr",
+    "open",
+    "https",
+    "publicDir",
+    "middleware",
+    "unixSocket",
+    "cors",
+    "accessToken",
+];
 
 /// Valid cache fields.
-pub const VALID_CACHE_FIELDS: &[&str] = &["enabled", "dir"];
+pub const VALID_CACHE_FIELDS: &[&str] = &["enabled", "dir", "remote"];
 
 /// Valid image fields.
 pub const VALID_IMAGE_FIELDS: &[&str] = &[
@@ -49,6 +83,7 @@ pub const VALID_IMAGE_FIELDS: &[&str] = &[
     "avif",
     "maxWidth",
     "maxHeight",
+    "responsiveWidths",
 ];
 
 /// Valid framework values.
@@ -80,6 +115,11 @@ pub const VALID_BUILD_FIELDS: &[&str] = &[
     "verifyOutput",
     "incrementalOutput",
     "wasmSimd",
+    "typeCheck",
+    "parallel",
+    "target",
+    "experimentalDecorators",
+    "emitDecoratorMetadata",
 ];
 
 /// Valid preload strategy values.
@@ -89,13 +129,25 @@ pub const VALID_PRELOAD_STRATEGIES: &[&str] = &["eager", "lazy", "manual"];
 pub const VALID_WASM_SIMD_MODES: &[&str] = &["auto", "always", "never"];
 
 /// Valid webhook fields.
-pub const VALID_WEBHOOK_FIELDS: &[&str] = &["enabled", "onBuild", "onError", "headers"];
+pub const VALID_WEBHOOK_FIELDS: &[&str] = &["enabled", "onBuild", "onError", "headers", "secret"];
 
 /// Valid i18n fields.
-pub const VALID_I18N_FIELDS: &[&str] = &["enabled", "locales", "defaultLocale", "messagePattern"];
+pub const VALID_I18N_FIELDS: &[&str] = &[
+    "enabled",
+    "locales",
+    "defaultLocale",
+    "messagePattern",
+    "extract",
+];
 
 /// Valid CSS fields.
-pub const VALID_CSS_FIELDS: &[&str] = &["rtl"];
+pub const VALID_CSS_FIELDS: &[&str] = &[
+    "rtl",
+    "darkMode",
+    "optimizeCustomProperties",
+    "minifyCustomPropertyNames",
+    "scoped",
+];
 
 /// Valid RTL mode values.
 pub const VALID_RTL_MODES: &[&str] = &["auto", "manual", "off"];
