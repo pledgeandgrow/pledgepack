@@ -152,6 +152,14 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      # Required for cosign's keyless signing: without it, cosign has no
+      # GitHub Actions OIDC token to trade with Fulcio for a short-lived
+      # cert, and falls back to an interactive device-code flow — which
+      # always times out in CI (nobody's there to open the link and enter
+      # the code within the 300s window). Confirmed failure mode: "Non-
+      # interactive mode detected, using device flow... error obtaining
+      # token: expired_token".
+      id-token: write
     steps:
       - uses: actions/checkout@v5
 
