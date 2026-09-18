@@ -8,8 +8,32 @@ fn main() {
         .expect("manifest dir has no parent — invalid directory structure");
     let lib_dir = root.join("zig-out").join("lib");
 
+    // Use CARGO_CFG_TARGET_OS (set by cargo for the TARGET, not host)
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    // ...and CARGO_CFG_TARGET_ENV to distinguish windows-msvc from windows-gnu
+    // (both report target_os == "windows").
+    let target_env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+
     // Invoke `zig build` if the static library artifact is missing or stale.
-    let lib_path = lib_dir.join("libpledge_native.a");
+    //
+    // The marker filename must match what Zig actually names the artifact on
+    // this target OS/ABI — on Windows (MSVC *and* GNU) that's always
+    // `pledge_native.lib`, never `lib*.a` (see the comment below). Checking
+    // for `libpledge_native.a` unconditionally meant this marker never
+    // existed on Windows, so build.rs always re-ran `zig build` with no
+    // `-Dtarget`, silently rebuilding for the *host* architecture and
+    // clobbering whatever target-specific library an earlier explicit
+    // `zig build -Dtarget=...` step (as CI's cross-compile jobs run) had
+    // already produced — invisible on native x86_64 Windows builds (host
+    // happens to match the intended target already) but fatal when
+    // cross-compiling to aarch64-pc-windows-msvc: the resulting library was
+    // silently x86_64, so the Rust linker found no usable symbols in it.
+    let marker_name = if target_os == "windows" {
+        "pledge_native.lib"
+    } else {
+        "libpledge_native.a"
+    };
+    let lib_path = lib_dir.join(marker_name);
     if !lib_path.exists() {
         let zig_executable = std::env::var("ZIG_EXECUTABLE").unwrap_or_else(|_| "zig".to_string());
         let status = std::process::Command::new(&zig_executable)
@@ -27,12 +51,6 @@ fn main() {
             ),
         }
     }
-
-    // Use CARGO_CFG_TARGET_OS (set by cargo for the TARGET, not host)
-    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
-    // ...and CARGO_CFG_TARGET_ENV to distinguish windows-msvc from windows-gnu
-    // (both report target_os == "windows").
-    let target_env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
 
     // On Windows, `zig build` always names its static-library output
     // `pledge_native.lib` (Zig's own convention on this OS, independent of
