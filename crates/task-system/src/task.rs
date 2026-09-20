@@ -432,6 +432,18 @@ impl<T, E: TaskEffect, V: TaskVersion> Task<T, E, V> {
         engine.read_task::<T>(self.id).await
     }
 
+    /// Blocking variant of `read` for rayon / `spawn_blocking` worker
+    /// threads where no async runtime is driving the caller.
+    pub fn read_blocking(
+        &self,
+        engine: &crate::TaskEngine,
+    ) -> Result<std::sync::Arc<T>, crate::TaskError>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync + 'static,
+    {
+        engine.read_task_blocking::<T>(self.id)
+    }
+
     /// Try to read the task's output without scheduling computation.
     ///
     /// Returns `Some(Arc<T>)` if the task is already computed and cached,

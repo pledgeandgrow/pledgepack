@@ -80,11 +80,12 @@ pub mod route_tracker;
 pub mod task;
 #[cfg(feature = "task-trace")]
 pub mod task_trace;
+/// Zig arena-backed dependency graph — the default `TaskGraphOps` backend.
 #[cfg(feature = "zig-graph")]
 pub mod zig_graph;
 
 // Re-export the most commonly used types at the crate root.
-pub use backend::{DiskBackend, MemoryBackend, StoredOutput, TaskBackend};
+pub use backend::{CasBackend, DiskBackend, DiskTier, MemoryBackend, StoredOutput, TaskBackend};
 pub use engine::{
     ActiveQuery, SchedulerTrace, TaskEngine, TaskEngineBuilder, TaskEngineStats, TaskError,
 };
@@ -92,7 +93,9 @@ pub use environment::{
     Environment, EnvironmentPlugin, EnvironmentPluginRegistry, current_environment,
     run_with_environment,
 };
-pub use graph::{AggregationGraph, AggregationNode, DependencyGraph, TaskStatus};
+pub use graph::{
+    AggregationGraph, AggregationNode, DependencyGraph, TaskGraphOps, TaskStatus, default_dep_graph,
+};
 pub use read_tracker::{
     ReadTracker, collect_tracker, install_tracker, is_tracking, read as tracked_read,
     read_to_string as tracked_read_to_string, record_read,
@@ -104,7 +107,7 @@ pub use task::{
     TaskVersion, V1, V2, compute_task_id, compute_task_id_compact,
 };
 #[cfg(feature = "zig-graph")]
-pub use zig_graph::{ZigTaskGraph, ZigTaskStatus};
+pub use zig_graph::ZigTaskGraph;
 
 // Re-export the proc macro.
 pub use pledgepack_task_system_macros::task;

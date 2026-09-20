@@ -241,6 +241,113 @@ impl DependencyGraph {
     }
 }
 
+/// Backend-agnostic interface for the task dependency graph.
+///
+/// Implemented by both the Rust `DependencyGraph` (DashMap-backed) and the
+/// Zig `ZigTaskGraph` (arena-backed, `zig-graph` feature). `TaskEngine`
+/// stores `Box<dyn TaskGraphOps>` and picks the backend at construction —
+/// Zig by default when the feature is compiled in, overridable with the
+/// `PLEDGE_GRAPH_BACKEND=rust` environment variable for A/B benchmarking.
+///
+/// All methods take `&self`; backends provide their own synchronization
+/// (DashMap internally, or a Mutex inside `ZigTaskGraph`).
+pub trait TaskGraphOps: Send + Sync {
+    /// Record a dependency edge: `parent` depends on `child`.
+    fn add_edge(&self, parent: TaskId, child: TaskId);
+    /// Record multiple dependency edges at once.
+    fn add_edges(&self, parent: TaskId, children: &[TaskId]) {
+        for &child in children {
+            self.add_edge(parent, child);
+        }
+    }
+    /// Tasks that depend on `task` (reverse edges).
+    fn dependents(&self, task: &TaskId) -> HashSet<TaskId>;
+    /// Tasks that `task` depends on (forward edges).
+    fn dependencies(&self, task: &TaskId) -> HashSet<TaskId>;
+    /// Current status of a task.
+    fn status(&self, task: &TaskId) -> TaskStatus;
+    /// Set the status of a task.
+    fn set_status(&self, task: TaskId, status: TaskStatus);
+    /// Mark `task` and all transitive dependents dirty; returns the dirtied set.
+    fn mark_dirty(&self, task: TaskId) -> HashSet<TaskId>;
+    /// Mark a task clean (after successful computation).
+    fn mark_clean(&self, task: TaskId) {
+        self.set_status(task, TaskStatus::Clean);
+    }
+    /// All tasks currently marked dirty.
+    fn dirty_tasks(&self) -> Vec<TaskId>;
+    /// All tasks currently marked clean.
+    fn clean_tasks(&self) -> Vec<TaskId>;
+    /// Every task known to the graph.
+    fn all_tasks(&self) -> Vec<TaskId>;
+    /// Remove all tasks and edges.
+    fn clear(&self);
+    /// Number of tasks in the graph.
+    fn len(&self) -> usize;
+    /// Whether the graph is empty.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl TaskGraphOps for DependencyGraph {
+    fn add_edge(&self, parent: TaskId, child: TaskId) {
+        DependencyGraph::add_edge(self, parent, child);
+    }
+    fn add_edges(&self, parent: TaskId, children: &[TaskId]) {
+        DependencyGraph::add_edges(self, parent, children);
+    }
+    fn dependents(&self, task: &TaskId) -> HashSet<TaskId> {
+        DependencyGraph::dependents(self, task)
+    }
+    fn dependencies(&self, task: &TaskId) -> HashSet<TaskId> {
+        DependencyGraph::dependencies(self, task)
+    }
+    fn status(&self, task: &TaskId) -> TaskStatus {
+        DependencyGraph::status(self, task)
+    }
+    fn set_status(&self, task: TaskId, status: TaskStatus) {
+        DependencyGraph::set_status(self, task, status);
+    }
+    fn mark_dirty(&self, task: TaskId) -> HashSet<TaskId> {
+        DependencyGraph::mark_dirty(self, task)
+    }
+    fn dirty_tasks(&self) -> Vec<TaskId> {
+        DependencyGraph::dirty_tasks(self)
+    }
+    fn clean_tasks(&self) -> Vec<TaskId> {
+        DependencyGraph::clean_tasks(self)
+    }
+    fn all_tasks(&self) -> Vec<TaskId> {
+        DependencyGraph::all_tasks(self)
+    }
+    fn clear(&self) {
+        DependencyGraph::clear(self);
+    }
+    fn len(&self) -> usize {
+        DependencyGraph::len(self)
+    }
+    fn is_empty(&self) -> bool {
+        DependencyGraph::is_empty(self)
+    }
+}
+
+/// Construct the default dependency-graph backend.
+///
+/// With the `zig-graph` feature enabled (the default), this is the Zig
+/// arena graph — 24-byte nodes, flat edge arrays, single-pass dirty
+/// propagation. Set `PLEDGE_GRAPH_BACKEND=rust` to force the DashMap
+/// backend for comparison or as a fallback.
+pub fn default_dep_graph() -> Box<dyn TaskGraphOps> {
+    #[cfg(feature = "zig-graph")]
+    {
+        if !matches!(std::env::var("PLEDGE_GRAPH_BACKEND").as_deref(), Ok("rust")) {
+            return Box::new(crate::zig_graph::ZigTaskGraph::new());
+        }
+    }
+    Box::new(DependencyGraph::new())
+}
+
 /// An aggregation node in the aggregation graph.
 ///
 /// The aggregation graph is a tree (or forest) parallel to the dependency graph.
@@ -358,7 +465,7 @@ impl AggregationGraph {
     ///
     /// Each task's aggregation children are its direct dependencies.
     /// Aggregation counts are computed bottom-up.
-    pub fn build_from(&self, dep_graph: &DependencyGraph) {
+    pub fn build_from(&self, dep_graph: &dyn TaskGraphOps) {
         let all_tasks = dep_graph.all_tasks();
         for &task in &all_tasks {
             let deps = dep_graph.dependencies(&task);
@@ -382,11 +489,14 @@ impl AggregationGraph {
     pub fn query_subtree(
         &self,
         task: TaskId,
-        dep_graph: &DependencyGraph,
+        dep_graph: &dyn TaskGraphOps,
     ) -> Option<AggregationNode> {
         // Mark as queried
         {
-            let mut queried = self.queried.lock().unwrap();
+            let mut queried = self
+                .queried
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if queried.contains(&task) {
                 // Already queried — return existing node
                 return self.nodes.get(&task).map(|r| r.value().clone());
@@ -461,12 +571,18 @@ impl AggregationGraph {
 
     /// G3.10: Returns the number of tasks that have been queried.
     pub fn queried_count(&self) -> usize {
-        self.queried.lock().unwrap().len()
+        self.queried
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
     }
 
     /// G3.10: Returns true if a task has been queried (its subtree is materialized).
     pub fn is_queried(&self, task: &TaskId) -> bool {
-        self.queried.lock().unwrap().contains(task)
+        self.queried
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(task)
     }
 
     /// Returns true if a cycle has been detected in the dependency graph.
@@ -487,7 +603,7 @@ impl AggregationGraph {
     /// `affected_tasks` are the tasks whose dependencies or status changed.
     /// The method finds all transitive dependents and recomputes their
     /// aggregation counts in topological order.
-    pub fn incremental_rebuild(&self, affected_tasks: &[TaskId], dep_graph: &DependencyGraph) {
+    pub fn incremental_rebuild(&self, affected_tasks: &[TaskId], dep_graph: &dyn TaskGraphOps) {
         // Collect all affected tasks + their transitive dependents
         let mut to_rebuild: HashSet<TaskId> = HashSet::new();
         let mut queue: Vec<TaskId> = affected_tasks.to_vec();
@@ -557,7 +673,7 @@ impl AggregationGraph {
     /// This is called after the dependency graph changes. Uses a bottom-up
     /// traversal (topological order from leaves to roots) to ensure child
     /// counts are computed before parent counts.
-    fn recompute_counts(&self, dep_graph: &DependencyGraph) {
+    fn recompute_counts(&self, dep_graph: &dyn TaskGraphOps) {
         let all_tasks = dep_graph.all_tasks();
         // Topological sort: process leaves first, then parents.
         // We use a simple approach: repeatedly find tasks whose dependencies
@@ -599,7 +715,7 @@ impl AggregationGraph {
     }
 
     /// Update the aggregation counts for a single task's subtree.
-    fn update_subtree_count(&self, task: TaskId, dep_graph: &DependencyGraph) {
+    fn update_subtree_count(&self, task: TaskId, dep_graph: &dyn TaskGraphOps) {
         let deps = dep_graph.dependencies(&task);
         let mut dirty_count = 0u32;
         let mut error_count = 0u32;
@@ -632,7 +748,7 @@ impl AggregationGraph {
     ///
     /// This is O(log n) — we only update the path from the leaf to the root,
     /// not the entire tree.
-    pub fn mark_dirty(&self, task: TaskId, dep_graph: &DependencyGraph) {
+    pub fn mark_dirty(&self, task: TaskId, dep_graph: &dyn TaskGraphOps) {
         // Update this node
         if let Some(mut node) = self.nodes.get_mut(&task) {
             let was_dirty = node.dirty_count > 0;
@@ -649,7 +765,7 @@ impl AggregationGraph {
     }
 
     /// Mark a task as clean and propagate the clean delta up the aggregation tree.
-    pub fn mark_clean(&self, task: TaskId, dep_graph: &DependencyGraph) {
+    pub fn mark_clean(&self, task: TaskId, dep_graph: &dyn TaskGraphOps) {
         if let Some(mut node) = self.nodes.get_mut(&task)
             && node.dirty_count > 0
         {
@@ -670,7 +786,7 @@ impl AggregationGraph {
     ///
     /// Returns the number of nodes removed (compacted away).
     /// If the subtree is not clean, returns 0 and does nothing.
-    pub fn compact(&self, task: TaskId, dep_graph: &DependencyGraph) -> usize {
+    pub fn compact(&self, task: TaskId, dep_graph: &dyn TaskGraphOps) -> usize {
         // Only compact if the subtree is clean
         let is_clean = self.nodes.get(&task).map(|r| r.is_clean()).unwrap_or(false);
         if !is_clean {
@@ -718,7 +834,7 @@ impl AggregationGraph {
     ///
     /// Finds all root tasks (tasks with no dependents) and compacts their
     /// clean subtrees. Returns the total number of nodes removed.
-    pub fn compact_all(&self, dep_graph: &DependencyGraph) -> usize {
+    pub fn compact_all(&self, dep_graph: &dyn TaskGraphOps) -> usize {
         let all_tasks = dep_graph.all_tasks();
         let roots: Vec<TaskId> = all_tasks
             .iter()

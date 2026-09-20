@@ -89,13 +89,9 @@ pub fn parse_schema(source: &str) -> Result<DrizzleSchema> {
 
 fn extract_quoted_string(s: &str) -> Option<String> {
     let s = s.trim_start();
-    if s.starts_with('\'') || s.starts_with('"') {
-        let quote = s.chars().next().unwrap();
-        if let Some(end) = s[1..].find(quote) {
-            return Some(s[1..1 + end].to_string());
-        }
-    }
-    None
+    let quote = s.chars().next().filter(|c| *c == '\'' || *c == '"')?;
+    let end = s[1..].find(quote)?;
+    Some(s[1..1 + end].to_string())
 }
 
 fn find_matching_brace(s: &str) -> Option<usize> {

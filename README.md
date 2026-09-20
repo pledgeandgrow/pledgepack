@@ -45,7 +45,7 @@ pledgepack/
 ├── Cargo.toml              # Rust workspace
 ├── build.zig               # Zig build script
 ├── build.zig.zon           # Zig config
-├── package.json            # npm package (bin: pledgepack, pledge)
+├── package.json            # npm package (bin: pledgepack only — the `pledge` alias was removed)
 ├── native-sys/             # Rust FFI bindings to Zig
 │   ├── src/lib.rs          # C ABI bindings (Graph, read_file, find_imports)
 │   └── zig/                # Zig native library
@@ -241,7 +241,7 @@ Config resolution order: `pledge.config.ts` → `pledge.config.js` → `pledge.c
 
 ### `.env` Files
 
-Pledge loads environment variables from `.env` files with the following precedence (highest first):
+PledgePack loads environment variables from `.env` files with the following precedence (highest first):
 
 1. `.env.[mode].local`
 2. `.env.[mode]`
@@ -448,9 +448,36 @@ The native binary can be used programmatically via Rust crates:
 }
 ```
 
+## Distribution
+
+PledgePack is distributed via **npm only** (`npm install -g pledgepack`); the
+Rust crates in this workspace are deliberately **not published to crates.io**
+(`publish = false`). See [CONTRIBUTING.md](CONTRIBUTING.md#distribution--publish-policy).
+
 ## License
 
 MIT License ([LICENSE](LICENSE)).
+
+## Status
+
+Current version: **1.0.0-rc.1** (release candidate). For the honest, source-verified picture of what
+works and what doesn't, see
+[docs/PRODUCTION-READINESS-100.md](docs/PRODUCTION-READINESS-100.md) — it is
+the authoritative status document (a goal only counts as done when backed by
+a CI-enforced regression test). As of 2026-09-17 the headline items are:
+
+- `wasm-plugin-host` compiles and is fully green: the `task_transform` /
+  `ast_pool` modules were wired into `pledgepack-core`, the WASI
+  integration was migrated to the wasmtime-48 API, and the crate passes
+  40 unit + 20 e2e tests (real WASM component, sandboxed instantiation,
+  hook dispatch) — no longer excluded from CI's workspace commands.
+- `cargo deny check advisories` / `cargo audit` are green (commit
+  `75946ba`): wasmtime 28.0.1 → 48.0.2 cleared all 20 disclosed RUSTSEC
+  advisories; rustls was bumped alongside it.
+- Workspace `clippy -D warnings` is green with no crate exclusions.
+- The previously `#[ignore]`d Windows heap-corruption resolver test
+  (`pnpm_virtual_store_fallback_...`, goal 54) now passes — the crash was
+  a symptom of the runtime-shim bug fixed in `3e5874b`.
 
 See [docs/ROADMAP.md](docs/ROADMAP.md) for the roadmap.
 See [docs/LIMITATIONS.md](docs/LIMITATIONS.md) for known limitations.

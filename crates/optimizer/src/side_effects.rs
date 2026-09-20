@@ -56,7 +56,6 @@ impl SideEffectDetector {
         match stmt {
             // Pure: declarations that don't execute code at eval time
             Statement::ImportDeclaration(_)
-            | Statement::ExportNamedDeclaration(_)
             | Statement::ExportAllDeclaration(_)
             | Statement::TSTypeAliasDeclaration(_)
             | Statement::TSInterfaceDeclaration(_)
@@ -64,12 +63,34 @@ impl SideEffectDetector {
             | Statement::TSModuleDeclaration(_)
             | Statement::TSImportEqualsDeclaration(_) => {}
 
+            // `export const x = compute();` executes `compute()` at eval
+            // time exactly like the non-exported form — the declaration
+            // inside must be classified, not waved through.
+            Statement::ExportNamedDeclaration(decl) => {
+                if let Some(inner) = &decl.declaration {
+                    match inner {
+                        Declaration::VariableDeclaration(v) => {
+                            for d in &v.declarations {
+                                if let Some(init) = &d.init {
+                                    self.classify_expression(init);
+                                }
+                            }
+                        }
+                        Declaration::ClassDeclaration(c) => self.classify_class(c),
+                        _ => {}
+                    }
+                }
+            }
+
             Statement::ExportDefaultDeclaration(decl) => {
                 // `export default function Foo() {}` → pure
                 // `export default class Foo {}` → pure
                 // `export default someExpr` → check the expression
                 if let Some(expr) = decl.declaration.as_expression() {
                     self.classify_expression(expr);
+                } else if let ExportDefaultDeclarationKind::ClassDeclaration(c) = &decl.declaration
+                {
+                    self.classify_class(c);
                 }
             }
 
@@ -84,7 +105,8 @@ impl SideEffectDetector {
                 }
             }
 
-            Statement::FunctionDeclaration(_) | Statement::ClassDeclaration(_) => {}
+            Statement::FunctionDeclaration(_) => {}
+            Statement::ClassDeclaration(c) => self.classify_class(c),
 
             Statement::ExpressionStatement(expr_stmt) => {
                 // Top-level expression — could be a call, assignment, etc.
@@ -109,6 +131,19 @@ impl SideEffectDetector {
         }
     }
 
+    /// A class definition runs code at eval time through its `extends`
+    /// expression and its `static { }` blocks.
+    fn classify_class(&mut self, class: &Class) {
+        if let Some(sup) = &class.super_class {
+            self.classify_expression(sup);
+        }
+        for el in &class.body.body {
+            if matches!(el, ClassElement::StaticBlock(_)) {
+                self.has_side_effects = true;
+            }
+        }
+    }
+
     /// Classify an expression at module top level.
     ///
     /// Only calls, awaits, new, assignments, updates, and yields count
@@ -124,9 +159,34 @@ impl SideEffectDetector {
             | Expression::AwaitExpression(_)
             | Expression::AssignmentExpression(_)
             | Expression::UpdateExpression(_)
-            | Expression::YieldExpression(_) => {
+            | Expression::YieldExpression(_)
+            // `tag`x`` is a call; `import('x')` starts a load.
+            | Expression::TaggedTemplateExpression(_)
+            | Expression::ImportExpression(_) => {
                 self.has_side_effects = true;
             }
+
+            // Wrappers: the effect is in what they wrap.
+            Expression::ParenthesizedExpression(p) => self.classify_expression(&p.expression),
+            Expression::ChainExpression(_) => {
+                // Optional call chains (`a?.()`) — conservatively effectful.
+                self.has_side_effects = true;
+            }
+            Expression::UnaryExpression(u) => {
+                if matches!(u.operator, UnaryOperator::Delete) {
+                    self.has_side_effects = true;
+                } else {
+                    self.classify_expression(&u.argument);
+                }
+            }
+            Expression::BinaryExpression(b) => {
+                self.classify_expression(&b.left);
+                self.classify_expression(&b.right);
+            }
+            Expression::TSAsExpression(e) => self.classify_expression(&e.expression),
+            Expression::TSSatisfiesExpression(e) => self.classify_expression(&e.expression),
+            Expression::TSNonNullExpression(e) => self.classify_expression(&e.expression),
+            Expression::TSTypeAssertion(e) => self.classify_expression(&e.expression),
 
             // Recurse into compound expressions — embedded calls count
             Expression::TemplateLiteral(tpl) => {
@@ -195,6 +255,31 @@ mod tests {
 
     fn has_sx(source: &str) -> bool {
         has_side_effects_ast(source, SourceType::mjs())
+    }
+
+    #[test]
+    fn exported_declarations_with_calls_are_side_effects() {
+        assert!(has_sx("export const registered = register();"));
+        assert!(has_sx("export let a = 1, b = init();"));
+        assert!(!has_sx("export const x = 1; export function f() { g(); }"));
+    }
+
+    #[test]
+    fn parenthesized_and_wrapped_calls_are_side_effects() {
+        assert!(has_sx("const x = (foo());"));
+        assert!(has_sx("const x = 1 + foo();"));
+        assert!(has_sx("const x = !foo();"));
+        assert!(has_sx("const x = tag`a`;"));
+        assert!(has_sx("const x = a?.b();"));
+        assert!(!has_sx("const x = (1 + 2) * 3;"));
+    }
+
+    #[test]
+    fn class_extends_call_and_static_blocks_are_side_effects() {
+        assert!(has_sx("class A extends mixin(B) {}"));
+        assert!(has_sx("export class A extends mixin(B) {}"));
+        assert!(has_sx("class A { static { init(); } }"));
+        assert!(!has_sx("class A extends B { m() { init(); } }"));
     }
 
     #[test]

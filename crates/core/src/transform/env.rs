@@ -331,13 +331,18 @@ pub(super) fn expand_import_meta_glob(
             if eager {
                 let var_name = format!("__pledge_glob_{}", i);
                 if is_raw {
-                    // TODO(#fix): Make this transform fully async so file reads
-                    // use tokio::task::spawn_blocking instead of blocking the
-                    // worker thread. For now this runs on rayon workers (not
-                    // the tokio runtime), but synchronous I/O still stalls the
-                    // transform pipeline. A future refactor should collect all
-                    // raw paths and batch-read them via spawn_blocking.
-                    let content = std::fs::read_to_string(abs_path).unwrap_or_default();
+                    // Design note: transforms run on rayon workers, not the tokio
+                    // runtime, so this synchronous read blocks only its own worker
+                    // thread. A read failure is logged (not silently turned into an
+                    // empty string) and the glob entry falls back to "".
+                    let content = std::fs::read_to_string(abs_path).unwrap_or_else(|e| {
+                        tracing::warn!(
+                            "import.meta.glob ?raw: cannot read {}: {}",
+                            crate::display_path(&abs_path),
+                            e
+                        );
+                        String::new()
+                    });
                     imports_prefix.push_str(&format!(
                         "const {} = {};\n",
                         var_name,

@@ -24,6 +24,12 @@
 > current, test-verified status (governing rule: a claim counts as done only
 > once backed by a passing, CI-enforced regression test).
 >
+> **2026-09-17 update:** the wasmtime bump has since landed — `Cargo.lock`
+> now pins 48.0.2 (commit `75946ba`), so the "wasmtime v47" references below
+> were wrong in *both* directions and the 28.0.1 pin this correction cited
+> is also superseded. `wasm-plugin-host` now compiles and passes all tests
+> (40 unit + 20 e2e) on 48.0.2.
+>
 > Status: Consolidated analysis · Last updated: 2026-08-10 (all 194 rival goals complete, all moat pillars built, verified against source code)
 >
 > This file consolidates: Moat Analysis, Competitor Analysis, Engine Design Comparison, Turbo-Tasks Analysis, and Current State Audit.

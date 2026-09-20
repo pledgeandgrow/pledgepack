@@ -81,7 +81,7 @@ pub fn resolve_preset(name: &str) -> Option<PluginPreset> {
         && let Ok(content) = std::fs::read_to_string(&path)
         && let Ok(preset) = serde_json::from_str::<PluginPreset>(&content)
     {
-        info!("Loaded community preset '{}' from {}", name, path.display());
+        info!("Loaded community preset '{}' from {}", name, crate::display_path(&path));
         return Some(preset);
     }
     warn!("Preset '{}' not found", name);
@@ -397,7 +397,7 @@ pub fn detect_workspace(start: &Path) -> Option<WorkspaceInfo> {
     }
     info!(
         "Detected workspace at {} with {} packages ({})",
-        root.display(),
+        crate::display_path(&root),
         packages.len(),
         pm
     );

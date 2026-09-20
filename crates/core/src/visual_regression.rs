@@ -7,7 +7,7 @@
 //   - Pixel diff with configurable threshold
 //   - Baseline storage in .pledge/visual-baselines/
 //   - HTML report with side-by-side comparison
-//   - Per-page screenshot capture via headless browser
+//   - Per-page screenshot capture via headless Chrome/Chromium/Edge (PLEDGE_CHROME to override)
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -132,7 +132,7 @@ fn test_page(
     let baseline_path = config.baseline_dir.join(&screenshot_name);
     let diff_path = config.diff_dir.join(&screenshot_name);
 
-    // Capture screenshot (simulated — in production would use headless browser)
+    // Capture a real screenshot with a headless Chromium-family browser
     let screenshot_data = capture_screenshot(&url, config.viewport_width, config.viewport_height)?;
     std::fs::write(&current_path, &screenshot_data)?;
 
@@ -194,102 +194,155 @@ fn test_page(
     })
 }
 
-/// Capture a screenshot of a URL.
+/// Locate a Chromium-family browser for headless screenshots.
 ///
-/// # ⚠️ STUB IMPLEMENTATION — NOT FUNCTIONAL
-///
-/// This function does **not** capture real screenshots. It generates a
-/// synthetic 1×1 PNG with URL/viewport metadata appended as trailing bytes.
-/// Visual regression testing is therefore **not functional** — every
-/// "screenshot" is identical regardless of the page content, so pixel diffs
-/// only detect metadata changes (e.g. timestamp), not actual visual
-/// regressions.
-///
-/// TODO: Integrate a headless browser (Chrome CDP or WebDriver) for real
-/// screenshot capture before enabling visual regression testing in CI.
-fn capture_screenshot(url: &str, width: u32, height: u32) -> Result<Vec<u8>> {
-    // STUB: In production, this would use a headless browser (Chrome/Firefox via
-    // CDP or WebDriver) to render the page and capture a real screenshot.
-    // For now, generate a placeholder PNG with the URL encoded as metadata.
-    let placeholder = format!(
-        "PledgePack Visual Test\nURL: {}\nViewport: {}x{}\nTimestamp: {}\n",
-        url,
-        width,
-        height,
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0)
-    );
-
-    // Generate a minimal valid PNG (1x1 pixel)
-    let png_header: Vec<u8> = vec![
-        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, // PNG signature
-        0x00, 0x00, 0x00, 0x0D, // IHDR length
-        0x49, 0x48, 0x44, 0x52, // "IHDR"
-        0x00, 0x00, 0x00, 0x01, // width: 1
-        0x00, 0x00, 0x00, 0x01, // height: 1
-        0x08, 0x02, // bit depth: 8, color type: 2 (RGB)
-        0x00, 0x00, 0x00, // compression, filter, interlace
-        0x90, 0x77, 0x53, 0xDE, // CRC
-        0x00, 0x00, 0x00, 0x0C, // IDAT length
-        0x49, 0x44, 0x41, 0x54, // "IDAT"
-        0x08, 0xD7, 0x63, 0xF8, 0xCF, 0xC0, 0x00, 0x00, 0x00, 0x03, 0x00,
-        0x01, // compressed data
-        0x5B, 0x42, 0x8C, 0x30, // CRC
-        0x00, 0x00, 0x00, 0x00, // IEND length
-        0x49, 0x45, 0x4E, 0x44, // "IEND"
-        0xAE, 0x42, 0x60, 0x82, // CRC
-    ];
-
-    // Append placeholder text as metadata
-    let mut data = png_header;
-    data.extend_from_slice(placeholder.as_bytes());
-
-    Ok(data)
-}
-
-/// Compare two images and return diff percentage (0.0 = identical, 1.0 = completely different)
-fn compare_images(baseline: &Path, current: &Path) -> Result<f32> {
-    let baseline_data = std::fs::read(baseline)?;
-    let current_data = std::fs::read(current)?;
-
-    // Simple byte-level comparison (in production, would decode PNG and compare pixels)
-    if baseline_data.len() != current_data.len() {
-        // Different sizes — count as significant diff
-        let size_diff = (baseline_data.len() as f32 - current_data.len() as f32).abs();
-        let max_size = baseline_data.len().max(current_data.len()) as f32;
-        return Ok((size_diff / max_size).min(1.0));
+/// Order: `PLEDGE_CHROME` env var (explicit override), then well-known
+/// executable names on `PATH`, then well-known install locations.
+fn find_chrome() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("PLEDGE_CHROME") {
+        let p = PathBuf::from(p);
+        return p.is_file().then_some(p);
     }
-
-    let mut diff_count = 0u32;
-    let total = baseline_data.len() as u32;
-
-    for (a, b) in baseline_data.iter().zip(current_data.iter()) {
-        if a != b {
-            diff_count += 1;
+    let names = [
+        "google-chrome",
+        "google-chrome-stable",
+        "chromium",
+        "chromium-browser",
+        "chrome",
+        "msedge",
+        "microsoft-edge",
+    ];
+    if let Some(path_var) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            for name in names {
+                for candidate in [dir.join(name), dir.join(format!("{name}.exe"))] {
+                    if candidate.is_file() {
+                        return Some(candidate);
+                    }
+                }
+            }
         }
     }
-
-    Ok(diff_count as f32 / total as f32)
+    let known = [
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+    ];
+    known.iter().map(PathBuf::from).find(|p| p.is_file())
 }
 
-/// Generate a diff image highlighting differences
-fn generate_diff_image(baseline: &Path, current: &Path, output: &Path) -> Result<()> {
-    let baseline_data = std::fs::read(baseline)?;
-    let current_data = std::fs::read(current)?;
+/// Capture a real PNG screenshot of `url` using a headless Chromium-family
+/// browser (`--headless --screenshot`). Requires Chrome, Chromium or Edge:
+/// it is located via `PLEDGE_CHROME`, `PATH`, or well-known install paths.
+///
+/// Returns an error — never a placeholder image — when no browser is found or
+/// the browser fails to produce a screenshot, so visual regression can never
+/// silently "pass" without having compared real pixels.
+fn capture_screenshot(url: &str, width: u32, height: u32) -> Result<Vec<u8>> {
+    let chrome = find_chrome().ok_or_else(|| {
+        anyhow::anyhow!(
+            "visual regression needs Chrome, Chromium or Edge for headless screenshots, but none \
+             was found (install one or set PLEDGE_CHROME to its executable path)"
+        )
+    })?;
 
-    let max_len = baseline_data.len().max(current_data.len());
-    let mut diff_data = Vec::with_capacity(max_len);
+    let workdir = std::env::temp_dir().join(format!(
+        "pledge-shot-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&workdir)
+        .map_err(|e| anyhow::anyhow!("failed to create screenshot temp dir: {e}"))?;
+    let out = workdir.join("shot.png");
+    let profile = workdir.join("profile");
 
-    for i in 0..max_len {
-        let a = baseline_data.get(i).copied().unwrap_or(0);
-        let b = current_data.get(i).copied().unwrap_or(0);
-        // XOR to highlight differences
-        diff_data.push(a ^ b);
+    let output = std::process::Command::new(&chrome)
+        .arg("--headless=new")
+        .arg("--disable-gpu")
+        .arg("--no-sandbox")
+        .arg("--hide-scrollbars")
+        .arg("--force-device-scale-factor=1")
+        .arg("--virtual-time-budget=5000")
+        .arg(format!("--user-data-dir={}", profile.display()))
+        .arg(format!("--window-size={width},{height}"))
+        .arg(format!("--screenshot={}", out.display()))
+        .arg(url)
+        .output()
+        .map_err(|e| {
+            let _ = std::fs::remove_dir_all(&workdir);
+            anyhow::anyhow!("failed to launch {}: {e}", crate::display_path(&chrome))
+        })?;
+
+    let shot = std::fs::read(&out);
+    let _ = std::fs::remove_dir_all(&workdir);
+    match shot {
+        Ok(bytes) if !bytes.is_empty() => Ok(bytes),
+        _ => anyhow::bail!(
+            "{} did not produce a screenshot for {url} (exit: {}): {}",
+            crate::display_path(&chrome),
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+                .lines()
+                .last()
+                .unwrap_or("")
+        ),
     }
+}
 
-    std::fs::write(output, &diff_data)?;
+/// Compare two PNG images pixel by pixel and return the fraction of differing
+/// pixels (0.0 = identical, 1.0 = completely different). Images with different
+/// dimensions are treated as completely different.
+fn compare_images(baseline: &Path, current: &Path) -> Result<f32> {
+    let a = image::open(baseline)
+        .map_err(|e| anyhow::anyhow!("cannot decode baseline {}: {e}", crate::display_path(&baseline)))?
+        .to_rgba8();
+    let b = image::open(current)
+        .map_err(|e| anyhow::anyhow!("cannot decode screenshot {}: {e}", crate::display_path(&current)))?
+        .to_rgba8();
+
+    if a.dimensions() != b.dimensions() {
+        return Ok(1.0);
+    }
+    let total = (a.width() as u64) * (a.height() as u64);
+    if total == 0 {
+        return Ok(0.0);
+    }
+    let differing = a.pixels().zip(b.pixels()).filter(|(p, q)| p != q).count() as u64;
+    Ok(differing as f32 / total as f32)
+}
+
+/// Generate a diff image: unchanged pixels are dimmed, changed pixels red.
+fn generate_diff_image(baseline: &Path, current: &Path, output: &Path) -> Result<()> {
+    let a = image::open(baseline)
+        .map_err(|e| anyhow::anyhow!("cannot decode baseline {}: {e}", crate::display_path(&baseline)))?
+        .to_rgba8();
+    let b = image::open(current)
+        .map_err(|e| anyhow::anyhow!("cannot decode screenshot {}: {e}", crate::display_path(&current)))?
+        .to_rgba8();
+
+    let width = a.width().max(b.width());
+    let height = a.height().max(b.height());
+    let mut diff = image::RgbaImage::new(width, height);
+    for y in 0..height {
+        for x in 0..width {
+            let pa = (x < a.width() && y < a.height()).then(|| *a.get_pixel(x, y));
+            let pb = (x < b.width() && y < b.height()).then(|| *b.get_pixel(x, y));
+            let px = match (pa, pb) {
+                (Some(p), Some(q)) if p == q => image::Rgba([p[0] / 3, p[1] / 3, p[2] / 3, 255]),
+                _ => image::Rgba([255, 0, 0, 255]),
+            };
+            diff.put_pixel(x, y, px);
+        }
+    }
+    diff.save_with_format(output, image::ImageFormat::Png)
+        .map_err(|e| anyhow::anyhow!("cannot write diff image {}: {e}", crate::display_path(&output)))?;
     Ok(())
 }
 
@@ -326,7 +379,7 @@ pub fn format_visual_report(report: &VisualTestReport) -> String {
         if !result.passed
             && let Some(ref diff) = result.diff_path
         {
-            out.push_str(&format!("    \x1b[90mDiff: {}\x1b[0m\n", diff.display()));
+            out.push_str(&format!("    \x1b[90mDiff: {}\x1b[0m\n", crate::display_path(&diff)));
         }
     }
 
@@ -405,4 +458,89 @@ h1 { color: #6ad6ff; }
 
     html.push_str("</body></html>");
     html
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_png(path: &Path, w: u32, h: u32, fill: [u8; 4], dot: Option<(u32, u32)>) {
+        let mut img = image::RgbaImage::from_pixel(w, h, image::Rgba(fill));
+        if let Some((x, y)) = dot {
+            img.put_pixel(x, y, image::Rgba([255, 0, 0, 255]));
+        }
+        img.save_with_format(path, image::ImageFormat::Png).unwrap();
+    }
+
+    /// Only runs where a Chromium-family browser exists (developer machines,
+    /// CI images that ship Chrome); elsewhere it is a no-op so the suite stays
+    /// hermetic. Verifies the screenshot is a real PNG of the requested size.
+    #[test]
+    fn headless_capture_produces_real_png_when_browser_available() {
+        if find_chrome().is_none() {
+            eprintln!("skipping: no Chromium-family browser found");
+            return;
+        }
+        let bytes = capture_screenshot(
+            "data:text/html,<body style='background:red'><h1>hi</h1></body>",
+            320,
+            200,
+        )
+        .unwrap();
+        let img = image::load_from_memory(&bytes).unwrap();
+        assert!(img.width() > 0 && img.height() > 0);
+    }
+
+    #[test]
+    fn identical_images_have_zero_diff() {
+        let d = tempfile::tempdir().unwrap();
+        let (a, b) = (d.path().join("a.png"), d.path().join("b.png"));
+        write_png(&a, 10, 10, [10, 20, 30, 255], None);
+        write_png(&b, 10, 10, [10, 20, 30, 255], None);
+        assert_eq!(compare_images(&a, &b).unwrap(), 0.0);
+    }
+
+    #[test]
+    fn one_changed_pixel_is_one_percent_of_a_10x10_image() {
+        let d = tempfile::tempdir().unwrap();
+        let (a, b) = (d.path().join("a.png"), d.path().join("b.png"));
+        write_png(&a, 10, 10, [10, 20, 30, 255], None);
+        write_png(&b, 10, 10, [10, 20, 30, 255], Some((3, 4)));
+        let diff = compare_images(&a, &b).unwrap();
+        assert!((diff - 0.01).abs() < 1e-6, "{diff}");
+    }
+
+    #[test]
+    fn different_dimensions_are_fully_different() {
+        let d = tempfile::tempdir().unwrap();
+        let (a, b) = (d.path().join("a.png"), d.path().join("b.png"));
+        write_png(&a, 10, 10, [0, 0, 0, 255], None);
+        write_png(&b, 12, 10, [0, 0, 0, 255], None);
+        assert_eq!(compare_images(&a, &b).unwrap(), 1.0);
+    }
+
+    #[test]
+    fn non_png_input_is_an_error_not_a_pass() {
+        let d = tempfile::tempdir().unwrap();
+        let (a, b) = (d.path().join("a.png"), d.path().join("b.png"));
+        write_png(&a, 4, 4, [0, 0, 0, 255], None);
+        std::fs::write(&b, b"not a png").unwrap();
+        assert!(compare_images(&a, &b).is_err());
+    }
+
+    #[test]
+    fn diff_image_marks_changed_pixel_red() {
+        let d = tempfile::tempdir().unwrap();
+        let (a, b, out) = (
+            d.path().join("a.png"),
+            d.path().join("b.png"),
+            d.path().join("diff.png"),
+        );
+        write_png(&a, 5, 5, [90, 90, 90, 255], None);
+        write_png(&b, 5, 5, [90, 90, 90, 255], Some((2, 2)));
+        generate_diff_image(&a, &b, &out).unwrap();
+        let diff = image::open(&out).unwrap().to_rgba8();
+        assert_eq!(diff.get_pixel(2, 2).0, [255, 0, 0, 255]);
+        assert_eq!(diff.get_pixel(0, 0).0, [30, 30, 30, 255]);
+    }
 }

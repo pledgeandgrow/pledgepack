@@ -41,6 +41,20 @@ impl SolidAdapter {
         file_path: &str,
         is_production: bool,
     ) -> Result<String> {
+        self.transform_with_source_map(source, kind, file_path, is_production)
+            .map(|(code, _)| code)
+    }
+
+    /// Like [`transform`](Self::transform), also returning the v3 source map
+    /// (JSON) produced by Oxc's codegen. The dev-mode HMR snippet is appended
+    /// after the generated code, so the mappings stay valid.
+    pub fn transform_with_source_map(
+        &self,
+        source: &str,
+        kind: ModuleKind,
+        file_path: &str,
+        is_production: bool,
+    ) -> Result<(String, Option<String>)> {
         let allocator = Allocator::default();
         let path = Path::new(file_path);
 
@@ -98,10 +112,12 @@ impl SolidAdapter {
         let codegen_result = Codegen::new()
             .with_options(CodegenOptions {
                 minify: is_production,
+                source_map_path: Some(path.to_path_buf()),
                 ..CodegenOptions::default()
             })
             .build(&program);
 
+        let source_map = codegen_result.map.as_ref().map(|m| m.to_json_string());
         let mut code = codegen_result.code;
 
         // Inject Solid HMR boundary in dev mode with reactive scope preservation
@@ -131,7 +147,7 @@ if (import.meta.hot && typeof window !== 'undefined') {
             );
         }
 
-        Ok(code)
+        Ok((code, source_map))
     }
 }
 
@@ -148,6 +164,23 @@ mod tests {
     // adapter-tanstack) marketed as supported. See also goal 70's note in
     // this crate's doc comment.
     use super::*;
+
+    #[test]
+    fn transform_with_source_map_emits_a_v3_map() {
+        let adapter = SolidAdapter::new();
+        let (code, map) = adapter
+            .transform_with_source_map(
+                "export default function App() { return <div>Hello</div>; }",
+                ModuleKind::Jsx,
+                "App.jsx",
+                true,
+            )
+            .unwrap();
+        assert!(code.contains("Hello"));
+        let map: serde_json::Value = serde_json::from_str(&map.expect("no source map")).unwrap();
+        assert_eq!(map["version"], 3);
+        assert!(map["sources"].to_string().contains("App.jsx"));
+    }
 
     #[test]
     fn transforms_basic_jsx_in_dev_mode() {

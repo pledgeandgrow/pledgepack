@@ -513,13 +513,13 @@ fn to_pascal_case(s: &str) -> String {
 
 // ─── Feature 33: YAML/CSV/TSV imports ─────────────────────────────────
 
-/// Transform YAML to ES module with named exports using noyalib for proper
+/// Transform YAML to ES module with named exports using serde-saphyr for proper
 /// parsing of nested structures, lists, anchors, and multi-line strings.
 pub fn transform_yaml(source: &str) -> String {
-    let parsed: serde_json::Value = match noyalib::from_str(source) {
+    let parsed: serde_json::Value = match serde_saphyr::from_str(source) {
         Ok(v) => v,
         Err(_) => {
-            // Fallback: if noyalib fails, produce empty default export
+            // Fallback: if the YAML is invalid, produce empty default export
             return "export default {};".to_string();
         }
     };
@@ -977,6 +977,28 @@ mod tests {
         assert!(code.contains("export const name = \"Test\""));
         assert!(code.contains("export const version = 2"));
         assert!(code.contains("export const enabled = true"));
+    }
+
+    #[test]
+    fn test_transform_yaml_nested_anchors_and_lists() {
+        let yaml = "base: &b
+  a: 1
+child:
+  <<: *b
+  list: [x, z]
+multi: |
+  line1
+  line2
+";
+        let code = transform_yaml(yaml);
+        assert!(code.contains("export const base = {\"a\":1}"), "{code}");
+        assert!(code.contains("\"list\":[\"x\",\"z\"]"), "{code}");
+        assert!(code.contains("line1\\nline2"), "{code}");
+    }
+
+    #[test]
+    fn test_transform_yaml_invalid_falls_back_to_empty_default() {
+        assert_eq!(transform_yaml("a: [unterminated"), "export default {};");
     }
 
     #[test]

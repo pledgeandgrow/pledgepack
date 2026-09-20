@@ -189,5 +189,7 @@ fn benchIo(writer: anytype, allocator: std.mem.Allocator) !void {
         try writer.print("  Batch read: FAILED\n", .{});
     }
 
-    io.resetArena();
+    if (result == 0) {
+        for (0..file_count) |i| io.freeBufferPtr(bufs[i]);
+    }
 }

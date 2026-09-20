@@ -21,7 +21,7 @@ pub fn compile_test_globset(patterns: &[String]) -> globset::GlobSet {
 
 /// Top-level configuration for the Pledge bundler.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(default)]
+#[serde(rename_all = "camelCase", default)]
 pub struct PledgeConfig {
     /// Entry points (e.g., ["src/index.tsx"])
     #[serde(default)]
@@ -48,7 +48,7 @@ pub struct PledgeConfig {
     pub alias: Vec<PathAlias>,
 
     /// File extensions to resolve (default: [".tsx", ".ts", ".jsx", ".js", ".json", ".css"])
-    #[serde(default)]
+    #[serde(default = "default_extensions")]
     pub extensions: Vec<String>,
 
     /// Nested resolve config (alternative to flat fields, matches pledge.json format)
@@ -65,7 +65,7 @@ pub struct PledgeConfig {
     pub dev_server: DevServerConfig,
 
     /// Whether to enable source maps
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub source_maps: bool,
 
     /// Resolve aliases (e.g., { "@": "./src" })
@@ -91,7 +91,7 @@ pub struct PledgeConfig {
     pub output_format: OutputFormat,
 
     /// Conditions for package.json exports resolution
-    #[serde(default)]
+    #[serde(default = "default_conditions")]
     pub conditions: Vec<String>,
 
     /// Optimization config (matches pledge.json format)
@@ -100,11 +100,11 @@ pub struct PledgeConfig {
     pub optimize: Option<OptimizeConfig>,
 
     /// Environment variable prefixes to inject (default: ["PLEDGE_"])
-    #[serde(default)]
+    #[serde(default = "default_env_prefix")]
     pub env_prefix: Vec<String>,
 
     /// Whether to generate .d.ts for import.meta.env (default: true)
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub env_dts: bool,
 
     /// HTML entry point (default: "index.html")
@@ -130,6 +130,11 @@ pub struct PledgeConfig {
     /// Plugin paths (JS/TS plugins to load)
     #[serde(default)]
     pub plugins: Vec<String>,
+
+    /// Plugin trust policy — signature + capability enforcement for
+    /// `plugins` (default: signed plugins required).
+    #[serde(default, alias = "pluginSecurity")]
+    pub plugin_security: PluginSecurityConfig,
 
     /// Library mode configuration (for building npm packages)
     #[serde(default)]
@@ -268,6 +273,7 @@ pub struct PledgeConfig {
 
 /// Test configuration (Vitest-compatible)
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct TestConfig {
     /// Test environment: "node" (default), "jsdom", "happy-dom"
     #[serde(default = "default_test_environment")]
@@ -370,6 +376,7 @@ impl Default for TestConfig {
 
 /// Build configuration for production builds
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct BuildConfig {
     /// Manual chunk splitting configuration
     /// Maps chunk name to list of module paths/globs to include
@@ -481,7 +488,7 @@ pub struct BuildConfig {
 
 /// CSS preprocessor configuration for multi-preprocessor support
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
-#[serde(default)]
+#[serde(rename_all = "camelCase", default)]
 pub struct CssPreprocessorConfig {
     /// Enable Less support (default: true if .less files detected)
     pub less: bool,
@@ -495,7 +502,7 @@ pub struct CssPreprocessorConfig {
 
 /// Template language configuration for server-side rendering
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
-#[serde(default)]
+#[serde(rename_all = "camelCase", default)]
 pub struct TemplateConfig {
     /// Enable Pug template compilation (default: false)
     pub pug: bool,
@@ -509,7 +516,7 @@ pub struct TemplateConfig {
 
 /// Compiled-to-JS language configuration
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
-#[serde(default)]
+#[serde(rename_all = "camelCase", default)]
 pub struct LanguageConfig {
     /// Enable CoffeeScript compilation (default: false)
     pub coffeescript: bool,
@@ -529,6 +536,24 @@ fn default_assets_inline_limit() -> usize {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_extensions() -> Vec<String> {
+    [".tsx", ".ts", ".jsx", ".js", ".mjs", ".json", ".css"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
+fn default_conditions() -> Vec<String> {
+    ["browser", "import"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
+fn default_env_prefix() -> Vec<String> {
+    ["PLEDGE_"].iter().map(|s| s.to_string()).collect()
 }
 
 fn default_preload_strategy() -> String {
@@ -628,7 +653,7 @@ pub struct PathAlias {
 
 /// Nested resolve configuration (matches pledge.json format)
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
-#[serde(default)]
+#[serde(rename_all = "camelCase", default)]
 pub struct ResolveConfig {
     /// Path aliases as a map (e.g., { "@": "./src" })
     pub alias: std::collections::HashMap<String, String>,
@@ -640,7 +665,7 @@ pub struct ResolveConfig {
 
 /// Nested optimization configuration (matches pledge.json format)
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
-#[serde(default)]
+#[serde(rename_all = "camelCase", default)]
 pub struct OptimizeConfig {
     /// Enable minification (default: true in production)
     pub minify: Option<bool>,
@@ -651,7 +676,7 @@ pub struct OptimizeConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(default)]
+#[serde(rename_all = "camelCase", default)]
 pub struct CacheConfig {
     /// Enable filesystem cache (default: true)
     pub enabled: bool,
@@ -664,6 +689,7 @@ pub struct CacheConfig {
 
 /// Settings for remote cache (S3/GCS/HTTP)
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct RemoteCacheSettings {
     /// Enable remote cache (default: false)
     pub enabled: bool,
@@ -690,7 +716,7 @@ impl Default for CacheConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(default)]
+#[serde(rename_all = "camelCase", default)]
 pub struct DevServerConfig {
     /// Port (default: 3000)
     #[serde(default = "default_dev_port")]
@@ -812,7 +838,7 @@ pub struct ProxyConfig {
 
 /// Image optimization configuration
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(default)]
+#[serde(rename_all = "camelCase", default)]
 pub struct ImageConfig {
     /// Enable image optimization (default: false)
     pub enabled: bool,
@@ -856,6 +882,7 @@ pub enum OutputFormat {
 
 /// Library mode configuration for building npm packages
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct LibraryConfig {
     /// Entry point for the library
     pub entry: String,
@@ -871,6 +898,7 @@ pub struct LibraryConfig {
 
 /// HTTPS configuration for dev server
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct HttpsConfig {
     /// Path to SSL certificate file
     pub cert: PathBuf,
@@ -880,7 +908,7 @@ pub struct HttpsConfig {
 
 /// Watch mode configuration
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(default)]
+#[serde(rename_all = "camelCase", default)]
 pub struct WatchConfig {
     /// Enable watch mode
     pub enabled: bool,
@@ -899,6 +927,7 @@ impl Default for WatchConfig {
 
 /// Webhook configuration for build events (#105)
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct WebhookConfig {
     /// Enable webhooks (default: false)
     #[serde(default)]
@@ -919,6 +948,7 @@ pub struct WebhookConfig {
 
 /// i18n configuration for locale-aware bundling (#106)
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct I18nConfig {
     /// Enable i18n-aware bundling (default: false)
     #[serde(default)]
@@ -960,6 +990,7 @@ fn default_message_pattern() -> String {
 /// CSS configuration for RTL auto-generation (#107), dark mode (#67),
 /// custom property optimization (#68), scoped CSS (#69)
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct CssConfig {
     /// RTL CSS generation mode: "auto", "manual", "off" (default: "off")
     #[serde(default = "default_rtl_mode")]
@@ -1008,6 +1039,7 @@ fn default_scoped_css() -> String {
 
 /// Accessibility linting configuration (#108)
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct A11yConfig {
     /// Enable a11y linting during build (default: false)
     #[serde(default)]
@@ -1040,6 +1072,7 @@ impl Default for A11yConfig {
 
 /// Build-time string encryption configuration (#109)
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct EncryptConfig {
     /// Enable string encryption (default: false)
     #[serde(default)]
@@ -1054,6 +1087,7 @@ pub struct EncryptConfig {
 
 /// Bundle size budget configuration (#102)
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct BudgetConfig {
     /// Enable budget checking (default: false)
     #[serde(default)]
@@ -1125,6 +1159,7 @@ impl Default for PledgeConfig {
             image: ImageConfig::default(),
             edge_target: None,
             plugins: vec![],
+            plugin_security: PluginSecurityConfig::default(),
             library: None,
             https: None,
             server_entry: None,
@@ -1422,6 +1457,7 @@ impl PledgeConfig {
 
 /// GraphQL code generation configuration (#116)
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct GraphqlConfig {
     /// Path to schema file (e.g., "schema.graphql")
     #[serde(default)]
@@ -1452,6 +1488,7 @@ impl Default for GraphqlConfig {
 
 /// Service worker caching configuration (#113)
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct SwCachingConfig {
     /// Per-route caching rules
     #[serde(default)]
@@ -1493,6 +1530,7 @@ impl Default for SwCachingConfig {
 
 /// Conditional exports resolution configuration (#119)
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct ExportsConfig {
     /// Additional conditions for package.json exports resolution
     /// e.g., ["production", "browser"] to prefer production/browser entry points
@@ -1505,6 +1543,7 @@ pub struct ExportsConfig {
 /// Plugin preset definition (#94)
 /// A preset bundles plugins and config defaults for a specific ecosystem
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct PluginPreset {
     /// Preset name (e.g., "react", "tailwind", "solid")
     pub name: String,
@@ -1524,6 +1563,7 @@ pub struct PluginPreset {
 /// Custom transformer pipeline configuration (#97)
 /// Allows inserting custom transform steps at any point in the pipeline
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct TransformPipelineConfig {
     /// Ordered list of transform steps
     /// Built-in steps: "oxc", "minify", "tree-shake"
@@ -1539,6 +1579,7 @@ pub struct TransformPipelineConfig {
 
 /// Workspace configuration for monorepo support (#98, #99, #100)
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct WorkspaceConfig {
     /// Enable workspace-aware resolution (default: true when workspaces is set)
     #[serde(default = "default_true")]
@@ -1570,6 +1611,7 @@ impl Default for WorkspaceConfig {
 
 /// Security configuration for SRI (#81) and CSP (#82)
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct SecurityConfig {
     /// Generate Subresource Integrity hashes for script/link tags (default: false)
     /// #81 — SHA-256 integrity attributes
@@ -1592,6 +1634,82 @@ impl Default for SecurityConfig {
 
 fn default_csp_mode() -> String {
     "off".to_string()
+}
+
+/// Plugin trust policy (`plugin_security` / `pluginSecurity` in config).
+///
+/// Defaults to **signed plugins required**: every plugin in `plugins` must
+/// carry a `<path>.sig.json` sidecar whose Ed25519 signature verifies
+/// against one of `trusted_keys` and whose declared capabilities pass the
+/// `CapabilityAuditor` policy. Set `require_signed = false` to opt out
+/// entirely (unsigned plugins load, no capability audit — documented as
+/// insecure, useful for local plugin development).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", default)]
+pub struct PluginSecurityConfig {
+    /// Require a valid `.sig.json` sidecar from a trusted signer on every
+    /// plugin (default: true — unsigned plugins are refused).
+    #[serde(default = "default_require_signed", alias = "requireSigned")]
+    pub require_signed: bool,
+
+    /// Trusted signer identities → hex-encoded Ed25519 public keys. A
+    /// signature only verifies if its `(identity, public_key)` pair is
+    /// listed here — with no trusted keys configured and
+    /// `require_signed` on, every plugin is refused.
+    #[serde(default, alias = "trustedKeys")]
+    pub trusted_keys: std::collections::HashMap<String, String>,
+
+    /// Extra capabilities to approve beyond the default policy
+    /// (e.g. "fs:write", "network", or custom strings).
+    #[serde(default, alias = "allowCapabilities")]
+    pub allow_capabilities: Vec<String>,
+
+    /// Extra capabilities to deny beyond the default policy.
+    #[serde(default, alias = "denyCapabilities")]
+    pub deny_capabilities: Vec<String>,
+}
+
+impl Default for PluginSecurityConfig {
+    fn default() -> Self {
+        Self {
+            require_signed: true,
+            trusted_keys: std::collections::HashMap::new(),
+            allow_capabilities: Vec::new(),
+            deny_capabilities: Vec::new(),
+        }
+    }
+}
+
+fn default_require_signed() -> bool {
+    true
+}
+
+impl PluginSecurityConfig {
+    /// Build the verifier + auditor a plugin host should enforce. Returns
+    /// `None` for both when `require_signed` is off — the explicit opt-out
+    /// disables the whole trust check, exactly like passing no verifier.
+    pub fn policy(
+        &self,
+    ) -> (
+        Option<crate::plugin_system::PluginSigningVerifier>,
+        Option<crate::plugin_system::CapabilityAuditor>,
+    ) {
+        if !self.require_signed {
+            return (None, None);
+        }
+        let mut verifier = crate::plugin_system::PluginSigningVerifier::new();
+        for (identity, key) in &self.trusted_keys {
+            verifier.trust_key(identity, key);
+        }
+        let mut auditor = crate::plugin_system::CapabilityAuditor::new();
+        for cap in &self.allow_capabilities {
+            auditor.approve(crate::plugin_system::PluginCapability::parse(cap));
+        }
+        for cap in &self.deny_capabilities {
+            auditor.deny(crate::plugin_system::PluginCapability::parse(cap));
+        }
+        (Some(verifier), Some(auditor))
+    }
 }
 
 #[cfg(test)]

@@ -494,6 +494,81 @@ pub fn list_pinned_plugins(cache_dir: &std::path::Path) -> Result<Vec<PinnedWasm
 }
 
 /// Remove a pinned plugin from the cache.
+/// Sign a plugin file, producing a `<path>.sig.json` trust sidecar that
+/// the plugin hosts verify at load time (see `plugin_security` config).
+///
+/// `secret_key_hex` is a 32-byte Ed25519 secret key (hex); the signature
+/// covers the plugin's blake3 hash, exactly what
+/// `PluginSigningVerifier::verify` checks. The signer identity +
+/// public key are embedded in the sidecar — consumers must add that pair
+/// to `plugin_security.trusted_keys` for the plugin to load.
+pub fn sign_plugin(
+    path: &std::path::Path,
+    identity: &str,
+    secret_key_hex: &str,
+    capabilities: &[crate::plugin_system::PluginCapability],
+) -> Result<std::path::PathBuf> {
+    use ed25519_dalek::{Signer, SigningKey};
+
+    let bytes = std::fs::read(path)
+        .map_err(|e| anyhow::anyhow!("Failed to read plugin {}: {e}", path.display()))?;
+    let hash_hex = blake3::hash(&bytes).to_hex().to_string();
+
+    let secret_bytes = hex::decode(secret_key_hex.trim())
+        .map_err(|e| anyhow::anyhow!("Invalid signing key (expected 64-char hex): {e}"))?;
+    let secret_bytes: [u8; 32] = secret_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("Signing key must be 32 bytes (64 hex chars)"))?;
+    let signing_key = SigningKey::from_bytes(&secret_bytes);
+    let signature = signing_key.sign(hash_hex.as_bytes());
+
+    let plugin_name = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("plugin")
+        .to_string();
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let sidecar = crate::plugin_system::PluginTrustSidecar {
+        signature: crate::plugin_system::PluginSignature {
+            plugin_name,
+            version: "0.0.0".to_string(),
+            wasm_hash: hash_hex,
+            signer_public_key: hex::encode(signing_key.verifying_key().to_bytes()),
+            signature: hex::encode(signature.to_bytes()),
+            signer_identity: identity.to_string(),
+            timestamp,
+            verified: false,
+        },
+        capabilities: capabilities.to_vec(),
+    };
+
+    let sidecar_path = {
+        let mut s = path.as_os_str().to_os_string();
+        s.push(".sig.json");
+        std::path::PathBuf::from(s)
+    };
+    let json = serde_json::to_string_pretty(&sidecar)?;
+    std::fs::write(&sidecar_path, format!("{json}\n"))?;
+
+    Ok(sidecar_path)
+}
+
+/// Generate a fresh Ed25519 signing keypair for plugin signing. Returns
+/// (secret_key_hex, public_key_hex).
+pub fn generate_signing_key() -> (String, String) {
+    let mut rng = rand::rngs::OsRng;
+    let signing_key = ed25519_dalek::SigningKey::generate(&mut rng);
+    (
+        hex::encode(signing_key.to_bytes()),
+        hex::encode(signing_key.verifying_key().to_bytes()),
+    )
+}
+
 pub fn unpin_plugin(name: &str, version: &str, cache_dir: &std::path::Path) -> Result<()> {
     let filename = format!(
         "{}-{}.wasm",

@@ -1,0 +1,20 @@
+[advisories]
+# Each ignored advisory carries a `review-by` date. `scripts/check-stale-ignores.sh`
+# (run in CI's `audit` job) fails the build once that date passes, so an ignore
+# can't silently become permanent.
+# This file lives at .cargo/audit.toml so a plain `cargo audit` (local or CI)
+# picks it up; it is the single source of truth — do not repeat --ignore flags.
+# Keep in sync with deny.toml's [advisories].ignore.
+# See PRODUCTION-READINESS-100.md goal 6.
+ignore = [
+    # bincode 2.0.1 — flagged as unmaintained. Latest major version, stable.
+    # review-by: 2026-12-15
+    "RUSTSEC-2025-0141",
+    # paste 1.0.15 — compile-time macro crate, no runtime code. Transitive.
+    # review-by: 2026-12-15
+    "RUSTSEC-2024-0436",
+    # fxhash 0.2.1 — unmaintained (no CVE); transitive via scraper -> selectors.
+    # See deny.toml for the full rationale.
+    # review-by: 2026-12-15
+    "RUSTSEC-2025-0057",
+]

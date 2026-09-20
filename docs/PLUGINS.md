@@ -17,34 +17,61 @@ If you don't have a reason to pick one, use `wasm-plugin-host` — it's the
 one PledgePack is consolidating on (see "Which host should I target?"
 below).
 
-> ⚠️ **Known issue as of this writing:** the pinned `wasmtime`/`wasmtime-wasi`
-> version (28.0.1) has multiple disclosed RUSTSEC advisories, some of them
-> sandbox-escape or memory-safety issues in the WASM runtime itself — see
-> `PRODUCTION-READINESS-100.md`'s Phase 1 callout. Until that's resolved,
-> "sandboxed" in the table above is the *design intent*, not a guarantee to
-> rely on for genuinely untrusted, adversarial plugin code.
+> ✅ **Update 2026-09-17:** `wasm-plugin-host` compiles and is fully green —
+> the `task_transform`/`ast_pool` wiring gap was closed, the WASI code was
+> migrated to the wasmtime-48 API, and the crate passes 40 unit + 20 e2e
+> tests on wasmtime 48.0.2 (sandboxed component instantiation verified). It
+> is no longer excluded from workspace builds. The earlier warning here —
+> that the crate didn't compile and "sandboxed" was only design intent — is
+> resolved; the RUSTSEC advisories on wasmtime 28.0.1 were cleared by the
+> same day's `75946ba` bump. Caveat that still applies: e2e coverage is a
+> single test plugin, so "sandboxed" is verified against the shipped WASI
+> restriction set, not yet adversarially probed.
 
 ## Hook reference
 
 | Hook | Signature | Ordering | Notes |
 |---|---|---|---|
-| `resolveId` | `(source, importer, isEntry, kind) -> id?` | Sequential, first non-null wins | |
-| `load` | `(id) -> code?` | Sequential, first non-null wins | |
-| `transform` | `(code, id) -> code?` | Sequential chain — each plugin sees the previous plugin's output | |
-| `transformIndexHtml` | `(html, path) -> html?` | Sequential chain | |
-| `renderChunk` | `(code, filename, chunkType) -> code?` | Sequential chain | Runs after code splitting, before final emit. Added to the WIT contract in v0.1.2. |
+| `resolveId` | `(source, importer, isEntry, kind) -> id?` | Sequential, first non-null wins | JS host (`pledge build`): called as `(source, importer)`; may return a string, `{ id, external }`, or `false` (= external). A non-file id is a virtual module that `load` must provide. |
+| `load` | `(id) -> code?` | Sequential, first non-null wins | JS host: string or `{ code, map }`. Runs before the file is read. |
+| `transform` | `(code, id) -> code?` | Sequential chain — each plugin sees the previous plugin's output | JS host (`pledge build`): runs on the loaded source **before** the built-in TS/JSX/CSS transform (see below). |
+| `transformIndexHtml` | `(html, path) -> html?` | Sequential chain | JS host: called as `(html, "index.html")`; may return a string, a tag array, or `{ html, tags }`. Runs before `index.html` is written. |
+| `renderChunk` | `(code, filename, chunkType) -> code?` | Sequential chain | Runs after code splitting, **before** content hashing and writing, so file-name hashes reflect the final code. `chunkType` is `"entry"` or `"chunk"` (`"module"` for per-module emit). Added to the WIT contract in v0.1.2. |
 | `handleHotUpdate` | `(file, timestamp) -> moduleIds?` | Sequential, first non-null wins | Dev mode only. Returning `none` defers to the next plugin (or the host's default HMR resolution if none handle it); returning an *empty* `moduleIds` list means "I handled this, suppress HMR for it" — those are different outcomes, pick deliberately. Added to the WIT contract in v0.1.3 — previously absent from both hosts. |
 | `buildStart` | `()` | All plugins called; order not guaranteed | |
 | `buildEnd` | `()` | All plugins called; order not guaranteed | |
 | `generateBundle` | `()` | All plugins called; order not guaranteed | |
 | `configureServer` | `() -> middleware?` | All plugins called, results collected | Dev mode only. |
 
-**Plugin ordering** (`enforce`): a plugin can declare `enforce: "pre"` to run
-before PledgePack's built-in transform, or `enforce: "post"` (the default,
-including when `enforce` is unset) to run after. This only affects
-`transform`'s position relative to the built-in transform pipeline — it
-doesn't reorder plugins relative to each other within the "pre" or "post"
-group.
+**JS host per-module hooks in `pledge build`.** `resolveId`, `load`, `transform`,
+`renderChunk` and `transformIndexHtml` run in the production build through the core
+`PluginHooks` bridge, with the ordering above. Any exception or promise rejection
+aborts the build with a message of the form
+``plugin '<name>' failed in `<hook>` hook for <file>: <message>``.
+`async` hooks are awaited (microtasks only). `transform` sees the *source* module text
+(TypeScript/JSX included) because hooks run before the built-in transform; that keeps
+dependency discovery and every cache keyed on what the plugin produced. Plugin
+`transform` results are re-computed each build, and returned source maps are ignored.
+Plugin paths in `plugins` are resolved against the project root (`--root`).
+
+**JS host lifecycle semantics.** `buildStart`, `buildEnd` and `generateBundle` run in
+plugin load order; `async` hooks are awaited (microtasks only — QuickJS has no timers or
+I/O); a throwing/rejecting hook does not stop later plugins but makes `pledge build` fail.
+`generateBundle` is called as `generateBundle({}, {})` (files are already emitted to the
+output directory). `handleHotUpdate` runs in the dev server for files changed under the
+project root.
+
+**Trust policy.** Every plugin must carry a `<file>.sig.json` Ed25519 sidecar from a signer
+listed in `plugin_security.trustedKeys` (default: `requireSigned: true`; set it to `false`
+only for local development). See [LIMITATIONS.md](LIMITATIONS.md#js-plugin-system--full-api).
+
+**Plugin ordering** (`enforce`): for **WASM** plugins a plugin can declare
+`enforce: "pre"` to run before PledgePack's built-in transform, or
+`enforce: "post"` (the default) to run after. This only affects `transform`'s
+position relative to the built-in transform pipeline — it doesn't reorder
+plugins relative to each other within the "pre" or "post" group.
+For **JS** plugins in `pledge build` the `enforce` field is currently ignored:
+`transform` always runs before the built-in transform (see above).
 
 **Batch-load failure semantics differ between hosts** — worth knowing if
 you're loading several plugins at once:

@@ -27,8 +27,7 @@ use crate::config::PledgeConfig;
 use crate::module::ModuleKind;
 use crate::transform::{self, TransformOutput};
 use pledgepack_task_system::{
-    Task, TaskEngine, TaskEngineBuilder, TaskExecutor, TaskId, TaskRegistry,
-    StoredOutput,
+    StoredOutput, Task, TaskEngine, TaskEngineBuilder, TaskExecutor, TaskId, TaskRegistry,
 };
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -43,6 +42,10 @@ use tracing::{debug, trace};
 /// depend on `pledgepack-js-plugin-host` directly (which would create a
 /// circular dependency). The js-plugin-host crate constructs this from
 /// its `TransformResult` type.
+/// Shared callback type for plugin transform hooks — the indirection that
+/// lets this module avoid a circular dependency on the JS/WASM plugin hosts.
+pub type PluginTransformFn = Arc<dyn Fn(&str, &str) -> Option<PluginTransformResult> + Send + Sync>;
+
 #[derive(Debug, Clone)]
 pub struct PluginTransformResult {
     /// The transformed code
@@ -216,12 +219,7 @@ impl PluginOutput {
     }
 
     /// Create a PluginOutput from a resolve-id hook result.
-    pub fn from_resolve_id(
-        plugin_name: &str,
-        cache_key: &str,
-        id: String,
-        external: bool,
-    ) -> Self {
+    pub fn from_resolve_id(plugin_name: &str, cache_key: &str, id: String, external: bool) -> Self {
         Self {
             plugin_name: plugin_name.to_string(),
             hook: "resolve-id".to_string(),
@@ -284,7 +282,6 @@ impl From<TransformTaskOutput> for TransformOutput {
             is_worker: o.is_worker,
             dynamic_imports: o.dynamic_imports,
             content_hash: o.content_hash,
-            i18n_keys: None,
         }
     }
 }
@@ -321,21 +318,33 @@ impl TaskTransformEngine {
     }
 
     /// Create a new task transform engine with disk caching.
+    ///
+    /// Uses the content-addressed store (`<cache_dir>/cas/`): task outputs
+    /// are zstd-compressed blobs named by their blake3, indexed by an
+    /// append-only log — identical outputs dedupe automatically and reads
+    /// are integrity-verified by construction.
     pub fn with_disk(cache_dir: std::path::PathBuf) -> std::io::Result<Self> {
         let registry = TaskRegistry::new();
-        let disk = pledgepack_task_system::DiskBackend::new(cache_dir)?;
-        let engine = TaskEngineBuilder::new(registry)
-            .with_disk(disk)
-            .build();
+        let cas = pledgepack_task_system::CasBackend::new(cache_dir)?;
+        let engine = TaskEngineBuilder::new(registry).with_cas(cas).build();
         Ok(Self { engine })
     }
 
+    /// Wrap an externally-built `TaskEngine` — e.g. one constructed via
+    /// `TaskEngineBuilder` with disk + remote tiers configured by the
+    /// caller (as `BuildEngine` does from `config.cache`).
+    pub fn from_engine(engine: TaskEngine) -> Self {
+        Self { engine }
+    }
+
     /// Create a new task transform engine with disk caching and determinism verification.
-    pub fn with_disk_and_verify_determinism(cache_dir: std::path::PathBuf) -> std::io::Result<Self> {
+    pub fn with_disk_and_verify_determinism(
+        cache_dir: std::path::PathBuf,
+    ) -> std::io::Result<Self> {
         let registry = TaskRegistry::new();
-        let disk = pledgepack_task_system::DiskBackend::new(cache_dir)?;
+        let cas = pledgepack_task_system::CasBackend::new(cache_dir)?;
         let engine = TaskEngineBuilder::new(registry)
-            .with_disk(disk)
+            .with_cas(cas)
             .with_verify_determinism()
             .build();
         Ok(Self { engine })
@@ -432,10 +441,7 @@ impl TaskTransformEngine {
     /// - Caching: unchanged files skip re-reading
     /// - io_uring on Linux: async file I/O without thread pool overhead
     /// - SIMD scanning: import detection happens inside the task
-    pub fn register_read_task(
-        &self,
-        file_path: Arc<String>,
-    ) -> Task<FileReadOutput> {
+    pub fn register_read_task(&self, file_path: Arc<String>) -> Task<FileReadOutput> {
         let task_id = Self::read_file_task_id(&file_path);
 
         let file_path_clone = file_path.clone();
@@ -443,28 +449,17 @@ impl TaskTransformEngine {
             task_id,
             "read_file".to_string(),
             TaskExecutor::sync(move || {
-                // Use async file I/O — on Linux this uses io_uring
-                // We block on the async read since the task executor is sync
-                let source = if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                    // We're inside a tokio runtime — use block_in_place to
-                    // avoid deadlock (block_in_place moves the blocking work
-                    // to a separate thread)
-                    let path_clone = file_path_clone.clone();
-                    tokio::task::block_in_place(|| {
-                        handle.block_on(pledgepack_native_sys::read_file_async(&path_clone))
-                    })?
-                } else {
-                    // No tokio runtime — fall back to sync read
-                    pledgepack_native_sys::read_file(&file_path_clone)?
-                };
+                // Sync file read via the Zig fast path (native-sys has no
+                // async read_file variant — the io_uring path was never
+                // implemented there).
+                let source = pledgepack_native_sys::read_file(&file_path_clone)?;
 
                 // SIMD scanning for imports (happens inside the task)
-                let import_offsets = pledgepack_native_sys::find_imports(&source);
+                let (_, import_offsets) = pledgepack_native_sys::summarize_module(&source);
                 let source_str = String::from_utf8_lossy(&source).to_string();
                 let mut imports = Vec::new();
                 for offset in import_offsets {
-                    let rest = &source_str[offset..];
-                    if let Some(dep) = extract_module_specifier(rest) {
+                    if let Some(dep) = extract_module_specifier(&source_str, offset) {
                         imports.push(dep);
                     }
                 }
@@ -486,7 +481,10 @@ impl TaskTransformEngine {
     }
 
     /// Read a file read task's output.
-    pub async fn read_file_task(&self, task: Task<FileReadOutput>) -> anyhow::Result<Arc<FileReadOutput>> {
+    pub async fn read_file_task(
+        &self,
+        task: Task<FileReadOutput>,
+    ) -> anyhow::Result<Arc<FileReadOutput>> {
         task.read(&self.engine)
             .await
             .map_err(|e| anyhow::anyhow!("File read task failed: {:?}", e))
@@ -566,17 +564,21 @@ impl TaskTransformEngine {
                 // Extract deps from the parsed module (imports)
                 // We re-scan with SIMD here because the transform may have
                 // changed the import structure (e.g., JSX → JS adds imports)
-                let import_offsets = pledgepack_native_sys::find_imports(source_clone.as_bytes());
+                let (_, import_offsets) =
+                    pledgepack_native_sys::summarize_module(source_clone.as_bytes());
                 let mut deps = Vec::new();
                 for offset in import_offsets {
-                    let rest = &source_clone[offset..];
-                    if let Some(dep) = extract_module_specifier(rest) {
+                    if let Some(dep) = extract_module_specifier(&source_clone, offset) {
                         deps.push(dep);
                     }
                 }
                 task_output.deps = deps;
 
-                Ok(StoredOutput::new(task_id, &task_output, vec![parse_task_id])?)
+                Ok(StoredOutput::new(
+                    task_id,
+                    &task_output,
+                    vec![parse_task_id],
+                )?)
             }),
         );
 
@@ -592,6 +594,7 @@ impl TaskTransformEngine {
     /// This uses a function pointer instead of a direct reference to
     /// `JsPluginHost` to avoid a circular dependency (js-plugin-host
     /// depends on core, not the other way around).
+    #[allow(clippy::too_many_arguments)]
     pub fn register_transform_task_with_plugin(
         &self,
         source: Arc<String>,
@@ -600,7 +603,7 @@ impl TaskTransformEngine {
         is_production: bool,
         config: Arc<PledgeConfig>,
         parse_task_id: TaskId,
-        plugin_transform: Arc<dyn Fn(&str, &str) -> Option<PluginTransformResult> + Send + Sync>,
+        plugin_transform: PluginTransformFn,
         plugin_cache_key: String,
     ) -> Task<TransformTaskOutput> {
         let task_id = Self::transform_task_id_with_plugin(
@@ -646,17 +649,21 @@ impl TaskTransformEngine {
                 }
 
                 // 3. Extract deps
-                let import_offsets = pledgepack_native_sys::find_imports(source_clone.as_bytes());
+                let (_, import_offsets) =
+                    pledgepack_native_sys::summarize_module(source_clone.as_bytes());
                 let mut deps = Vec::new();
                 for offset in import_offsets {
-                    let rest = &source_clone[offset..];
-                    if let Some(dep) = extract_module_specifier(rest) {
+                    if let Some(dep) = extract_module_specifier(&source_clone, offset) {
                         deps.push(dep);
                     }
                 }
                 task_output.deps = deps;
 
-                Ok(StoredOutput::new(task_id, &task_output, vec![parse_task_id])?)
+                Ok(StoredOutput::new(
+                    task_id,
+                    &task_output,
+                    vec![parse_task_id],
+                )?)
             }),
         );
 
@@ -670,6 +677,7 @@ impl TaskTransformEngine {
     /// - Post-plugin runs AFTER the built-in Oxc transform
     ///
     /// Either closure can be `None` if no pre/post plugin is configured.
+    #[allow(clippy::too_many_arguments)]
     pub fn register_transform_task_with_plugin_ordering(
         &self,
         source: Arc<String>,
@@ -678,8 +686,8 @@ impl TaskTransformEngine {
         is_production: bool,
         config: Arc<PledgeConfig>,
         parse_task_id: TaskId,
-        pre_plugin: Option<Arc<dyn Fn(&str, &str) -> Option<PluginTransformResult> + Send + Sync>>,
-        post_plugin: Option<Arc<dyn Fn(&str, &str) -> Option<PluginTransformResult> + Send + Sync>>,
+        pre_plugin: Option<PluginTransformFn>,
+        post_plugin: Option<PluginTransformFn>,
         plugin_cache_key: String,
     ) -> Task<TransformTaskOutput> {
         let task_id = Self::transform_task_id_with_plugin(
@@ -721,34 +729,38 @@ impl TaskTransformEngine {
                 let mut task_output = TransformTaskOutput::from(output);
 
                 // 2. Apply post-plugin transform (enforce: "post" or default)
-                if let Some(ref post) = post_plugin {
-                    if let Some(plugin_result) = post(&task_output.code, &file_path_clone) {
-                        debug!(
-                            "Post-plugin transformed {}: code {} → {} bytes",
-                            file_path_clone,
-                            task_output.code.len(),
-                            plugin_result.code.len()
-                        );
-                        task_output.code = plugin_result.code;
-                        if plugin_result.map.is_some() {
-                            task_output.source_map = plugin_result.map;
-                        }
-                        task_output.plugin_transformed = true;
+                if let Some(ref post) = post_plugin
+                    && let Some(plugin_result) = post(&task_output.code, &file_path_clone)
+                {
+                    debug!(
+                        "Post-plugin transformed {}: code {} → {} bytes",
+                        file_path_clone,
+                        task_output.code.len(),
+                        plugin_result.code.len()
+                    );
+                    task_output.code = plugin_result.code;
+                    if plugin_result.map.is_some() {
+                        task_output.source_map = plugin_result.map;
                     }
+                    task_output.plugin_transformed = true;
                 }
 
                 // 3. Extract deps
-                let import_offsets = pledgepack_native_sys::find_imports(source_clone.as_bytes());
+                let (_, import_offsets) =
+                    pledgepack_native_sys::summarize_module(source_clone.as_bytes());
                 let mut deps = Vec::new();
                 for offset in import_offsets {
-                    let rest = &source_clone[offset..];
-                    if let Some(dep) = extract_module_specifier(rest) {
+                    if let Some(dep) = extract_module_specifier(&source_clone, offset) {
                         deps.push(dep);
                     }
                 }
                 task_output.deps = deps;
 
-                Ok(StoredOutput::new(task_id, &task_output, vec![parse_task_id])?)
+                Ok(StoredOutput::new(
+                    task_id,
+                    &task_output,
+                    vec![parse_task_id],
+                )?)
             }),
         );
 
@@ -772,6 +784,26 @@ impl TaskTransformEngine {
             .map_err(|e| anyhow::anyhow!("Transform task failed: {:?}", e))
     }
 
+    /// Blocking variant of `read_transform` for rayon worker threads in
+    /// `BuildEngine::transform_modules_via_tasks` — drives the same
+    /// cache-check → compute flow without an async runtime.
+    pub fn read_transform_blocking(
+        &self,
+        task: Task<TransformTaskOutput>,
+    ) -> anyhow::Result<Arc<TransformTaskOutput>> {
+        task.read_blocking(&self.engine)
+            .map_err(|e| anyhow::anyhow!("Transform task failed: {:?}", e))
+    }
+
+    /// Blocking variant of `read_parse` for rayon worker threads.
+    pub fn read_parse_blocking(
+        &self,
+        task: Task<ParsedModule>,
+    ) -> anyhow::Result<Arc<ParsedModule>> {
+        task.read_blocking(&self.engine)
+            .map_err(|e| anyhow::anyhow!("Parse task failed: {:?}", e))
+    }
+
     // ─── G7.2: Plugin outputs as first-class Task<T> nodes ──────────
 
     /// G7.2: Register a plugin output as a cached `Task<PluginOutput>` node.
@@ -784,19 +816,14 @@ impl TaskTransformEngine {
     /// The caller computes the `PluginOutput` by invoking the plugin hook,
     /// then passes it here for caching. On subsequent calls with the same
     /// cache_key, the task graph returns the cached result.
-    pub fn register_plugin_output_task(
-        &self,
-        output: PluginOutput,
-    ) -> Task<PluginOutput> {
+    pub fn register_plugin_output_task(&self, output: PluginOutput) -> Task<PluginOutput> {
         let task_id = PluginOutput::task_id(&output.plugin_name, &output.hook, &output.cache_key);
         let output_clone = output.clone();
 
         self.engine.registry().register(
             task_id,
             format!("plugin_output:{}", output.hook),
-            TaskExecutor::sync(move || {
-                Ok(StoredOutput::new(task_id, &output_clone, vec![])?)
-            }),
+            TaskExecutor::sync(move || Ok(StoredOutput::new(task_id, &output_clone, vec![])?)),
         );
 
         Task::from_id(task_id)
@@ -871,12 +898,13 @@ impl TaskTransformEngine {
 
         // Determine the source type from the module kind + file path
         let path = std::path::Path::new(&parsed.file_path);
-        let source_type = oxc::span::SourceType::from_path(path).unwrap_or_else(|_| match parsed.kind {
-            ModuleKind::Tsx => oxc::span::SourceType::tsx(),
-            ModuleKind::TypeScript => oxc::span::SourceType::ts(),
-            ModuleKind::Jsx => oxc::span::SourceType::jsx(),
-            _ => oxc::span::SourceType::mjs(),
-        });
+        let source_type =
+            oxc::span::SourceType::from_path(path).unwrap_or_else(|_| match parsed.kind {
+                ModuleKind::Tsx => oxc::span::SourceType::tsx(),
+                ModuleKind::TypeScript => oxc::span::SourceType::ts(),
+                ModuleKind::Jsx => oxc::span::SourceType::jsx(),
+                _ => oxc::span::SourceType::mjs(),
+            });
 
         // get_or_parse is a no-op if already cached, parses fresh if not
         pool.get_or_parse(source, source_type)
@@ -930,11 +958,10 @@ fn parse_module_sync(
     }
 
     // SIMD scan for imports (fast — no AST needed)
-    let import_offsets = pledgepack_native_sys::find_imports(source.as_bytes());
+    let (_, import_offsets) = pledgepack_native_sys::summarize_module(source.as_bytes());
     let mut imports = Vec::new();
     for offset in import_offsets {
-        let rest = &source[offset..];
-        if let Some(dep) = extract_module_specifier(rest) {
+        if let Some(dep) = extract_module_specifier(source, offset) {
             imports.push(dep);
         }
     }
@@ -996,10 +1023,7 @@ fn parse_exports_and_dynamic_imports(
     }
 
     impl Visit<'_> for AstCollector {
-        fn visit_export_named_declaration(
-            &mut self,
-            node: &oxc::ast::ast::ExportNamedDeclaration,
-        ) {
+        fn visit_export_named_declaration(&mut self, node: &oxc::ast::ast::ExportNamedDeclaration) {
             // Handle export { foo, bar }
             for specifier in &node.specifiers {
                 self.exports.push(specifier.local.name().to_string());
@@ -1041,10 +1065,7 @@ fn parse_exports_and_dynamic_imports(
             self.has_default_export = true;
         }
 
-        fn visit_import_expression(
-            &mut self,
-            expr: &oxc::ast::ast::ImportExpression,
-        ) {
+        fn visit_import_expression(&mut self, expr: &oxc::ast::ast::ImportExpression) {
             if let oxc::ast::ast::Expression::StringLiteral(lit) = &expr.source {
                 let spec = &lit.value;
                 if spec.starts_with("./") || spec.starts_with("../") {
@@ -1061,7 +1082,11 @@ fn parse_exports_and_dynamic_imports(
     };
     collector.visit_program(&program);
 
-    (collector.exports, collector.has_default_export, collector.dynamic_imports)
+    (
+        collector.exports,
+        collector.has_default_export,
+        collector.dynamic_imports,
+    )
 }
 
 /// Fallback string-based dynamic import detection.
@@ -1097,27 +1122,79 @@ fn string_detect_dynamic_imports(source: &str) -> Vec<String> {
 ///
 /// This is the same logic used in engine.rs but duplicated here to avoid
 /// a circular dependency between the task transform module and the engine.
-fn extract_module_specifier(rest: &str) -> Option<String> {
-    let rest = rest.trim_start();
+fn extract_module_specifier(source: &str, offset: usize) -> Option<String> {
+    let rest = &source[offset..];
+    if !rest.starts_with("import") && !rest.starts_with("export") {
+        return None;
+    }
+    let keyword_len = 6;
+    let after = rest[keyword_len..].trim_start();
 
-    // import ... from "specifier"
-    // import "specifier"
-    // export ... from "specifier"
+    // import.meta — a builtin, not a dependency.
+    if after.starts_with(".meta") {
+        return None;
+    }
+
+    let first = after.chars().next()?;
+    let dynamic = first == '(';
+    if !dynamic {
+        // Statement-position check: the match must start a statement. Scanning
+        // back, a newline counts as a boundary (ASI); otherwise the previous
+        // non-whitespace char must be `;`, `{`, or `}`.
+        let mut at_boundary = source[..offset].trim().is_empty();
+        for ch in source[..offset].chars().rev() {
+            if ch == '\n' {
+                at_boundary = true;
+                break;
+            }
+            if ch.is_whitespace() {
+                continue;
+            }
+            at_boundary = matches!(ch, ';' | '{' | '}');
+            break;
+        }
+        if !at_boundary {
+            return None;
+        }
+    }
+
+    if !dynamic && first != '"' && first != '\'' {
+        // Clause form: require a `from` token before the statement ends.
+        let mut has_from = false;
+        let mut cur = String::new();
+        for ch in after.chars() {
+            match ch {
+                ';' | '<' | '>' => break,
+                c if c.is_alphanumeric() || c == '_' || c == '$' => cur.push(c),
+                _ => {
+                    if cur == "from" {
+                        has_from = true;
+                        break;
+                    }
+                    cur.clear();
+                }
+            }
+        }
+        if cur == "from" {
+            has_from = true;
+        }
+        if !has_from {
+            return None;
+        }
+    }
 
     // Find the first string literal
-    let mut chars = rest.chars().peekable();
     let mut in_string = false;
     let mut quote_char = '"';
     let mut specifier = String::new();
 
-    while let Some(c) = chars.next() {
+    for c in after.chars() {
         if !in_string && (c == '"' || c == '\'') {
             in_string = true;
             quote_char = c;
             specifier.clear();
         } else if in_string {
             if c == quote_char {
-                // End of string
                 if !specifier.is_empty() {
                     return Some(specifier);
                 }
@@ -1125,8 +1202,7 @@ fn extract_module_specifier(rest: &str) -> Option<String> {
             } else {
                 specifier.push(c);
             }
-        } else if c == ';' || c == '\n' {
-            // No string found on this line
+        } else if c == ';' {
             break;
         }
     }
@@ -1168,10 +1244,14 @@ mod tests {
 
     #[test]
     fn parse_task_id_is_deterministic() {
-        let id1 = TaskTransformEngine::parse_task_id("const x = 1;", ModuleKind::JavaScript, "test.js");
-        let id2 = TaskTransformEngine::parse_task_id("const x = 1;", ModuleKind::JavaScript, "test.js");
-        let id3 = TaskTransformEngine::parse_task_id("const y = 2;", ModuleKind::JavaScript, "test.js");
-        let id4 = TaskTransformEngine::parse_task_id("const x = 1;", ModuleKind::TypeScript, "test.js");
+        let id1 =
+            TaskTransformEngine::parse_task_id("const x = 1;", ModuleKind::JavaScript, "test.js");
+        let id2 =
+            TaskTransformEngine::parse_task_id("const x = 1;", ModuleKind::JavaScript, "test.js");
+        let id3 =
+            TaskTransformEngine::parse_task_id("const y = 2;", ModuleKind::JavaScript, "test.js");
+        let id4 =
+            TaskTransformEngine::parse_task_id("const x = 1;", ModuleKind::TypeScript, "test.js");
 
         assert_eq!(id1, id2, "Same inputs → same TaskId");
         assert_ne!(id1, id3, "Different source → different TaskId");
@@ -1183,9 +1263,27 @@ mod tests {
         let config = Arc::new(PledgeConfig::default());
         let ch = config_hash(&config);
 
-        let id1 = TaskTransformEngine::transform_task_id("const x = 1;", ModuleKind::JavaScript, "test.js", true, ch);
-        let id2 = TaskTransformEngine::transform_task_id("const x = 1;", ModuleKind::JavaScript, "test.js", true, ch);
-        let id3 = TaskTransformEngine::transform_task_id("const x = 1;", ModuleKind::JavaScript, "test.js", false, ch);
+        let id1 = TaskTransformEngine::transform_task_id(
+            "const x = 1;",
+            ModuleKind::JavaScript,
+            "test.js",
+            true,
+            ch,
+        );
+        let id2 = TaskTransformEngine::transform_task_id(
+            "const x = 1;",
+            ModuleKind::JavaScript,
+            "test.js",
+            true,
+            ch,
+        );
+        let id3 = TaskTransformEngine::transform_task_id(
+            "const x = 1;",
+            ModuleKind::JavaScript,
+            "test.js",
+            false,
+            ch,
+        );
 
         assert_eq!(id1, id2, "Same inputs → same TaskId");
         assert_ne!(id1, id3, "Different is_production → different TaskId");
@@ -1206,7 +1304,8 @@ mod tests {
             .to_string(),
         );
 
-        let task = engine.register_parse_task(source, ModuleKind::Tsx, Arc::new("test.tsx".to_string()));
+        let task =
+            engine.register_parse_task(source, ModuleKind::Tsx, Arc::new("test.tsx".to_string()));
         let result = engine.read_parse(task).await.unwrap();
 
         assert!(result.imports.contains(&"./foo".to_string()));
@@ -1227,8 +1326,13 @@ mod tests {
             .to_string(),
         );
 
-        let parse_task_id = TaskTransformEngine::parse_task_id(&source, ModuleKind::TypeScript, "test.ts");
-        let parse_task = engine.register_parse_task(source.clone(), ModuleKind::TypeScript, Arc::new("test.ts".to_string()));
+        let parse_task_id =
+            TaskTransformEngine::parse_task_id(&source, ModuleKind::TypeScript, "test.ts");
+        let parse_task = engine.register_parse_task(
+            source.clone(),
+            ModuleKind::TypeScript,
+            Arc::new("test.ts".to_string()),
+        );
         engine.read_parse(parse_task).await.unwrap();
 
         let config = Arc::new(PledgeConfig::default());
@@ -1260,17 +1364,37 @@ mod tests {
     #[test]
     fn extract_module_specifier_works() {
         assert_eq!(
-            extract_module_specifier(r#"from "react";"#),
+            extract_module_specifier(r#"import React from "react";"#, 0),
             Some("react".to_string())
         );
         assert_eq!(
-            extract_module_specifier(r#"from "./foo";"#),
+            extract_module_specifier(r#"import { x } from "./foo";"#, 0),
             Some("./foo".to_string())
         );
+        let src = r#"const p = import("./dynamic");"#;
+        let off = src.find("import").unwrap();
         assert_eq!(
-            extract_module_specifier(r#""./dynamic";"#),
+            extract_module_specifier(src, off),
             Some("./dynamic".to_string())
         );
+
+        // find_imports is a raw substring scan — `import` inside JSX text or
+        // string literals must not produce bogus deps.
+        let jsx_text =
+            "<p>Debug meta tags, import maps, and script injection.</p>\n<div className=\"card\">";
+        let off = jsx_text.find("import").unwrap();
+        assert_eq!(extract_module_specifier(jsx_text, off), None);
+        let in_string = "const s = 'auto-generates import maps for bare specifiers.';";
+        let off = in_string.find("import").unwrap();
+        assert_eq!(extract_module_specifier(in_string, off), None);
+        assert_eq!(
+            extract_module_specifier("export const x = 'value';", 0),
+            None
+        );
+        assert_eq!(extract_module_specifier("import.meta.env", 0), None);
+        let asi = "const x = 1\nimport y from 'z';";
+        let off = asi.find("import").unwrap();
+        assert_eq!(extract_module_specifier(asi, off), Some("z".to_string()));
     }
 
     #[tokio::test]
@@ -1284,12 +1408,19 @@ mod tests {
             .to_string(),
         );
 
-        let task = engine.register_parse_task(source.clone(), ModuleKind::TypeScript, Arc::new("test.ts".to_string()));
+        let task = engine.register_parse_task(
+            source.clone(),
+            ModuleKind::TypeScript,
+            Arc::new("test.ts".to_string()),
+        );
         let result = engine.read_parse(task).await.unwrap();
 
         // The ast_handle should be the FNV-1a hash of the source
         let expected = crate::ast_pool::AstHandle::from_source(&source).0;
-        assert_eq!(result.ast_handle, expected, "ast_handle should match FNV-1a hash of source");
+        assert_eq!(
+            result.ast_handle, expected,
+            "ast_handle should match FNV-1a hash of source"
+        );
     }
 
     #[tokio::test]
@@ -1301,20 +1432,31 @@ mod tests {
         "#;
         let source_arc = Arc::new(source.to_string());
 
-        let task = engine.register_parse_task(source_arc.clone(), ModuleKind::TypeScript, Arc::new("test.ts".to_string()));
+        let task = engine.register_parse_task(
+            source_arc.clone(),
+            ModuleKind::TypeScript,
+            Arc::new("test.ts".to_string()),
+        );
         let parsed = engine.read_parse(task).await.unwrap();
 
         // The AstPool should be empty initially
         let mut pool = crate::ast_pool::AstPool::new();
 
         // Bridge: ensure the AST is in the pool
-        let handle = engine.ensure_ast_in_pool(&parsed, &source_arc, &mut pool).unwrap();
-        assert_eq!(handle.0, parsed.ast_handle, "Handle should match the parsed module's ast_handle");
+        let handle = engine
+            .ensure_ast_in_pool(&parsed, &source_arc, &mut pool)
+            .unwrap();
+        assert_eq!(
+            handle.0, parsed.ast_handle,
+            "Handle should match the parsed module's ast_handle"
+        );
 
         // The pool should now have the AST — we can read from it
-        let imports = pool.with_program(handle, |prog| {
-            crate::transform::detect_dynamic_imports_from_program(prog)
-        }).unwrap_or_default();
+        let imports = pool
+            .with_program(handle, |prog| {
+                crate::transform::detect_dynamic_imports_from_program(prog)
+            })
+            .unwrap_or_default();
         assert!(imports.is_empty(), "No dynamic imports in this source");
     }
 
@@ -1324,14 +1466,20 @@ mod tests {
     fn plugin_output_task_id_is_deterministic() {
         let id1 = PluginOutput::task_id("my-plugin", "transform", "abc123");
         let id2 = PluginOutput::task_id("my-plugin", "transform", "abc123");
-        assert_eq!(id1, id2, "Same plugin+hook+cache_key should produce same TaskId");
+        assert_eq!(
+            id1, id2,
+            "Same plugin+hook+cache_key should produce same TaskId"
+        );
     }
 
     #[test]
     fn plugin_output_task_id_differs_for_different_plugins() {
         let id1 = PluginOutput::task_id("plugin-a", "transform", "abc123");
         let id2 = PluginOutput::task_id("plugin-b", "transform", "abc123");
-        assert_ne!(id1, id2, "Different plugins should produce different TaskIds");
+        assert_ne!(
+            id1, id2,
+            "Different plugins should produce different TaskIds"
+        );
     }
 
     #[test]
@@ -1345,16 +1493,22 @@ mod tests {
     fn plugin_output_task_id_differs_for_different_cache_keys() {
         let id1 = PluginOutput::task_id("my-plugin", "transform", "abc123");
         let id2 = PluginOutput::task_id("my-plugin", "transform", "def456");
-        assert_ne!(id1, id2, "Different cache_keys should produce different TaskIds");
+        assert_ne!(
+            id1, id2,
+            "Different cache_keys should produce different TaskIds"
+        );
     }
 
     #[tokio::test]
     async fn plugin_output_task_caches_result() {
         let engine = TaskTransformEngine::new();
 
-        let task = engine.register_plugin_output_task(
-            PluginOutput::from_transform("test-plugin", "cache-key-1", "transformed code".to_string(), None),
-        );
+        let task = engine.register_plugin_output_task(PluginOutput::from_transform(
+            "test-plugin",
+            "cache-key-1",
+            "transformed code".to_string(),
+            None,
+        ));
 
         // First read computes
         let result1 = engine.read_plugin_output(task).await.unwrap();
@@ -1369,12 +1523,18 @@ mod tests {
     async fn plugin_output_task_different_cache_keys_compute_separately() {
         let engine = TaskTransformEngine::new();
 
-        let task1 = engine.register_plugin_output_task(
-            PluginOutput::from_transform("test-plugin", "key-1", "output-1".to_string(), None),
-        );
-        let task2 = engine.register_plugin_output_task(
-            PluginOutput::from_transform("test-plugin", "key-2", "output-2".to_string(), None),
-        );
+        let task1 = engine.register_plugin_output_task(PluginOutput::from_transform(
+            "test-plugin",
+            "key-1",
+            "output-1".to_string(),
+            None,
+        ));
+        let task2 = engine.register_plugin_output_task(PluginOutput::from_transform(
+            "test-plugin",
+            "key-2",
+            "output-2".to_string(),
+            None,
+        ));
 
         let result1 = engine.read_plugin_output(task1).await.unwrap();
         let result2 = engine.read_plugin_output(task2).await.unwrap();
@@ -1385,7 +1545,8 @@ mod tests {
 
     #[test]
     fn plugin_output_from_resolve_id() {
-        let output = PluginOutput::from_resolve_id("resolver", "key", "/src/mod.tsx".to_string(), false);
+        let output =
+            PluginOutput::from_resolve_id("resolver", "key", "/src/mod.tsx".to_string(), false);
         assert_eq!(output.hook, "resolve-id");
         assert_eq!(output.resolved_id.as_deref(), Some("/src/mod.tsx"));
         assert_eq!(output.external, Some(false));
@@ -1394,7 +1555,12 @@ mod tests {
 
     #[test]
     fn plugin_output_from_load() {
-        let output = PluginOutput::from_load("loader", "key", "module code".to_string(), Some("map".to_string()));
+        let output = PluginOutput::from_load(
+            "loader",
+            "key",
+            "module code".to_string(),
+            Some("map".to_string()),
+        );
         assert_eq!(output.hook, "load");
         assert_eq!(output.code.as_deref(), Some("module code"));
         assert_eq!(output.source_map.as_deref(), Some("map"));
@@ -1408,9 +1574,12 @@ mod tests {
         assert!(!engine.is_plugin_output_cached("plugin", "transform", "key"));
 
         // Register and compute
-        let task = engine.register_plugin_output_task(
-            PluginOutput::from_transform("plugin", "key", "code".to_string(), None),
-        );
+        let task = engine.register_plugin_output_task(PluginOutput::from_transform(
+            "plugin",
+            "key",
+            "code".to_string(),
+            None,
+        ));
 
         // Need to actually compute it for it to be cached
         // Use a runtime to drive the async read

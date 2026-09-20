@@ -12,6 +12,15 @@
 > version numbers and "Done"/"Implemented" claims elsewhere in this document
 > as unverified in this pass — `PRODUCTION-READINESS-100.md` is the
 > currently test-verified source of truth for what's actually working.
+>
+> **2026-09-17 update:** the wasmtime 28 → 48 bump has landed (commit
+> `75946ba` — `Cargo.lock` now pins 48.0.2, clearing all 20 RUSTSEC
+> advisories on 28.0.1; `cargo audit`/`cargo deny` pass), and
+> `wasm-plugin-host`'s compile break is fixed: `task_transform`/`ast_pool`
+> were wired into `pledgepack-core` and the WASI code migrated to the 48
+> API — the crate now compiles and passes all tests (40 unit + 20 e2e) on
+> wasmtime 48.0.2, and is back in CI's workspace commands. Stray "wasmtime
+> 28.0.1" references below describe the pre-bump state.
 
 ## Overview
 
@@ -323,7 +332,7 @@ Source string
 - **Network URL display**: Local network IP address shown alongside localhost URL via `local-ip-address` crate (e.g., `→ Network: http://192.168.x.x:3000`)
 
 ### WASM Plugin Host (`crates/wasm-plugin-host/src/lib.rs`)
-- **Wasmtime 28.0.1** engine loads `.wasm` plugin files (WASM Component Model, WIT contract currently at v0.1.3)
+- **Wasmtime 48.0.2** engine loads `.wasm` plugin files (WASM Component Model, WIT contract currently at v0.1.3)
 - 8 hooks: `resolve-id`, `load`, `transform`, `transform-index-html`, `build-start`, `build-end`, `generate-bundle`, `configure-server`
 - WIT contract: 11 record types, `cache-key` in every output for task graph caching
 - Sandbox: restricted WASI context (no filesystem, no network, empty env)
@@ -684,7 +693,7 @@ All assets       → AssetManifest with content-hashed output paths
 
 ```
 1. Plugin discovery — scan configured plugin paths
-2. Plugin loading — WASM plugins via wasmtime 28.0.1, JS plugins via QuickJS (rquickjs 0.12.2)
+2. Plugin loading — WASM plugins via wasmtime 48.0.2, JS plugins via QuickJS (rquickjs 0.12.2)
 3. Hot reload — PluginHotReloader watches for file changes, reloads without restart
 4. Sandboxing — SandboxLimits (memory, CPU time) + SandboxedFs (filesystem access)
 5. Dependency resolution — PluginDependencyResolver with import maps for npm packages

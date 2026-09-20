@@ -43,9 +43,8 @@ cargo +nightly fuzz run resolve_specifier artifacts/resolve_specifier/<crash-fil
 
 ## CI
 
-`ci.yml`'s `fuzz-smoke` job builds (not runs — a full fuzzing run is
-unbounded) both targets on a schedule/best-effort basis. It was added
-without the ability to verify it locally in the environment that authored
-it (no nightly toolchain / cargo-fuzz install available there), so treat a
-first red run there as "confirm this scaffold is correct," not necessarily
-as a real bug found by fuzzing.
+`ci.yml`'s `fuzz-smoke` job is **enforced** (no `continue-on-error`): it builds
+every target with `cargo +nightly fuzz build` and then runs each for 30 seconds
+(`-max_total_time=30`), so a target that stops compiling — or a shallow crash —
+fails CI. Long fuzzing sessions (hours) are a manual activity; run them locally
+as described above and commit any reproducer as a regression test.

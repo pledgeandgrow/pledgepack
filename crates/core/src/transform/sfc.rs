@@ -484,11 +484,10 @@ impl<'a> HtmlParser<'a> {
     }
 
     fn parse_attr_value(&mut self) -> String {
-        let quote = self.peek();
-        if quote == Some('"') || quote == Some('\'') {
+        let quote = self.peek().filter(|c| *c == '"' || *c == '\'');
+        if let Some(q) = quote {
             self.advance(1);
             let start = self.pos;
-            let q = quote.unwrap();
             while let Some(c) = self.peek() {
                 if c == q {
                     break;
@@ -936,8 +935,9 @@ pub(super) fn transform_svelte(
         } else {
             script_content.clone()
         };
-        // TODO: Svelte script-level reactivity is passed through untransformed.
-        // The following are not yet compiled and rely on a runtime shim:
+        // Known limitation (see docs/LIMITATIONS.md, "Svelte SFC support"): script-level
+        // reactivity is passed through untransformed. The following are not compiled
+        // and rely on a runtime shim:
         // - `$:` reactive statements (should be collected into an update fn)
         // - `$store` auto-subscription (should lower to `store.subscribe()`)
         // - `onMount` / `onDestroy` / lifecycle hooks (passed through as-is)
@@ -1033,7 +1033,7 @@ if (import.meta.hot) {
 /// - `{#if cond}` ... `{:else}` ... `{/if}` → `if (cond) { ... } else { ... }`
 /// - `{#each items as item}` ... `{/each}` → `items.forEach(item => { ... })`
 ///
-/// TODO(unsupported Svelte features):
+/// Known limitations (unsupported Svelte features; see docs/LIMITATIONS.md):
 /// - `$:` reactive statements (in `<script>`) — not yet compiled to a reactive
 ///   update function.
 /// - `$store` auto-subscription syntax — not yet lowered to
@@ -1187,8 +1187,8 @@ fn find_svelte_if_block(nodes: &[HtmlNode], start: usize) -> (Option<usize>, Opt
             if trimmed.starts_with("{#if") {
                 depth += 1;
             } else if trimmed.starts_with("{:else if") || trimmed.starts_with("{:else}") {
-                // TODO: full `{:else if}` chains; for now the first else-family
-                // marker at depth 1 acts as the else boundary.
+                // Known limitation: `{:else if}` chains are not expanded; the first
+                // else-family marker at depth 1 acts as the else boundary.
                 if depth == 1 && else_idx.is_none() {
                     else_idx = Some(j);
                 }
@@ -1231,7 +1231,7 @@ fn find_svelte_each_block(nodes: &[HtmlNode], start: usize) -> Option<usize> {
 /// Each node is created with a uniquely-prefixed variable name and appended to
 /// `container`. Svelte control-flow markers are skipped here (only one level
 /// of nesting is supported by `nodes_to_svelte_render`; deeper nesting is a
-/// TODO).
+/// documented limitation).
 fn render_svelte_nodes_into(
     nodes: &[HtmlNode],
     container: &str,
@@ -1245,7 +1245,7 @@ fn render_svelte_nodes_into(
         if let HtmlNode::Text(t) = node {
             let trimmed = t.trim();
             if trimmed.starts_with("{#") || trimmed.starts_with("{:") || trimmed.starts_with("{/") {
-                // TODO: nested control flow inside {#if}/{#each}.
+                // Known limitation: nested control flow inside {#if}/{#each} is skipped.
                 continue;
             }
         }

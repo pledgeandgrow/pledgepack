@@ -56,7 +56,7 @@ wasmtime::component::bindgen!({
 //
 // This maintains the sandbox while allowing wit-bindgen-based plugins to load.
 
-use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiView};
+use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 // ─── Plugin Instance ──────────────────────────────────────────────────
 
@@ -76,14 +76,24 @@ pub struct WasmPlugin {
     /// The instantiated component handle (for calling hooks)
     instance: PledgepackPlugin,
     /// G7.3: Cumulative fuel consumed across all hook invocations.
-    /// Capped at `MAX_CUMULATIVE_FUEL` to bound total CPU usage per plugin
+    /// Capped at `WasmLimits::lifetime_fuel` to bound total CPU usage per plugin
     /// instance over its lifetime (prevents a plugin from burning an
     /// unbounded amount of CPU across many small calls).
     cumulative_fuel: u64,
+    /// Per-call / lifetime / memory / table limits for this instance.
+    limits: WasmLimits,
 }
+
+/// Host-side resolver a plugin's `resolve-import` host call is delegated to:
+/// `(specifier, importer) -> resolved id`. Supplied by the embedder (e.g. a
+/// closure over the build engine's resolver).
+pub type ImportResolver = std::sync::Arc<dyn Fn(&str, &str) -> Option<String> + Send + Sync>;
 
 /// State stored in the wasmtime Store for each plugin instance.
 pub struct PluginState {
+    /// Optional embedder-provided resolver backing the `resolve-import` host
+    /// import. `None` means "not resolved" (plugin falls back to its own logic).
+    import_resolver: Option<ImportResolver>,
     /// Plugin name (for diagnostics)
     name: String,
     /// Whether this plugin has been initialized
@@ -108,16 +118,20 @@ pub struct PluginState {
 impl PluginState {
     fn new(name: String) -> Self {
         Self {
+            import_resolver: None,
             name,
             initialized: false,
             wasi: restricted_wasi_ctx(),
             table: wasmtime::component::ResourceTable::new(),
             host_config: String::from("{}"),
             emitted_files: Vec::new(),
-            limits: wasmtime::StoreLimitsBuilder::new()
-                .memory_size(DEFAULT_MEMORY_MAX_BYTES)
-                .build(),
+            limits: WasmLimits::default().store_limits(),
         }
+    }
+
+    /// Install the resolver that answers this plugin's `resolve-import` calls.
+    pub fn set_import_resolver(&mut self, resolver: Option<ImportResolver>) {
+        self.import_resolver = resolver;
     }
 
     /// Set the host config (JSON string) that plugins can read via get-config.
@@ -131,19 +145,16 @@ impl PluginState {
     }
 }
 
-// wasmtime-wasi 28.0.1's `WasiView` is the simple two-accessor form (`table`
-// + `ctx`), not the newer unified `WasiCtxView` accessor some later
-// wasmtime versions use — this previously didn't match the locked
-// wasmtime-wasi version at all (see PRODUCTION-READINESS-100.md; discovered
-// while verifying Phase 1/3 changes, not caused by them — this crate could
-// not compile against its own Cargo.lock before this fix).
+// wasmtime-wasi 48's `WasiView` is the unified single-accessor form: one
+// `ctx()` method returning a `WasiCtxView` bundling both the `WasiCtx` and
+// the `ResourceTable`. (wasmtime-wasi 28 used separate `table()`/`ctx()`
+// accessors; this impl was migrated as part of the 28 → 48 dep bump.)
 impl WasiView for PluginState {
-    fn table(&mut self) -> &mut wasmtime::component::ResourceTable {
-        &mut self.table
-    }
-
-    fn ctx(&mut self) -> &mut WasiCtx {
-        &mut self.wasi
+    fn ctx(&mut self) -> WasiCtxView<'_> {
+        WasiCtxView {
+            ctx: &mut self.wasi,
+            table: &mut self.table,
+        }
     }
 }
 
@@ -169,13 +180,14 @@ impl PledgepackPluginImports for PluginState {
     }
 
     fn resolve_import(&mut self, specifier: String, importer: String) -> Option<String> {
-        // TODO: Wire to the engine's resolver via a callback channel.
-        // The WASM plugin host doesn't have direct access to the engine's
-        // resolver, so we return None (not resolved). The plugin should fall
-        // back to its own resolution logic. Future: wire this to the engine
-        // via a callback channel so the host can delegate resolution.
+        // Delegated to the embedder-provided resolver (see
+        // `WasmPluginHost::with_import_resolver`); with none installed the
+        // import is reported as unresolved and the plugin falls back to its
+        // own resolution logic.
         tracing::trace!("resolve_import called: {} from {}", specifier, importer);
-        None
+        self.import_resolver
+            .as_ref()
+            .and_then(|resolve| resolve(&specifier, &importer))
     }
 }
 
@@ -206,6 +218,11 @@ impl WasmPlugin {
         Self::load_with_engine(path, &default_engine()?)
     }
 
+    /// Install the resolver backing this plugin's `resolve-import` host call.
+    pub fn set_import_resolver(&mut self, resolver: Option<ImportResolver>) {
+        self.store.data_mut().set_import_resolver(resolver);
+    }
+
     /// Load and instantiate a WASM plugin with a custom engine.
     ///
     /// Use this when you want to share an engine across multiple plugins
@@ -216,9 +233,16 @@ impl WasmPlugin {
         // Read the component bytes
         let bytes = std::fs::read(path)
             .map_err(|e| anyhow::anyhow!("Failed to read plugin file {}: {}", path.display(), e))?;
+        Self::load_from_bytes(path, &bytes, engine)
+    }
 
+    /// Load and instantiate a plugin from already-read component bytes.
+    /// `path` is only used for diagnostics. Signature-checked loads pass the
+    /// exact bytes that were hashed, so the file cannot be swapped between
+    /// verification and instantiation.
+    pub fn load_from_bytes(path: &Path, bytes: &[u8], engine: &wasmtime::Engine) -> Result<Self> {
         // Compile the component (validates against the WIT contract)
-        let component = wasmtime::component::Component::new(engine, &bytes).map_err(|e| {
+        let component = wasmtime::component::Component::new(engine, bytes).map_err(|e| {
             anyhow::anyhow!("Failed to compile WASM component {}: {}", path.display(), e)
         })?;
 
@@ -242,18 +266,22 @@ impl WasmPlugin {
         // by wit-bindgen runtime) but NO filesystem or network access.
         let mut linker: wasmtime::component::Linker<PluginState> =
             wasmtime::component::Linker::new(engine);
-        wasmtime_wasi::add_to_linker_sync(&mut linker)
+        // wasmtime-wasi 48 splits WASI into p0/p1/p2 namespaces; preview2
+        // (what wit-bindgen components import) lives under `p2`.
+        wasmtime_wasi::p2::add_to_linker_sync(&mut linker)
             .map_err(|e| anyhow::anyhow!("Failed to add WASI to linker: {}", e))?;
 
         // Item 6: Wire host imports (get-config, emit-file, resolve-import)
         // This allows plugins to call back into the host for config access,
-        // file emission, and import resolution. wasmtime 28's generated
-        // `add_to_linker<T, U>` just takes a plain `Fn(&mut T) -> &mut U`
-        // accessor (T and U both infer to PluginState here) — no `HasSelf`
-        // marker type, which is a later-wasmtime-version construct that
-        // doesn't exist in 28.x at all.
-        PledgepackPlugin::add_to_linker(&mut linker, |state: &mut PluginState| state)
-            .map_err(|e| anyhow::anyhow!("Failed to add host imports to linker: {}", e))?;
+        // file emission, and import resolution. wasmtime 48's generated
+        // `add_to_linker<T, D>` requires `D: HasData` — `HasSelf<PluginState>`
+        // projects `&mut PluginState` to itself since `PluginState` implements
+        // `PledgepackPluginImports` directly.
+        PledgepackPlugin::add_to_linker::<PluginState, wasmtime::component::HasSelf<PluginState>>(
+            &mut linker,
+            |state: &mut PluginState| state,
+        )
+        .map_err(|e| anyhow::anyhow!("Failed to add host imports to linker: {}", e))?;
 
         // Instantiate the component
         let instance =
@@ -284,29 +312,61 @@ impl WasmPlugin {
             store,
             instance,
             cumulative_fuel: 0,
+            limits: WasmLimits::default(),
         })
     }
 
     /// G7.3: Refill fuel before a hook invocation.
-    /// Resets the fuel budget so each hook gets a fresh CPU allowance.
     ///
-    /// Also tracks cumulative fuel across all invocations. Once a plugin
-    /// instance has consumed more than `MAX_CUMULATIVE_FUEL` total fuel, we
-    /// stop refilling — the next hook call will trap on out-of-fuel, bounding
-    /// the total CPU a single plugin instance can burn over its lifetime.
+    /// Every hook call gets a fresh `limits.fuel_per_call` budget (the
+    /// per-call budget is *reset*, not accumulated). What the previous call
+    /// actually burned is added to a lifetime counter; once that exceeds the
+    /// configurable `limits.lifetime_fuel` (if any) no further fuel is granted
+    /// and the call traps on out-of-fuel.
     fn refill_fuel(&mut self) {
-        self.cumulative_fuel = self.cumulative_fuel.saturating_add(DEFAULT_FUEL);
-        if self.cumulative_fuel > MAX_CUMULATIVE_FUEL {
+        let remaining = self.store.get_fuel().unwrap_or(0);
+        let (cumulative, exhausted) = account_fuel(
+            self.cumulative_fuel,
+            remaining,
+            self.limits.fuel_per_call,
+            self.limits.lifetime_fuel,
+        );
+        self.cumulative_fuel = cumulative;
+        if exhausted {
             tracing::warn!(
-                "[plugin:{}] exceeded cumulative fuel budget: {} (max {})",
+                "[plugin:{}] exceeded lifetime fuel budget: {} (max {:?})",
                 self.name(),
                 self.cumulative_fuel,
-                MAX_CUMULATIVE_FUEL
+                self.limits.lifetime_fuel
             );
-            // Don't refill — let the next call trap on out-of-fuel.
+            // Drain whatever is left (a partly used previous grant would
+            // otherwise let this call run) so the call really traps.
+            let _ = self.store.set_fuel(0);
             return;
         }
-        let _ = self.store.set_fuel(DEFAULT_FUEL);
+        let _ = self.store.set_fuel(self.limits.fuel_per_call);
+    }
+
+    /// Replace this instance's resource limits (per-call fuel, lifetime fuel
+    /// cap, memory, table size). Takes effect from the next hook call.
+    pub fn set_limits(&mut self, limits: WasmLimits) {
+        self.store.data_mut().limits = limits.store_limits();
+        self.limits = limits;
+    }
+
+    /// Current resource limits.
+    pub fn limits(&self) -> &WasmLimits {
+        &self.limits
+    }
+
+    /// Fuel charged against the lifetime cap so far (up to the previous call).
+    pub fn lifetime_fuel_used(&self) -> u64 {
+        self.cumulative_fuel
+    }
+
+    /// Reset the lifetime fuel counter (e.g. at the start of a new build).
+    pub fn reset_lifetime_fuel(&mut self) {
+        self.cumulative_fuel = 0;
     }
 
     /// Get the plugin's metadata.
@@ -655,21 +715,16 @@ pub struct WasmPluginHost {
     /// Optional capability auditor (goal 13), same opt-in default-`None`
     /// shape as `signing_verifier` above.
     capability_auditor: Option<pledgepack_core::plugin_system::CapabilityAuditor>,
+    /// Resolver handed to every loaded plugin for its `resolve-import` host call.
+    import_resolver: Option<ImportResolver>,
+    /// Resource limits applied to every plugin loaded through this host.
+    limits: WasmLimits,
 }
 
-/// A plugin's signature plus (optionally) its declared capabilities, read
-/// from a `<plugin-path>.sig.json` sidecar file. Kept local to this crate
-/// (rather than extending `PluginSignature` itself, or the frozen WIT
-/// contract) since neither the sidecar file format nor plugin-declared
-/// capabilities are part of the plugin ABI — they're a host-side trust
-/// mechanism layered on top of it.
-#[derive(serde::Deserialize)]
-struct PluginTrustSidecar {
-    #[serde(flatten)]
-    signature: pledgepack_core::plugin_system::PluginSignature,
-    #[serde(default)]
-    capabilities: Vec<pledgepack_core::plugin_system::PluginCapability>,
-}
+// A plugin's signature plus (optionally) its declared capabilities, read
+// from a `<plugin-path>.sig.json` sidecar file — shared with
+// `js-plugin-host` via `pledgepack_core::plugin_system`.
+use pledgepack_core::plugin_system::PluginTrustSidecar;
 
 impl WasmPluginHost {
     /// Create a new WASM plugin host with default engine configuration.
@@ -680,7 +735,37 @@ impl WasmPluginHost {
             engine,
             signing_verifier: None,
             capability_auditor: None,
+            import_resolver: None,
+            limits: WasmLimits::default(),
         })
+    }
+
+    /// Apply `limits` (per-call fuel, lifetime fuel cap, memory, tables) to
+    /// every plugin loaded afterwards and to those already loaded.
+    pub fn with_limits(mut self, limits: WasmLimits) -> Self {
+        for plugin in &mut self.plugins {
+            plugin.set_limits(limits.clone());
+        }
+        self.limits = limits;
+        self
+    }
+
+    /// Reset every loaded plugin's lifetime fuel counter (e.g. per build).
+    pub fn reset_lifetime_fuel(&mut self) {
+        for plugin in &mut self.plugins {
+            plugin.reset_lifetime_fuel();
+        }
+    }
+
+    /// Route every plugin's `resolve-import` host call to `resolver`
+    /// (`(specifier, importer) -> resolved id`). Applies to plugins loaded
+    /// after this call and to those already loaded.
+    pub fn with_import_resolver(mut self, resolver: ImportResolver) -> Self {
+        for plugin in &mut self.plugins {
+            plugin.set_import_resolver(Some(resolver.clone()));
+        }
+        self.import_resolver = Some(resolver);
+        self
     }
 
     /// Require every subsequently loaded plugin to carry a valid signature
@@ -717,18 +802,29 @@ impl WasmPluginHost {
     /// is unchanged from before this existed: every plugin loads
     /// unconditionally. See PRODUCTION-READINESS-100.md goals 12-13.
     pub fn load_plugin(&mut self, path: &Path) -> Result<&str> {
-        if self.signing_verifier.is_some() || self.capability_auditor.is_some() {
-            self.check_plugin_trust(path)?;
+        let verified_bytes = if self.signing_verifier.is_some() || self.capability_auditor.is_some()
+        {
+            self.check_plugin_trust(path)?
+        } else {
+            None
+        };
+        let mut plugin = match verified_bytes {
+            Some(bytes) => WasmPlugin::load_from_bytes(path, &bytes, &default_engine()?)?,
+            None => WasmPlugin::load_from_file(path)?,
+        };
+        if let Some(ref resolver) = self.import_resolver {
+            plugin.set_import_resolver(Some(resolver.clone()));
         }
-        let plugin = WasmPlugin::load_from_file(path)?;
+        plugin.set_limits(self.limits.clone());
+        let index = self.plugins.len();
         self.plugins.push(plugin);
-        Ok(self.plugins.last().unwrap().name())
+        Ok(self.plugins[index].name())
     }
 
     /// Signature/capability enforcement for [`load_plugin`](Self::load_plugin).
     /// Split out so the happy path (no verifier configured) above stays a
     /// one-line no-op check.
-    fn check_plugin_trust(&self, path: &Path) -> Result<()> {
+    fn check_plugin_trust(&self, path: &Path) -> Result<Option<Vec<u8>>> {
         let sidecar_path = {
             let mut s = path.as_os_str().to_os_string();
             s.push(".sig.json");
@@ -750,12 +846,16 @@ impl WasmPluginHost {
             )
         })?;
 
+        let mut verified_bytes = None;
         if let Some(ref verifier) = self.signing_verifier {
             let wasm_bytes = std::fs::read(path).map_err(|e| {
                 anyhow::anyhow!("Failed to read plugin file {}: {}", path.display(), e)
             })?;
             let actual_hash = blake3::hash(&wasm_bytes).to_hex().to_string();
-            if actual_hash != sidecar.signature.wasm_hash {
+            if !ct_eq(
+                actual_hash.as_bytes(),
+                sidecar.signature.wasm_hash.as_bytes(),
+            ) {
                 anyhow::bail!(
                     "Plugin {} content hash does not match its signature sidecar — refusing to load (expected {}, got {})",
                     path.display(),
@@ -774,6 +874,7 @@ impl WasmPluginHost {
                 path.display(),
                 sidecar.signature.signer_identity
             );
+            verified_bytes = Some(wasm_bytes);
         }
 
         if let Some(ref auditor) = self.capability_auditor
@@ -794,7 +895,7 @@ impl WasmPluginHost {
             info!("Plugin {}: capability audit passed", path.display());
         }
 
-        Ok(())
+        Ok(verified_bytes)
     }
 
     /// Load multiple plugins from a list of paths.
@@ -1028,19 +1129,70 @@ impl WasmPluginHost {
 
 // ─── Engine Configuration ─────────────────────────────────────────────
 
+/// Fuel accounting for one refill: `cumulative` is what earlier calls burned,
+/// `remaining` the fuel left in the store after the last call, `grant` the
+/// budget that call started with. Returns the new cumulative total and whether
+/// the lifetime budget `max` (`None` = unlimited) is now exceeded.
+fn account_fuel(cumulative: u64, remaining: u64, grant: u64, max: Option<u64>) -> (u64, bool) {
+    let total = cumulative.saturating_add(grant.saturating_sub(remaining));
+    (total, max.is_some_and(|m| total > m))
+}
+
 /// Default fuel budget per plugin invocation (10M instructions ≈ ~10ms CPU).
-/// Prevents infinite loops and runaway computation.
+/// Reset at the start of every hook call. Prevents infinite loops.
 const DEFAULT_FUEL: u64 = 10_000_000;
 
-/// G7.3: Maximum cumulative fuel a single plugin instance may consume across
-/// all hook invocations over its lifetime (100M instructions ≈ ~100ms total).
-/// Once exceeded, `refill_fuel` stops refilling and the next call traps on
-/// out-of-fuel, bounding total CPU usage per plugin instance.
-const MAX_CUMULATIVE_FUEL: u64 = 100_000_000;
+/// Default lifetime fuel cap for one plugin instance (100G instructions,
+/// on the order of a couple of minutes of pure compute). The previous 100M
+/// cap (~0.1 s) starved every real dev session. Configure via
+/// [`WasmLimits::lifetime_fuel`]; `None` disables the cap.
+const DEFAULT_LIFETIME_FUEL: u64 = 100_000_000_000;
 
 /// Default maximum linear memory size per plugin (128 MB).
 /// Prevents memory exhaustion from malicious or buggy plugins.
 const DEFAULT_MEMORY_MAX_BYTES: usize = 128 * 1024 * 1024;
+
+/// Default maximum number of elements in any one table.
+const DEFAULT_TABLE_ELEMENTS: usize = 100_000;
+
+/// Resource limits applied to one plugin instance.
+#[derive(Clone, Debug)]
+pub struct WasmLimits {
+    /// Fuel granted at the start of *every* hook call (reset each call).
+    pub fuel_per_call: u64,
+    /// Total fuel the instance may burn across all calls; `None` = unlimited.
+    pub lifetime_fuel: Option<u64>,
+    /// Max bytes of any one linear memory.
+    pub memory_bytes: usize,
+    /// Max elements of any one table.
+    pub table_elements: usize,
+}
+
+impl Default for WasmLimits {
+    fn default() -> Self {
+        Self {
+            fuel_per_call: DEFAULT_FUEL,
+            lifetime_fuel: Some(DEFAULT_LIFETIME_FUEL),
+            memory_bytes: DEFAULT_MEMORY_MAX_BYTES,
+            table_elements: DEFAULT_TABLE_ELEMENTS,
+        }
+    }
+}
+
+impl WasmLimits {
+    /// Build the wasmtime `StoreLimits` enforcing memory/table/instance caps.
+    /// Exceeding any of them makes the guest's grow request fail (and the
+    /// instantiation/growing operation trap) instead of exhausting the host.
+    fn store_limits(&self) -> wasmtime::StoreLimits {
+        wasmtime::StoreLimitsBuilder::new()
+            .memory_size(self.memory_bytes)
+            .table_elements(self.table_elements)
+            .instances(1_000)
+            .tables(64)
+            .memories(16)
+            .build()
+    }
+}
 
 /// Create a default wasmtime engine configured for sandboxed plugin execution.
 ///
@@ -1169,11 +1321,7 @@ impl WasmPluginHostBridge {
     /// Item 5: Plugin ordering for WASM plugins.
     pub fn pre_transform_closure(
         self: Arc<Self>,
-    ) -> Arc<
-        dyn Fn(&str, &str) -> Option<pledgepack_core::task_transform::PluginTransformResult>
-            + Send
-            + Sync,
-    > {
+    ) -> pledgepack_core::task_transform::PluginTransformFn {
         if !self.has_pre_plugin() {
             return Arc::new(|_code, _id| None);
         }
@@ -1226,11 +1374,7 @@ impl WasmPluginHostBridge {
     /// the result. If no plugins transform the code, returns `None`.
     pub fn transform_closure(
         self: Arc<Self>,
-    ) -> Arc<
-        dyn Fn(&str, &str) -> Option<pledgepack_core::task_transform::PluginTransformResult>
-            + Send
-            + Sync,
-    > {
+    ) -> pledgepack_core::task_transform::PluginTransformFn {
         Arc::new(move |code: &str, id: &str| {
             let mut host = self.host.lock();
             match host.transform(code, id, None) {
@@ -1405,8 +1549,8 @@ impl DebugConfig {
 /// cannot create instances itself — callers pre-instantiate them and hand
 /// them to the pool.
 ///
-/// TODO: Add a constructor that takes a loader closure so the pool can lazily
-/// instantiate instances up to `max_size` on demand.
+/// Use [`acquire_or_load`](Self::acquire_or_load) to have the pool lazily
+/// instantiate an instance through a loader closure when the cache is empty.
 pub struct PluginInstancePool {
     /// Cached, ready-to-use plugin instances.
     available: parking_lot::Mutex<Vec<WasmPlugin>>,
@@ -1481,6 +1625,22 @@ impl PluginInstancePool {
             max_size: pool_size,
             active: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    /// Acquire an instance, lazily creating one with `load` when the cache is
+    /// empty. The new instance is attached to the slot, so it returns to the
+    /// pool (subject to `max_size`) when the slot is dropped. If `load`
+    /// fails, the error is returned and no slot is held (the `active`
+    /// counter is restored).
+    pub fn acquire_or_load<F>(&self, load: F) -> Result<PoolSlot<'_>>
+    where
+        F: FnOnce() -> Result<WasmPlugin>,
+    {
+        let mut slot = self.acquire();
+        if slot.instance.is_none() {
+            slot.attach(load()?);
+        }
+        Ok(slot)
     }
 
     /// Add a pre-instantiated plugin to the pool's cache.
@@ -1825,7 +1985,7 @@ pub struct PluginAttestation {
 impl PluginAttestation {
     /// Verify that the plugin hash matches the expected hash.
     pub fn verify_hash(&self, expected: &[u8]) -> bool {
-        self.plugin_hash == expected
+        ct_eq(&self.plugin_hash, expected)
     }
 }
 
@@ -1890,6 +2050,75 @@ pub fn hook_support_matrix() -> Vec<(&'static str, bool)> {
         .iter()
         .map(|&name| (name, host_supports_hook(name)))
         .collect()
+}
+
+/// Constant-time equality for hashes/keys/signatures: runtime does not depend
+/// on where the first differing byte is (length is not secret).
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+#[cfg(test)]
+mod fuel_accounting_tests {
+    use super::*;
+
+    #[test]
+    fn cheap_calls_do_not_exhaust_the_lifetime_budget() {
+        // 1000 hook calls that each burn only 1k of the 10M grant.
+        let mut cumulative = 0;
+        for _ in 0..1000 {
+            let (c, exhausted) = account_fuel(
+                cumulative,
+                DEFAULT_FUEL - 1_000,
+                DEFAULT_FUEL,
+                Some(DEFAULT_LIFETIME_FUEL),
+            );
+            assert!(!exhausted);
+            cumulative = c;
+        }
+        assert_eq!(cumulative, 1_000_000);
+    }
+
+    #[test]
+    fn heavy_calls_still_exhaust_the_budget() {
+        let cap = Some(DEFAULT_LIFETIME_FUEL);
+        let (_, exhausted) = account_fuel(DEFAULT_LIFETIME_FUEL, 0, DEFAULT_FUEL, cap);
+        assert!(exhausted);
+    }
+
+    #[test]
+    fn per_call_grant_is_independent_of_history() {
+        // A plugin that burned a lot in earlier calls is still granted a
+        // fresh per-call budget as long as the lifetime cap allows it.
+        let (total, exhausted) = account_fuel(50_000_000, 0, DEFAULT_FUEL, Some(1_000_000_000));
+        assert_eq!(total, 60_000_000);
+        assert!(!exhausted);
+    }
+
+    #[test]
+    fn lifetime_cap_is_configurable_and_optional() {
+        // The old fixed 100M cap is exceeded after a mere ten full-budget calls.
+        assert!(account_fuel(95_000_000, 0, DEFAULT_FUEL, Some(100_000_000)).1);
+        // With the default (or no) cap a long session keeps running.
+        assert!(!account_fuel(95_000_000, 0, DEFAULT_FUEL, Some(DEFAULT_LIFETIME_FUEL)).1);
+        assert!(!account_fuel(u64::MAX - 1, 0, DEFAULT_FUEL, None).1);
+    }
+
+    #[test]
+    fn default_limits_cap_memory_and_tables() {
+        let l = WasmLimits::default();
+        assert_eq!(l.fuel_per_call, DEFAULT_FUEL);
+        assert!(l.lifetime_fuel.unwrap() > 1_000_000_000);
+        assert_eq!(l.memory_bytes, 128 * 1024 * 1024);
+        assert!(l.table_elements > 0 && l.table_elements <= 1_000_000);
+    }
 }
 
 #[cfg(test)]
@@ -2219,6 +2448,42 @@ mod tests {
     }
 
     #[test]
+    fn instance_pool_acquire_or_load_propagates_loader_errors_and_restores_counter() {
+        let pool = PluginInstancePool::new(2);
+        let err = pool
+            .acquire_or_load(|| Err(anyhow::anyhow!("loader failed")))
+            .err()
+            .expect("loader error must propagate");
+        assert!(err.to_string().contains("loader failed"));
+        assert_eq!(pool.stats().active, 0);
+    }
+
+    #[test]
+    fn resolve_import_delegates_to_embedder_resolver() {
+        let mut state = PluginState::new("t".to_string());
+        // No resolver installed: unresolved.
+        assert_eq!(
+            PledgepackPluginImports::resolve_import(&mut state, "x".into(), "/a.js".into()),
+            None
+        );
+        state.set_import_resolver(Some(std::sync::Arc::new(|spec, importer| {
+            (spec == "virtual:x").then(|| format!("/resolved/{}", importer))
+        })));
+        assert_eq!(
+            PledgepackPluginImports::resolve_import(
+                &mut state,
+                "virtual:x".into(),
+                "main.js".into()
+            ),
+            Some("/resolved/main.js".to_string())
+        );
+        assert_eq!(
+            PledgepackPluginImports::resolve_import(&mut state, "other".into(), "main.js".into()),
+            None
+        );
+    }
+
+    #[test]
     fn g7_11_instance_pool_acquire_release() {
         let pool = PluginInstancePool::new(2);
         let _slot1 = pool.acquire();
@@ -2249,7 +2514,7 @@ mod tests {
 
     #[test]
     fn g7_12_plugin_cache_store_operations() {
-        let mut store = PluginCacheStore::new();
+        let store = PluginCacheStore::new();
         let entry = PluginCacheEntry {
             cache_key: vec![0xAA; 16],
             plugin_name: "test-plugin".to_string(),
@@ -2284,7 +2549,7 @@ mod tests {
 
     #[test]
     fn g7_14_plugin_communication_channel() {
-        let mut channel = PluginCommunicationChannel::new();
+        let channel = PluginCommunicationChannel::new();
         channel.send(
             "@pledge/css-modules",
             "@pledge/minify",
@@ -2374,8 +2639,8 @@ mod tests {
             key_id: "key-001".to_string(),
         };
         // Verification checks that hash matches expected
-        assert!(att.verify_hash(&vec![0xAB; 32]));
-        assert!(!att.verify_hash(&vec![0xBB; 32]));
+        assert!(att.verify_hash(&[0xAB; 32]));
+        assert!(!att.verify_hash(&[0xBB; 32]));
     }
 
     // ─── G7.18: Plugin Profiling tests ───────────────────────────────
@@ -2401,5 +2666,19 @@ mod tests {
         assert_eq!(result.plugin_name, "@pledge/css-modules");
         assert_eq!(result.call_count, 3);
         assert!((result.total_time_ms - 42.5).abs() < f64::EPSILON);
+    }
+}
+
+#[cfg(test)]
+mod ct_eq_tests {
+    use super::ct_eq;
+
+    #[test]
+    fn matches_only_identical_slices() {
+        assert!(ct_eq(b"abc", b"abc"));
+        assert!(ct_eq(b"", b""));
+        assert!(!ct_eq(b"abc", b"abd"));
+        assert!(!ct_eq(b"abc", b"ab"));
+        assert!(!ct_eq(b"\x00", b"\x01"));
     }
 }

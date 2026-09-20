@@ -97,6 +97,7 @@ pub struct RemoteCacheEntry {
 }
 
 /// Remote cache client — abstracts over HTTP/S3/GCS backends
+#[derive(Clone)]
 pub struct RemoteCache {
     config: RemoteCacheConfig,
     enabled: bool,
@@ -279,22 +280,14 @@ impl RemoteCache {
         validate_object_url(&s3_url)?;
 
         let data = bincode::serde::encode_to_vec(entry, bincode::config::standard())?;
-        let temp_file =
-            std::env::temp_dir().join(format!("pledgepack_s3_{}", blake3::hash(&data).to_hex()));
-        std::fs::write(&temp_file, &data)?;
-
-        let output = std::process::Command::new("aws")
-            .args([
-                "s3",
-                "cp",
-                &temp_file.to_string_lossy(),
-                &s3_url,
-                "--region",
-                region,
-            ])
-            .output();
-
-        let _ = std::fs::remove_file(&temp_file);
+        // Upload from stdin (`aws s3 cp - <url>`): no temp file at all, so
+        // there is no predictable path for another local user to pre-create
+        // or symlink-swap.
+        let output = run_with_stdin(
+            "aws",
+            &["s3", "cp", "-", &s3_url, "--region", region],
+            &data,
+        );
 
         match output {
             Ok(result) if result.status.success() => {
@@ -359,15 +352,8 @@ impl RemoteCache {
         validate_object_url(&gs_url)?;
 
         let data = bincode::serde::encode_to_vec(entry, bincode::config::standard())?;
-        let temp_file =
-            std::env::temp_dir().join(format!("pledgepack_gcs_{}", blake3::hash(&data).to_hex()));
-        std::fs::write(&temp_file, &data)?;
-
-        let output = std::process::Command::new("gsutil")
-            .args(["cp", &temp_file.to_string_lossy(), &gs_url])
-            .output();
-
-        let _ = std::fs::remove_file(&temp_file);
+        // Upload from stdin (`gsutil cp - <url>`); see s3_set.
+        let output = run_with_stdin("gsutil", &["cp", "-", &gs_url], &data);
 
         match output {
             Ok(result) if result.status.success() => {
@@ -388,6 +374,33 @@ pub fn remote_cache_key(content_hash: u64, function_id: &str, path: &str) -> Str
     let combined = format!("{}:{}:{}", content_hash, function_id, path);
     let hash = blake3::hash(combined.as_bytes());
     hash.to_hex().as_str().to_string()
+}
+/// Run `program args...` feeding `data` on stdin, returning its output.
+/// The data is written from a separate thread so a child that produces
+/// output before draining stdin cannot deadlock us.
+fn run_with_stdin(
+    program: &str,
+    args: &[&str],
+    data: &[u8],
+) -> std::io::Result<std::process::Output> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    let payload = data.to_vec();
+    let writer = std::thread::spawn(move || {
+        let _ = stdin.write_all(&payload);
+        // dropping `stdin` closes the pipe -> EOF for the child
+    });
+    let output = child.wait_with_output();
+    let _ = writer.join();
+    output
 }
 
 #[cfg(test)]

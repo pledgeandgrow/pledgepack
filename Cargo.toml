@@ -20,7 +20,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.3.3"
+version = "1.0.0-rc.1"
 edition = "2024"
 license = "MIT"
 # None of these crates are published to crates.io today (see
@@ -56,14 +56,18 @@ tokio-tungstenite = "0.26"
 oxc = { version = "0.141", features = ["transformer", "codegen", "minifier", "semantic", "ast_visit"] }
 
 # Lightning CSS
-# NOTE: lightningcss is at an alpha version. This is a known risk —
-# alpha versions may have breaking changes, bugs, and security issues.
-# TODO: Upgrade to a stable release when lightningcss 1.0.0 is released.
-# review-by: 2026-12-15 — re-check for a 1.0.0 stable release (see
-# PRODUCTION-READINESS-100.md goal 23); also the root cause of the
-# RUSTSEC-2026-0235 ignore in deny.toml (transitive via parcel_sourcemap),
-# so re-evaluate both together.
-lightningcss = "1.0.0-alpha.72"
+# ACCEPTED RISK (decision recorded 2026-09-20): lightningcss has never shipped a
+# 1.0 stable — 1.0.0-alpha.72 is the newest release on crates.io (checked with
+# `cargo search`/`cargo info`), so there is nothing to upgrade to, and no
+# drop-in replacement offers the same nesting/prefixing/minify/CSS-Modules
+# coverage. Mitigations: (1) `default-features = false` — we only use
+# stylesheet parse/minify/print + targets, so the `bundler`, `nodejs` and
+# `sourcemap` features are off, which removes parcel_sourcemap and its
+# vulnerable rkyv 0.7 (RUSTSEC-2026-0235) from the dependency tree entirely;
+# (2) CSS output is covered by the crate's CSS tests. Re-check for a stable
+# release on the review date below.
+# review-by: 2026-12-15
+lightningcss = { version = "1.0.0-alpha.72", default-features = false }
 
 # Hashing (for cache keys and SRI)
 blake3 = "1"
@@ -86,7 +90,7 @@ anyhow = "1"
 thiserror = "2"
 
 # CLI
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 
 # CLI UX
 clap_complete = "4"
@@ -126,15 +130,11 @@ memmap2 = "0.9"
 # CLI tables
 comfy-table = "7"
 
-# YAML parsing (pure Rust, zero unsafe, YAML 1.2 compliant)
-# NOTE: noyalib is used for YAML parsing. This is a pre-1.0 crate with
-# minimal maintenance history. TODO: Evaluate switching to serde_yaml.
-# review-by: 2026-12-15 (PRODUCTION-READINESS-100.md goal 24) — note
-# serde_yaml itself was archived/deprecated by its maintainer; confirm
-# whether that's still the best available alternative or whether another
-# maintained YAML crate (or noyalib itself, if it's since matured) is the
-# right call before switching anything.
-noyalib = "0.0.15"
+# YAML parsing (pure Rust, YAML 1.2, panic-free parsing by design).
+# Migrated from noyalib (0.0.x pre-1.0, minimal history) to serde-saphyr 1.x, a
+# maintained stable-major crate. (serde_yaml itself is archived upstream.)
+# Only used for `import data from './x.yaml'` (crates/core/src/asset_pipeline.rs).
+serde-saphyr = "1.3"
 
 # Source-context error diagnostics
 miette = { version = "7", features = ["fancy"] }
@@ -183,6 +183,9 @@ zstd = "0.13"
 
 # Digital signatures for cache integrity
 ed25519-dalek = { version = "2", features = ["rand_core"] }
+# Constant-time comparison of key/hash material (already in the lockfile as an
+# ed25519-dalek dependency).
+subtle = "2"
 
 # Internal crates
 pledgepack-core = { path = "crates/core" }

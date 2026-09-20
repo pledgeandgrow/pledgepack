@@ -15,6 +15,7 @@ blake3 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 bincode = { workspace = true }
+zstd = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
@@ -40,6 +41,9 @@ tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
 
 [features]
-default = []
+# zig-graph is on by default: the Zig arena graph is the TaskEngine's
+# default dependency-graph backend (PLEDGE_GRAPH_BACKEND=rust opts out at
+# runtime). Build with --no-default-features for a pure-Rust fallback.
+default = ["zig-graph"]
 task-trace = []
-zig-graph = ["pledgepack-native-sys"]
+zig-graph = ["dep:pledgepack-native-sys"]

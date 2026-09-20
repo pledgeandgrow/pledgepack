@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Fails if any `# review-by: YYYY-MM-DD` marker in audit.toml / deny.toml /
+# Fails if any `# review-by: YYYY-MM-DD` marker in .cargo/audit.toml / deny.toml /
 # Cargo.toml has passed. Originally just the ignored-RUSTSEC-advisory markers
 # (goal 6); also covers the lightningcss/noyalib tracked-risk dependency
 # notes in Cargo.toml (goals 23-24) — same mechanism, same reasoning: an
@@ -10,7 +10,7 @@ set -euo pipefail
 today=$(date -u +%Y-%m-%d)
 stale=0
 
-for file in audit.toml deny.toml Cargo.toml; do
+for file in .cargo/audit.toml deny.toml Cargo.toml; do
   while IFS= read -r line; do
     date_str=$(echo "$line" | sed -n 's/.*review-by: \([0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}\).*/\1/p')
     if [ -n "$date_str" ] && [[ "$date_str" < "$today" ]]; then
@@ -30,4 +30,4 @@ if [ "$stale" -ne 0 ]; then
   exit 1
 fi
 
-echo "All review-by dates in audit.toml/deny.toml/Cargo.toml are still current."
+echo "All review-by dates in .cargo/audit.toml/deny.toml/Cargo.toml are still current."

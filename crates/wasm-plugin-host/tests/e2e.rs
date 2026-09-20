@@ -12,11 +12,25 @@ use pledgepack_wasm_plugin_host::*;
 use std::path::PathBuf;
 
 /// Path to the pre-built test plugin WASM component.
+///
+/// Prefers the `wasm32-wasip2` build (a real component — `cargo build
+/// --target wasm32-wasip2`). The `wasm32-wasip1` artifact is a *core*
+/// module, not a component, and cannot be loaded by
+/// `wasmtime::component::Component`; it only exists because the fixture
+/// was originally built without cargo-component/wasip2.
 fn test_plugin_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let target_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
         .join("test-plugin-guest")
-        .join("target")
+        .join("target");
+    let wasip2 = target_dir
+        .join("wasm32-wasip2")
+        .join("release")
+        .join("test_plugin_guest.wasm");
+    if wasip2.exists() {
+        return wasip2;
+    }
+    target_dir
         .join("wasm32-wasip1")
         .join("release")
         .join("test_plugin_guest.wasm")
@@ -319,4 +333,36 @@ fn test_wasm_plugin_state_emitted_files() {
     let plugin = WasmPlugin::load_from_file(&path).unwrap();
     // The test plugin doesn't emit files — just verify it loads
     assert_eq!(plugin.name(), "test-plugin");
+}
+
+#[test]
+fn test_lifetime_fuel_cap_is_configurable() {
+    require_test_plugin!();
+    let path = test_plugin_path();
+
+    // A tiny lifetime cap makes the next hook call trap on out-of-fuel.
+    let mut plugin = WasmPlugin::load_from_file(&path).unwrap();
+    plugin.set_limits(WasmLimits {
+        lifetime_fuel: Some(1),
+        ..WasmLimits::default()
+    });
+    assert!(
+        plugin
+            .resolve_id("virtual:test-plugin", None, false, None)
+            .is_err(),
+        "hook call must fail once the lifetime cap is exceeded"
+    );
+
+    // With the default limits a long session is not starved: far more than
+    // the old 10-full-budget-call cap's worth of calls all succeed, and the
+    // per-call budget is reset each time.
+    let mut plugin = WasmPlugin::load_from_file(&path).unwrap();
+    for _ in 0..500 {
+        plugin
+            .resolve_id("virtual:test-plugin", None, false, None)
+            .expect("hook call within budget");
+    }
+    assert!(plugin.lifetime_fuel_used() > 0);
+    plugin.reset_lifetime_fuel();
+    assert_eq!(plugin.lifetime_fuel_used(), 0);
 }

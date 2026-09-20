@@ -264,6 +264,17 @@ impl NextAdapter {
                     _ => continue,
                 };
 
+                // Page/route-handler files inside a subdirectory were already
+                // registered by the directory-level check above (with the
+                // correct catch-all flags); registering them again here would
+                // duplicate every nested route.
+                if matches!(kind, RouteKind::Page | RouteKind::RouteHandler) {
+                    let file = rel_path(&self.root, &path);
+                    if self.routes.iter().any(|r| r.kind == kind && r.file == file) {
+                        continue;
+                    }
+                }
+
                 let route_path = if prefix.is_empty() {
                     "/".to_string()
                 } else {
@@ -384,7 +395,12 @@ impl NextAdapter {
                     || name.ends_with(".js")
                     || name.ends_with(".mdx")
                 {
-                    let stem = name.split('.').next().unwrap_or(&name);
+                    // `_app`, `_document`, `_error` are framework files, not routes; and
+                    // `about.test.tsx` must not collapse onto `/about`.
+                    if name.starts_with('_') || name.ends_with(".d.ts") {
+                        continue;
+                    }
+                    let stem = name.rsplit_once('.').map(|(s, _)| s).unwrap_or(&name);
                     let (seg, param) = if stem.starts_with('[') && stem.ends_with(']') {
                         let inner = &stem[1..stem.len() - 1];
                         if let Some(p) = inner.strip_prefix("...") {
@@ -420,6 +436,14 @@ impl NextAdapter {
                 } else {
                     continue;
                 };
+                // `index` files in a subdirectory were already registered by
+                // the directory-level check above.
+                if matches!(kind, RouteKind::Page | RouteKind::Api) && {
+                    let file = rel_path(&self.root, &path);
+                    self.routes.iter().any(|r| r.file == file)
+                } {
+                    continue;
+                }
 
                 self.routes.push(Route {
                     path: route_path,
@@ -1275,5 +1299,58 @@ mod tests {
         );
         assert!(code.contains("getApiRoutes"), "should export getApiRoutes");
         assert!(code.contains("getLayouts"), "should export getLayouts");
+    }
+
+    #[test]
+    fn app_router_subdirectory_pages_are_not_duplicated() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("app/about")).unwrap();
+        fs::create_dir_all(root.join("app/docs/[...slug]")).unwrap();
+        fs::write(root.join("app/page.tsx"), "").unwrap();
+        fs::write(root.join("app/about/page.tsx"), "").unwrap();
+        fs::write(root.join("app/docs/[...slug]/page.tsx"), "").unwrap();
+        fs::write(root.join("app/about/route.ts"), "").unwrap();
+        let mut adapter = NextAdapter::new(root);
+        adapter.discover_routes().unwrap();
+        let count = |kind: RouteKind, path: &str| {
+            adapter
+                .routes
+                .iter()
+                .filter(|r| r.kind == kind && r.path == path)
+                .count()
+        };
+        assert_eq!(count(RouteKind::Page, "/about"), 1);
+        assert_eq!(count(RouteKind::RouteHandler, "/about"), 1);
+        assert_eq!(count(RouteKind::Page, "/docs/*slug"), 1);
+        let docs = adapter
+            .routes
+            .iter()
+            .find(|r| r.kind == RouteKind::Page && r.path == "/docs/*slug")
+            .unwrap();
+        assert!(docs.catch_all, "catch-all flag must survive de-duplication");
+    }
+
+    #[test]
+    fn pages_router_special_files_and_dotted_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("pages/blog")).unwrap();
+        fs::write(root.join("pages/index.tsx"), "").unwrap();
+        fs::write(root.join("pages/_app.tsx"), "").unwrap();
+        fs::write(root.join("pages/_document.tsx"), "").unwrap();
+        fs::write(root.join("pages/about.tsx"), "").unwrap();
+        fs::write(root.join("pages/about.test.tsx"), "").unwrap();
+        fs::write(root.join("pages/blog/index.tsx"), "").unwrap();
+        let mut adapter = NextAdapter::new(root);
+        adapter.discover_routes().unwrap();
+        let paths: Vec<&str> = adapter.routes.iter().map(|r| r.path.as_str()).collect();
+        assert!(
+            !paths
+                .iter()
+                .any(|p| p.contains("_app") || p.contains("_document"))
+        );
+        assert_eq!(paths.iter().filter(|p| **p == "/about").count(), 1);
+        assert_eq!(paths.iter().filter(|p| **p == "/blog").count(), 1);
     }
 }

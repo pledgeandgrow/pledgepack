@@ -19,7 +19,7 @@
 
 use crate::backend::{MemoryBackend, TaskBackend};
 use crate::environment::{self, Environment};
-use crate::graph::{AggregationGraph, DependencyGraph, TaskStatus};
+use crate::graph::{AggregationGraph, TaskGraphOps, TaskStatus, default_dep_graph};
 use crate::read_tracker;
 use crate::registry::TaskRegistry;
 use crate::task::TaskId;
@@ -156,7 +156,12 @@ pub struct TaskEngine {
     /// Three-tier storage for task outputs.
     backend: TaskBackend,
     /// Dependency graph (edges, invalidation propagation).
-    dep_graph: DependencyGraph,
+    ///
+    /// Backend selected by `default_dep_graph()` — the Zig arena graph when
+    /// the `zig-graph` feature is on (default), the DashMap
+    /// `DependencyGraph` when `PLEDGE_GRAPH_BACKEND=rust` or the feature is
+    /// disabled.
+    dep_graph: Box<dyn TaskGraphOps>,
     /// Aggregation graph (O(log n) sub-graph queries).
     agg_graph: AggregationGraph,
     /// Task registry (function ID → executor).
@@ -190,7 +195,7 @@ impl TaskEngine {
     pub fn new(registry: TaskRegistry, backend: TaskBackend) -> Self {
         TaskEngine {
             backend,
-            dep_graph: DependencyGraph::new(),
+            dep_graph: default_dep_graph(),
             agg_graph: AggregationGraph::new(),
             registry: Arc::new(registry),
             active_queries: RwLock::new(HashMap::new()),
@@ -232,6 +237,9 @@ impl TaskEngine {
     pub fn is_cached(&self, id: &TaskId) -> bool {
         if self.backend.memory.get(id).is_some() {
             return true;
+        }
+        if let Some(disk) = self.backend.disk() {
+            return disk.contains(id);
         }
         false
     }
@@ -313,7 +321,7 @@ impl TaskEngine {
         let active_queries: Vec<(u64, Vec<String>)> = self
             .active_queries
             .read()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
             .map(|(id, q)| {
                 let roots: Vec<String> = q.roots.iter().map(|t| t.to_hex()).collect();
@@ -604,6 +612,19 @@ impl TaskEngine {
         }
     }
 
+    /// Blocking variant of [`read_task`](Self::read_task) for rayon /
+    /// `spawn_blocking` worker threads where no async runtime is driving
+    /// the caller. Runs the same memory → disk → remote → compute flow on
+    /// a minimal noop executor. `TaskExecutor::sync` executors produce
+    /// immediately-ready futures; the `Notify` used to dedup in-flight
+    /// computations wakes the noop waker's thread parker correctly.
+    pub fn read_task_blocking<T>(&self, id: TaskId) -> Result<Arc<T>, TaskError>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync + 'static,
+    {
+        futures::executor::block_on(self.read_task(id))
+    }
+
     /// Try to read a task without scheduling computation.
     ///
     /// Returns `Some(Arc<T>)` if the task is already cached, `None` otherwise.
@@ -821,8 +842,13 @@ impl TaskEngine {
                     self.dep_graph.set_status(id, TaskStatus::Dirty);
                 }
 
-                // Rebuild aggregation graph for this subtree
-                self.agg_graph.build_from(&self.dep_graph);
+                // Update the aggregation graph incrementally — a full
+                // build_from() here is O(graph) per compute (O(n²) over a
+                // build), and each dependency query crosses FFI on the Zig
+                // backend. incremental_rebuild only touches this task's
+                // subtree.
+                self.agg_graph
+                    .incremental_rebuild(&[id], self.dep_graph.as_ref());
             }
             Err(e) => {
                 error!("Task computation failed: {}: {}", id, e);
@@ -858,7 +884,7 @@ impl TaskEngine {
     pub fn invalidate(&self, task: TaskId) {
         let dirty = self.dep_graph.mark_dirty(task);
         for &t in &dirty {
-            self.agg_graph.mark_dirty(t, &self.dep_graph);
+            self.agg_graph.mark_dirty(t, self.dep_graph.as_ref());
         }
         info!("Invalidated {} tasks", dirty.len());
     }
@@ -885,7 +911,7 @@ impl TaskEngine {
         for task_id in &tasks_to_invalidate {
             let dirty = self.dep_graph.mark_dirty(*task_id);
             for &t in &dirty {
-                self.agg_graph.mark_dirty(t, &self.dep_graph);
+                self.agg_graph.mark_dirty(t, self.dep_graph.as_ref());
             }
             count += dirty.len();
         }
@@ -1152,8 +1178,8 @@ impl TaskEngine {
     }
 
     /// Get the dependency graph (for debugging/visualization).
-    pub fn dependency_graph(&self) -> &DependencyGraph {
-        &self.dep_graph
+    pub fn dependency_graph(&self) -> &dyn TaskGraphOps {
+        self.dep_graph.as_ref()
     }
 
     /// Get the aggregation graph (for debugging/visualization).
@@ -1442,7 +1468,7 @@ pub struct TaskEngineStats {
 pub struct TaskEngineBuilder {
     registry: TaskRegistry,
     memory: MemoryBackend,
-    disk: Option<crate::backend::DiskBackend>,
+    disk: Option<crate::backend::DiskTier>,
     remote: Option<pledgepack_cache::remote::RemoteCache>,
     verify_determinism: bool,
 }
@@ -1460,9 +1486,15 @@ impl TaskEngineBuilder {
         }
     }
 
-    /// Enable the disk tier, backing the in-memory cache with `disk`.
+    /// Enable the legacy JSON disk tier, backing the in-memory cache with `disk`.
     pub fn with_disk(mut self, disk: crate::backend::DiskBackend) -> Self {
-        self.disk = Some(disk);
+        self.disk = Some(crate::backend::DiskTier::Json(disk));
+        self
+    }
+
+    /// Enable the content-addressed disk tier (default for new engines).
+    pub fn with_cas(mut self, cas: crate::backend::CasBackend) -> Self {
+        self.disk = Some(crate::backend::DiskTier::Cas(cas));
         self
     }
 
@@ -1484,7 +1516,7 @@ impl TaskEngineBuilder {
     pub fn build(self) -> TaskEngine {
         let mut backend = TaskBackend::new(self.memory);
         if let Some(disk) = self.disk {
-            backend = backend.with_disk(disk);
+            backend = backend.with_disk_tier(disk);
         }
         if let Some(remote) = self.remote {
             backend = backend.with_remote(remote);

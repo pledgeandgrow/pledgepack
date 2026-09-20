@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::RwLock;
 use tracing::{debug, trace};
 
 /// A serialized task output stored in the backend.
@@ -316,10 +317,9 @@ impl DiskBackend {
     /// Store a task output to disk (atomic write via temp-file-then-rename).
     pub fn store(&self, output: &StoredOutput) -> std::io::Result<()> {
         let path = self.path_for(&output.task_id);
-        let tmp = path.with_extension("json.tmp");
         let data = serde_json::to_vec_pretty(output).map_err(std::io::Error::other)?;
-        std::fs::write(&tmp, &data)?;
-        std::fs::rename(&tmp, &path)?;
+        // Uniquely named temp file + rename: concurrent stores never share one.
+        pledgepack_cache::atomic_write(&path, &data)?;
         debug!("Stored task output to disk: {}", output.task_id);
         Ok(())
     }
@@ -357,6 +357,13 @@ impl DiskBackend {
 
         trace!("Loaded task output from disk: {}", id);
         Ok(Some(output))
+    }
+
+    /// Check whether an output exists on disk without reading or
+    /// deserializing it. Used for cache-hit metrics where `get()`'s full
+    /// read + integrity re-hash would be wasted work.
+    pub fn contains(&self, id: &TaskId) -> bool {
+        self.path_for(id).exists()
     }
 
     /// Remove a task output from disk.
@@ -397,6 +404,399 @@ impl DiskBackend {
     }
 }
 
+/// Content-addressed disk backend — the default disk tier.
+///
+/// Layout under `<cache_dir>/cas/`:
+///
+/// ```text
+/// objects/<xx>/<rest-of-hex>.zst   zstd-compressed bincode StoredOutput,
+///                                  named by blake3 of the compressed blob
+/// index.log                        append-only "<task_hex> <blob_hex>\n"
+///                                  (tombstone: "<task_hex> -")
+/// ```
+///
+/// The `TaskId` is the lookup key; the blob hash is the storage key — two
+/// different tasks with identical serialized outputs share one object
+/// (dedup for free), and a read is integrity-verified by construction: a
+/// corrupted or tampered blob can't match its own address. Blobs are read
+/// through `memmap2` so large outputs page in lazily.
+///
+/// The index log is append-only: stores append a line, removes append a
+/// tombstone, and `compact()` rewrites the log with live entries only.
+/// `gc()` deletes objects not referenced by the index.
+pub struct CasBackend {
+    /// `<cache_dir>/cas`
+    dir: PathBuf,
+    /// `dir/objects`
+    objects: PathBuf,
+    /// task id → blob hash, replayed from index.log at open
+    index: RwLock<HashMap<TaskId, [u8; 32]>>,
+    /// Handle to `dir/index.lock`. The mutex serialises threads of this
+    /// process; the OS advisory lock on the file (shared for appends,
+    /// exclusive for compaction) serialises processes. Lock order is always
+    /// `index_lock` -> `index`, never the reverse.
+    index_lock: Mutex<std::fs::File>,
+}
+
+impl CasBackend {
+    /// Create (or open) a CAS backend rooted at `cache_dir`.
+    pub fn new(cache_dir: PathBuf) -> std::io::Result<Self> {
+        let dir = cache_dir.join("cas");
+        let objects = dir.join("objects");
+        std::fs::create_dir_all(&objects)?;
+
+        let index = Self::replay_index(&dir.join("index.log"));
+        // Make sure index.log exists so appenders can rely on it.
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("index.log"))?;
+        let index_lock = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(dir.join("index.lock"))?;
+
+        Ok(CasBackend {
+            dir,
+            objects,
+            index: RwLock::new(index),
+            index_lock: Mutex::new(index_lock),
+        })
+    }
+
+    fn log_path(&self) -> PathBuf {
+        self.dir.join("index.log")
+    }
+
+    /// Replay the append-only index log; last entry wins, `-` is a tombstone.
+    fn replay_index(path: &PathBuf) -> HashMap<TaskId, [u8; 32]> {
+        let mut index = HashMap::new();
+        let Ok(data) = std::fs::read_to_string(path) else {
+            return index;
+        };
+        for line in data.lines() {
+            let mut parts = line.split_whitespace();
+            let (Some(task_hex), Some(blob_hex)) = (parts.next(), parts.next()) else {
+                continue; // skip malformed lines
+            };
+            let Some(task_id) = TaskId::from_hex(task_hex) else {
+                continue;
+            };
+            if blob_hex == "-" {
+                index.remove(&task_id);
+                continue;
+            }
+            if let Some(hash) = parse_blob_hash(blob_hex) {
+                index.insert(task_id, hash);
+            }
+        }
+        index
+    }
+
+    /// Path for a blob: objects/<first-2-hex>/<remaining-62-hex>.zst
+    fn object_path(&self, hash: &[u8; 32]) -> PathBuf {
+        let hex = to_hex64(hash);
+        self.objects
+            .join(&hex[..2])
+            .join(format!("{}.zst", &hex[2..]))
+    }
+
+    /// Append one line to index.log and apply `update` to the in-memory
+    /// index, both while holding the index lock, so a concurrent
+    /// `compact_index` can neither miss the line nor drop it.
+    fn append_index(
+        &self,
+        line: &str,
+        update: impl FnOnce(&mut HashMap<TaskId, [u8; 32]>),
+    ) -> std::io::Result<()> {
+        use std::io::Write;
+
+        let guard = self.index_lock.lock().unwrap_or_else(|e| e.into_inner());
+        guard.lock_shared()?;
+        let result = (|| {
+            // Opened per append (not held open) so a log replaced by another
+            // process's compaction is never appended to through a stale handle.
+            let mut log = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(self.log_path())?;
+            log.write_all(line.as_bytes())
+        })();
+        if result.is_ok() {
+            update(&mut self.index.write().unwrap_or_else(|e| e.into_inner()));
+        }
+        let _ = guard.unlock();
+        result
+    }
+
+    /// Store a task output. Content-identical outputs share one blob.
+    pub fn store(&self, output: &StoredOutput) -> std::io::Result<()> {
+        let raw = bincode::serde::encode_to_vec(output, bincode::config::standard())
+            .map_err(std::io::Error::other)?;
+        let compressed = zstd::stream::encode_all(&raw[..], 3)?;
+        let hash: [u8; 32] = *blake3::hash(&compressed).as_bytes();
+
+        let path = self.object_path(&hash);
+        if !path.exists() {
+            // Dedup: only write new content. Atomic via a *uniquely named*
+            // temp file + rename, so concurrent stores never share or
+            // clobber a temp file.
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            pledgepack_cache::atomic_write(&path, &compressed)?;
+        }
+
+        let task_id = output.task_id;
+        let line = format!("{} {}\n", task_id.to_hex(), to_hex64(&hash));
+        self.append_index(&line, |index| {
+            index.insert(task_id, hash);
+        })?;
+        debug!("Stored task output to CAS: {}", output.task_id);
+        Ok(())
+    }
+
+    /// Load a task output. Verifies the blob's blake3 against its address
+    /// before decompressing — a corrupted blob is a miss, not a crash.
+    pub fn get(&self, id: &TaskId) -> std::io::Result<Option<StoredOutput>> {
+        let Some(hash) = self
+            .index
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(id)
+            .copied()
+        else {
+            return Ok(None);
+        };
+
+        let path = self.object_path(&hash);
+        if !path.exists() {
+            // Index references a missing object — drop the stale entry.
+            self.index
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(id);
+            return Ok(None);
+        }
+
+        // mmap the blob — lazily paged, zero-copy into the decompressor's
+        // read path for large outputs.
+        let file = std::fs::File::open(&path)?;
+        let mmap = unsafe { memmap2::Mmap::map(&file)? };
+        let compressed: &[u8] = &mmap[..];
+
+        // Integrity: the address IS the hash.
+        if *blake3::hash(compressed).as_bytes() != hash {
+            tracing::warn!(
+                "CAS integrity check failed for task {} (blob {}): discarding",
+                id,
+                to_hex64(&hash),
+            );
+            drop(mmap);
+            let _ = std::fs::remove_file(&path);
+            self.index
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(id);
+            return Ok(None);
+        }
+
+        let raw = zstd::stream::decode_all(compressed)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        drop(mmap);
+        let (output, _): (StoredOutput, usize) =
+            bincode::serde::decode_from_slice(&raw, bincode::config::standard())
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+        trace!("Loaded task output from CAS: {}", id);
+        Ok(Some(output))
+    }
+
+    /// Check whether an output exists without reading it.
+    pub fn contains(&self, id: &TaskId) -> bool {
+        self.index
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(id)
+    }
+
+    /// Tombstone a task output. The blob stays — it may be shared.
+    pub fn remove(&self, id: &TaskId) -> std::io::Result<()> {
+        if !self.contains(id) {
+            return Ok(());
+        }
+        let task_id = *id;
+        self.append_index(&format!("{} -\n", id.to_hex()), |index| {
+            index.remove(&task_id);
+        })
+    }
+
+    /// Rewrite index.log with only live entries (drops tombstones and
+    /// superseded lines). Call after heavy invalidation churn.
+    ///
+    /// Safe against concurrent stores/removes, in this process and others:
+    /// the whole rewrite runs under the exclusive index lock (appenders hold
+    /// it shared), the live set is rebuilt from the on-disk log — so lines
+    /// appended by other processes are kept — and the new log is swapped in
+    /// with an atomic rename of a uniquely named temp file.
+    pub fn compact_index(&self) -> std::io::Result<()> {
+        use std::fmt::Write as _;
+
+        let guard = self.index_lock.lock().unwrap_or_else(|e| e.into_inner());
+        guard.lock()?;
+        let result = (|| {
+            let live = Self::replay_index(&self.log_path());
+            let mut body = String::with_capacity(live.len() * 100);
+            for (id, hash) in live.iter() {
+                let _ = writeln!(body, "{} {}", id.to_hex(), to_hex64(hash));
+            }
+            pledgepack_cache::atomic_write(&self.log_path(), body.as_bytes())?;
+            *self.index.write().unwrap_or_else(|e| e.into_inner()) = live;
+            Ok(())
+        })();
+        let _ = guard.unlock();
+        result
+    }
+
+    /// Delete object blobs not referenced by the index.
+    /// Returns (objects removed, bytes reclaimed).
+    pub fn gc(&self) -> std::io::Result<(usize, u64)> {
+        let live: std::collections::HashSet<String> = self
+            .index
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .map(to_hex64)
+            .collect();
+
+        let mut removed = 0usize;
+        let mut bytes = 0u64;
+        for sub in std::fs::read_dir(&self.objects)? {
+            let sub = sub?;
+            if !sub.file_type()?.is_dir() {
+                continue;
+            }
+            for entry in std::fs::read_dir(sub.path())? {
+                let entry = entry?;
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                let Some(rest) = name.strip_suffix(".zst") else {
+                    continue;
+                };
+                let full = format!("{}{}", sub.file_name().to_string_lossy(), rest);
+                if !live.contains(&full) {
+                    bytes += entry.metadata()?.len();
+                    std::fs::remove_file(entry.path())?;
+                    removed += 1;
+                }
+            }
+        }
+        Ok((removed, bytes))
+    }
+
+    /// Clear all entries and objects.
+    pub fn clear(&self) -> std::io::Result<()> {
+        let guard = self.index_lock.lock().unwrap_or_else(|e| e.into_inner());
+        guard.lock()?;
+        let result = (|| {
+            self.index
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
+            if self.objects.exists() {
+                std::fs::remove_dir_all(&self.objects)?;
+                std::fs::create_dir_all(&self.objects)?;
+            }
+            std::fs::File::create(self.log_path())?;
+            Ok(())
+        })();
+        let _ = guard.unlock();
+        result
+    }
+
+    /// All cached task IDs.
+    pub fn ids(&self) -> Vec<TaskId> {
+        self.index
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .copied()
+            .collect()
+    }
+}
+
+/// Lowercase hex of a 32-byte blob hash (64 chars).
+fn to_hex64(hash: &[u8; 32]) -> String {
+    hash.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Parse a 64-char hex blob hash.
+fn parse_blob_hash(hex: &str) -> Option<[u8; 32]> {
+    if hex.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, pair) in hex.as_bytes().as_chunks::<2>().0.iter().enumerate() {
+        out[i] = u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?;
+    }
+    Some(out)
+}
+
+/// The disk tier — JSON-per-key (legacy) or content-addressed (default).
+///
+/// `CasBackend` is the default for new engines; `DiskBackend` stays
+/// available for migration and comparison.
+pub enum DiskTier {
+    /// Legacy per-task JSON files (`tasks/<id>.json`).
+    Json(DiskBackend),
+    /// Content-addressed store (`cas/`).
+    Cas(CasBackend),
+}
+
+impl DiskTier {
+    /// Store a task output.
+    pub fn store(&self, output: &StoredOutput) -> std::io::Result<()> {
+        match self {
+            DiskTier::Json(d) => d.store(output),
+            DiskTier::Cas(d) => d.store(output),
+        }
+    }
+
+    /// Load a task output.
+    pub fn get(&self, id: &TaskId) -> std::io::Result<Option<StoredOutput>> {
+        match self {
+            DiskTier::Json(d) => d.get(id),
+            DiskTier::Cas(d) => d.get(id),
+        }
+    }
+
+    /// Existence check without a full read.
+    pub fn contains(&self, id: &TaskId) -> bool {
+        match self {
+            DiskTier::Json(d) => d.contains(id),
+            DiskTier::Cas(d) => d.contains(id),
+        }
+    }
+
+    /// Remove an entry.
+    pub fn remove(&self, id: &TaskId) -> std::io::Result<()> {
+        match self {
+            DiskTier::Json(d) => d.remove(id),
+            DiskTier::Cas(d) => d.remove(id),
+        }
+    }
+
+    /// Clear all entries.
+    pub fn clear(&self) -> std::io::Result<()> {
+        match self {
+            DiskTier::Json(d) => d.clear(),
+            DiskTier::Cas(d) => d.clear(),
+        }
+    }
+}
+
 /// Three-tier task output storage: memory → disk → remote.
 ///
 /// Lookup order:
@@ -410,7 +810,7 @@ impl DiskBackend {
 pub struct TaskBackend {
     /// The in-memory tier, always present.
     pub memory: MemoryBackend,
-    disk: Option<DiskBackend>,
+    disk: Option<DiskTier>,
     remote: Option<pledgepack_cache::remote::RemoteCache>,
 }
 
@@ -424,9 +824,21 @@ impl TaskBackend {
         }
     }
 
-    /// Enable the disk tier.
+    /// Enable the legacy JSON disk tier.
     pub fn with_disk(mut self, disk: DiskBackend) -> Self {
-        self.disk = Some(disk);
+        self.disk = Some(DiskTier::Json(disk));
+        self
+    }
+
+    /// Enable the content-addressed disk tier (the default for new engines).
+    pub fn with_cas(mut self, cas: CasBackend) -> Self {
+        self.disk = Some(DiskTier::Cas(cas));
+        self
+    }
+
+    /// Enable a pre-built disk tier.
+    pub fn with_disk_tier(mut self, tier: DiskTier) -> Self {
+        self.disk = Some(tier);
         self
     }
 
@@ -470,8 +882,8 @@ impl TaskBackend {
         self.memory.store(output);
     }
 
-    /// Get the disk backend (if configured).
-    pub fn disk(&self) -> Option<&DiskBackend> {
+    /// Get the disk tier (if configured).
+    pub fn disk(&self) -> Option<&DiskTier> {
         self.disk.as_ref()
     }
 
@@ -661,6 +1073,130 @@ impl TaskBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tmpdir() -> tempfile::TempDir {
+        tempfile::tempdir().unwrap()
+    }
+
+    #[test]
+    fn cas_backend_store_and_get() {
+        let tmp = tmpdir();
+        let cas = CasBackend::new(tmp.path().to_path_buf()).unwrap();
+        let id = TaskId::compute("test", b"cas_input");
+        let output = StoredOutput::new(id, &"hello cas".to_string(), vec![]).unwrap();
+
+        assert!(!cas.contains(&id));
+        cas.store(&output).unwrap();
+        assert!(cas.contains(&id));
+
+        let got = cas.get(&id).unwrap().unwrap();
+        assert_eq!(got.deserialize::<String>().unwrap(), "hello cas");
+    }
+
+    #[test]
+    fn cas_backend_repeated_store_is_idempotent() {
+        let tmp = tmpdir();
+        let cas = CasBackend::new(tmp.path().to_path_buf()).unwrap();
+        let a = TaskId::compute("test", b"task_a");
+        let b = TaskId::compute("test", b"task_b");
+        let out_a = StoredOutput::new(a, &42u32, vec![]).unwrap();
+        let out_b = StoredOutput::new(b, &42u32, vec![]).unwrap();
+
+        let count_objects = |dir: &std::path::Path| -> usize {
+            std::fs::read_dir(dir.join("cas/objects"))
+                .unwrap()
+                .map(|sub| std::fs::read_dir(sub.unwrap().path()).unwrap().count())
+                .sum()
+        };
+
+        // Storing the same content twice still yields one blob — the
+        // content-address makes re-stores no-ops.
+        cas.store(&out_a).unwrap();
+        cas.store(&out_a).unwrap();
+        assert_eq!(count_objects(tmp.path()), 1);
+
+        // A different StoredOutput (task_id is embedded in the blob) is a
+        // second object.
+        cas.store(&out_b).unwrap();
+        assert_eq!(count_objects(tmp.path()), 2);
+        assert_eq!(cas.get(&a).unwrap().unwrap().task_id, a);
+        assert_eq!(cas.get(&b).unwrap().unwrap().task_id, b);
+    }
+
+    #[test]
+    fn cas_backend_persists_across_instances() {
+        let tmp = tmpdir();
+        let id = TaskId::compute("test", b"persistent");
+        {
+            let cas = CasBackend::new(tmp.path().to_path_buf()).unwrap();
+            cas.store(&StoredOutput::new(id, &"value".to_string(), vec![]).unwrap())
+                .unwrap();
+        }
+        // Reopen — the index log replays.
+        let cas = CasBackend::new(tmp.path().to_path_buf()).unwrap();
+        assert!(cas.contains(&id));
+        assert_eq!(
+            cas.get(&id)
+                .unwrap()
+                .unwrap()
+                .deserialize::<String>()
+                .unwrap(),
+            "value"
+        );
+    }
+
+    #[test]
+    fn cas_backend_tombstone_survives_reopen() {
+        let tmp = tmpdir();
+        let id = TaskId::compute("test", b"tombstone");
+        {
+            let cas = CasBackend::new(tmp.path().to_path_buf()).unwrap();
+            cas.store(&StoredOutput::new(id, &1u32, vec![]).unwrap())
+                .unwrap();
+            cas.remove(&id).unwrap();
+        }
+        let cas = CasBackend::new(tmp.path().to_path_buf()).unwrap();
+        assert!(!cas.contains(&id));
+        assert!(cas.get(&id).unwrap().is_none());
+    }
+
+    #[test]
+    fn cas_backend_gc_removes_unreferenced_blobs() {
+        let tmp = tmpdir();
+        let keep = TaskId::compute("test", b"keep");
+        let drop_id = TaskId::compute("test", b"drop");
+        let cas = CasBackend::new(tmp.path().to_path_buf()).unwrap();
+        cas.store(&StoredOutput::new(keep, &1u32, vec![]).unwrap())
+            .unwrap();
+        cas.store(&StoredOutput::new(drop_id, &2u32, vec![]).unwrap())
+            .unwrap();
+        cas.remove(&drop_id).unwrap();
+
+        let (removed, _bytes) = cas.gc().unwrap();
+        assert_eq!(removed, 1);
+        assert!(cas.contains(&keep));
+        assert!(cas.get(&keep).unwrap().is_some());
+    }
+
+    #[test]
+    fn cas_backend_corrupted_blob_is_a_miss() {
+        let tmp = tmpdir();
+        let id = TaskId::compute("test", b"corrupt");
+        let cas = CasBackend::new(tmp.path().to_path_buf()).unwrap();
+        cas.store(&StoredOutput::new(id, &"data".to_string(), vec![]).unwrap())
+            .unwrap();
+
+        // Corrupt every stored blob.
+        for sub in std::fs::read_dir(tmp.path().join("cas/objects")).unwrap() {
+            for entry in std::fs::read_dir(sub.unwrap().path()).unwrap() {
+                let entry = entry.unwrap();
+                std::fs::write(entry.path(), b"garbage").unwrap();
+            }
+        }
+
+        assert!(cas.get(&id).unwrap().is_none());
+        assert!(!cas.contains(&id));
+    }
 
     #[test]
     fn memory_backend_store_and_get() {
@@ -886,5 +1422,91 @@ mod lru_tests {
 
         let evicted = backend.evict_to_max(10);
         assert_eq!(evicted, 0, "Should not evict when under limit");
+    }
+}
+
+#[cfg(test)]
+mod cas_concurrency_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn out(i: u32) -> StoredOutput {
+        StoredOutput::new(TaskId::compute("t", &i.to_le_bytes()), &i, vec![]).unwrap()
+    }
+
+    /// `compact_index` used to snapshot the index and then swap the log under a
+    /// different lock than appenders used, silently dropping lines appended in
+    /// between. Hammer stores against repeated compactions and reopen from disk.
+    #[test]
+    fn compact_index_does_not_lose_concurrent_appends() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cas = Arc::new(CasBackend::new(tmp.path().to_path_buf()).unwrap());
+        let writers: Vec<_> = (0..4u32)
+            .map(|w| {
+                let cas = cas.clone();
+                std::thread::spawn(move || {
+                    for i in 0..60u32 {
+                        cas.store(&out(w * 1000 + i)).unwrap();
+                    }
+                })
+            })
+            .collect();
+        let compactor = {
+            let cas = cas.clone();
+            std::thread::spawn(move || {
+                for _ in 0..25 {
+                    cas.compact_index().unwrap();
+                }
+            })
+        };
+        for w in writers {
+            w.join().unwrap();
+        }
+        compactor.join().unwrap();
+        cas.compact_index().unwrap();
+        assert_eq!(cas.ids().len(), 240);
+
+        // A fresh open replays the on-disk log: nothing was lost there either.
+        let reopened = CasBackend::new(tmp.path().to_path_buf()).unwrap();
+        assert_eq!(reopened.ids().len(), 240);
+        for w in 0..4u32 {
+            for i in 0..60u32 {
+                let id = TaskId::compute("t", &(w * 1000 + i).to_le_bytes());
+                assert!(reopened.get(&id).unwrap().is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn concurrent_stores_of_same_content_share_no_temp_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cas = Arc::new(CasBackend::new(tmp.path().to_path_buf()).unwrap());
+        let hs: Vec<_> = (0..8)
+            .map(|_| {
+                let cas = cas.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..40 {
+                        cas.store(&out(7)).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in hs {
+            h.join().unwrap();
+        }
+        assert!(cas.get(&out(7).task_id).unwrap().is_some());
+        fn stray_tmp(dir: &std::path::Path) -> usize {
+            let mut n = 0;
+            for e in std::fs::read_dir(dir).unwrap() {
+                let p = e.unwrap().path();
+                if p.is_dir() {
+                    n += stray_tmp(&p);
+                } else if p.extension().is_some_and(|x| x == "tmp") {
+                    n += 1;
+                }
+            }
+            n
+        }
+        assert_eq!(stray_tmp(tmp.path()), 0);
     }
 }

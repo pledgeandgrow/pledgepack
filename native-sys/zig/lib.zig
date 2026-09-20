@@ -73,6 +73,139 @@ export fn pledge_graph_get_dependencies(
     return count;
 }
 
+// ─── Task graph operations ───
+// Content-addressed task dependency graph (16-byte blake3 TaskIds).
+// TaskIds cross the ABI as *const [16]u8 / [*][16]u8 — plain byte arrays,
+// no shared ownership.
+
+export fn pledge_task_graph_create() callconv(.c) *graph.TaskGraph {
+    return graph.createTaskGraph() catch @panic("failed to allocate task graph");
+}
+
+export fn pledge_task_graph_destroy(g: *graph.TaskGraph) callconv(.c) void {
+    graph.destroyTaskGraph(g);
+}
+
+export fn pledge_task_graph_add_task(
+    g: *graph.TaskGraph,
+    id_ptr: *const [16]u8,
+) callconv(.c) void {
+    _ = g.addTask(id_ptr.*) catch @panic("failed to add task");
+}
+
+// Adds both endpoint tasks if absent, then the edge parent→child.
+export fn pledge_task_graph_add_edge(
+    g: *graph.TaskGraph,
+    parent_ptr: *const [16]u8,
+    child_ptr: *const [16]u8,
+) callconv(.c) void {
+    _ = g.addTask(parent_ptr.*) catch @panic("failed to add task");
+    _ = g.addTask(child_ptr.*) catch @panic("failed to add task");
+    g.addDependency(parent_ptr.*, child_ptr.*) catch |e| switch (e) {
+        // Per-task edge counts are packed into 15/14-bit fields. Exceeding
+        // them used to wrap silently and corrupt the graph; now it stops hard
+        // with an explicit message. Prefer pledge_task_graph_try_add_edge,
+        // which reports the condition to the caller instead of aborting.
+        error.TooManyDependencies => @panic("task graph: a task has more than 32767 dependencies"),
+        error.TooManyDependents => @panic("task graph: a task has more than 16383 dependents"),
+        else => @panic("failed to add edge"),
+    };
+}
+
+// Non-aborting variant of pledge_task_graph_add_edge.
+// Returns 0 on success, -1 on allocation failure, -2 if `parent` already has
+// the maximum number of dependencies, -3 if `child` already has the maximum
+// number of dependents. A rejected edge leaves the graph unchanged.
+export fn pledge_task_graph_try_add_edge(
+    g: *graph.TaskGraph,
+    parent_ptr: *const [16]u8,
+    child_ptr: *const [16]u8,
+) callconv(.c) c_int {
+    _ = g.addTask(parent_ptr.*) catch return -1;
+    _ = g.addTask(child_ptr.*) catch return -1;
+    g.addDependency(parent_ptr.*, child_ptr.*) catch |e| switch (e) {
+        error.TooManyDependencies => return -2,
+        error.TooManyDependents => return -3,
+        else => return -1,
+    };
+    return 0;
+}
+
+export fn pledge_task_graph_get_dependents(
+    g: *graph.TaskGraph,
+    id_ptr: *const [16]u8,
+    out_ids: [*][16]u8,
+    out_capacity: usize,
+) callconv(.c) usize {
+    return g.getDependents(id_ptr.*, out_ids[0..out_capacity]);
+}
+
+export fn pledge_task_graph_get_dependencies(
+    g: *graph.TaskGraph,
+    id_ptr: *const [16]u8,
+    out_ids: [*][16]u8,
+    out_capacity: usize,
+) callconv(.c) usize {
+    return g.getDependencies(id_ptr.*, out_ids[0..out_capacity]);
+}
+
+export fn pledge_task_graph_set_status(
+    g: *graph.TaskGraph,
+    id_ptr: *const [16]u8,
+    status: u8,
+) callconv(.c) void {
+    const idx = g.getIndex(id_ptr.*) orelse return;
+    const s: graph.TaskStatus = @enumFromInt(@min(status, 5));
+    g.setStatus(idx, s);
+}
+
+export fn pledge_task_graph_get_status(
+    g: *graph.TaskGraph,
+    id_ptr: *const [16]u8,
+) callconv(.c) u8 {
+    const idx = g.getIndex(id_ptr.*) orelse return @intFromEnum(graph.TaskStatus.pending);
+    return @intFromEnum(g.getStatus(idx));
+}
+
+export fn pledge_task_graph_count(g: *graph.TaskGraph) callconv(.c) usize {
+    return g.taskCount();
+}
+
+// Marks the task and all transitive dependents dirty in one pass.
+// Returns the number of dirtied ids written (retry with a bigger buffer
+// if it equals out_capacity — dirtying is idempotent).
+export fn pledge_task_graph_mark_dirty(
+    g: *graph.TaskGraph,
+    id_ptr: *const [16]u8,
+    out_ids: [*][16]u8,
+    out_capacity: usize,
+) callconv(.c) usize {
+    return g.markDirty(id_ptr.*, out_ids[0..out_capacity]);
+}
+
+// Flat status scan — dirty_tasks/clean_tasks in one pass over the nodes.
+export fn pledge_task_graph_ids_by_status(
+    g: *graph.TaskGraph,
+    status: u8,
+    out_ids: [*][16]u8,
+    out_capacity: usize,
+) callconv(.c) usize {
+    const s: graph.TaskStatus = @enumFromInt(@min(status, 5));
+    return g.idsByStatus(s, out_ids[0..out_capacity]);
+}
+
+export fn pledge_task_graph_all_ids(
+    g: *graph.TaskGraph,
+    out_ids: [*][16]u8,
+    out_capacity: usize,
+) callconv(.c) usize {
+    return g.allIds(out_ids[0..out_capacity]);
+}
+
+export fn pledge_task_graph_clear(g: *graph.TaskGraph) callconv(.c) void {
+    g.clear();
+}
+
 // I/O operations
 export fn pledge_io_read_file(
     path_ptr: [*]const u8,
@@ -91,7 +224,7 @@ export fn pledge_io_read_files_batch(
     out_bufs: [*][*]u8,
     out_lens: [*]usize,
 ) callconv(.c) c_int {
-    return io.readFilesBatch(
+    return io.readFilesOptimized(
         paths_ptr,
         paths_len_ptr,
         count,
@@ -100,8 +233,12 @@ export fn pledge_io_read_files_batch(
     );
 }
 
-export fn pledge_io_free(buf: [*]u8, len: usize) callconv(.c) void {
-    io.freeBuffer(buf[0..len]);
+// Releases a buffer returned by pledge_io_read_file / pledge_io_read_files_batch.
+// `len` is accepted for ABI stability but ignored: the allocation size is
+// recorded in the buffer's own header. Null is a no-op.
+export fn pledge_io_free(buf: ?[*]u8, len: usize) callconv(.c) void {
+    _ = len;
+    if (buf) |b| io.freeBufferPtr(b);
 }
 
 // SIMD scanning
@@ -113,6 +250,18 @@ export fn pledge_simd_find_imports(
 ) callconv(.c) usize {
     const source = source_ptr[0..source_len];
     return simd.findImports(source, out_offsets[0..out_capacity]);
+}
+
+// One-pass module summary: offsets + classified counts + flags + hash.
+export fn pledge_simd_summarize_module(
+    source_ptr: [*]const u8,
+    source_len: usize,
+    out_summary: *simd.ModuleSummary,
+    out_offsets: [*]usize,
+    out_capacity: usize,
+) callconv(.c) usize {
+    const source = source_ptr[0..source_len];
+    return simd.summarizeModule(source, out_summary, out_offsets[0..out_capacity]);
 }
 
 test "library loads" {

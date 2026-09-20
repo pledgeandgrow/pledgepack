@@ -233,18 +233,13 @@ impl AstPool {
 
         // If already in pool, take it
         if let Some((allocator, program)) = self.take(handle) {
-            return Ok(PreParsedAst {
-                allocator,
-                program,
-            });
+            return Ok(PreParsedAst { allocator, program });
         }
 
         // Parse fresh (not stored in pool)
         let allocator = Box::new(Allocator::default());
         let ParserReturn {
-            program,
-            panicked,
-            ..
+            program, panicked, ..
         } = Parser::new(&allocator, source, source_type).parse();
 
         if panicked {
@@ -269,9 +264,7 @@ impl AstPool {
     ) -> Result<(), String> {
         let allocator = Box::new(Allocator::default());
         let ParserReturn {
-            program,
-            panicked,
-            ..
+            program, panicked, ..
         } = Parser::new(&allocator, source, source_type).parse();
 
         if panicked {
@@ -284,11 +277,12 @@ impl AstPool {
         let program_static: Program<'static> = unsafe { std::mem::transmute(program) };
 
         // Evict if at capacity
-        if self.max_entries > 0 && self.entries.len() >= self.max_entries {
-            if let Some(&oldest) = self.insertion_order.first() {
-                self.entries.remove(&oldest);
-                self.insertion_order.remove(0);
-            }
+        if self.max_entries > 0
+            && self.entries.len() >= self.max_entries
+            && let Some(&oldest) = self.insertion_order.first()
+        {
+            self.entries.remove(&oldest);
+            self.insertion_order.remove(0);
         }
 
         self.entries.insert(
@@ -357,9 +351,7 @@ impl AstPool {
 
         // Destructure the Box<AstEntry>
         let AstEntry {
-            allocator,
-            program,
-            ..
+            allocator, program, ..
         } = *entry;
 
         Some((allocator, program))
@@ -444,19 +436,27 @@ pub trait PluginAstSource {
     ///
     /// If the source is already in the pool, the AST is serialized from the
     /// cached parse. If not, it is parsed on demand.
-    fn get_plugin_ast(&mut self, source: &str, file_path: &str, kind: &str) -> Result<PluginAst, String>;
+    fn get_plugin_ast(
+        &mut self,
+        source: &str,
+        file_path: &str,
+        kind: &str,
+    ) -> Result<PluginAst, String>;
 }
 
 impl PluginAstSource for AstPool {
-    fn get_plugin_ast(&mut self, source: &str, file_path: &str, kind: &str) -> Result<PluginAst, String> {
+    fn get_plugin_ast(
+        &mut self,
+        source: &str,
+        file_path: &str,
+        kind: &str,
+    ) -> Result<PluginAst, String> {
         let path = std::path::Path::new(file_path);
-        let source_type = oxc::span::SourceType::from_path(path).unwrap_or_else(|_| {
-            match kind {
-                "tsx" => oxc::span::SourceType::tsx(),
-                "ts" | "typescript" => oxc::span::SourceType::ts(),
-                "jsx" => oxc::span::SourceType::jsx(),
-                _ => oxc::span::SourceType::mjs(),
-            }
+        let source_type = oxc::span::SourceType::from_path(path).unwrap_or_else(|_| match kind {
+            "tsx" => oxc::span::SourceType::tsx(),
+            "ts" | "typescript" => oxc::span::SourceType::ts(),
+            "jsx" => oxc::span::SourceType::jsx(),
+            _ => oxc::span::SourceType::mjs(),
         });
 
         let handle = self.get_or_parse(source, source_type)?;
@@ -464,9 +464,11 @@ impl PluginAstSource for AstPool {
         // Serialize the AST to ESTree-compatible JSON via the hand-written
         // Oxc → ESTree converter. This gives WASM and JS plugins full AST
         // access (the format Babel, ESLint, and most JS tooling expect).
-        let ast_json = self.with_program(handle, |program| {
-            crate::estree::program_to_estree(program).to_string()
-        }).ok_or("Failed to access AST for serialization")?;
+        let ast_json = self
+            .with_program(handle, |program| {
+                crate::estree::program_to_estree(program).to_string()
+            })
+            .ok_or("Failed to access AST for serialization")?;
 
         Ok(PluginAst {
             source: source.to_string(),
@@ -536,12 +538,18 @@ mod tests {
     fn ast_pool_eviction() {
         let mut pool = AstPool::with_capacity(2);
 
-        let h1 = pool.get_or_parse("const a = 1;", SourceType::mjs()).unwrap();
-        let h2 = pool.get_or_parse("const b = 2;", SourceType::mjs()).unwrap();
+        let h1 = pool
+            .get_or_parse("const a = 1;", SourceType::mjs())
+            .unwrap();
+        let h2 = pool
+            .get_or_parse("const b = 2;", SourceType::mjs())
+            .unwrap();
         assert_eq!(pool.len(), 2);
 
         // Adding a third should evict the oldest (h1)
-        let h3 = pool.get_or_parse("const c = 3;", SourceType::mjs()).unwrap();
+        let h3 = pool
+            .get_or_parse("const c = 3;", SourceType::mjs())
+            .unwrap();
         assert_eq!(pool.len(), 2);
         assert!(!pool.contains(h1));
         assert!(pool.contains(h2));
@@ -551,8 +559,10 @@ mod tests {
     #[test]
     fn ast_pool_clear() {
         let mut pool = AstPool::new();
-        pool.get_or_parse("const x = 1;", SourceType::mjs()).unwrap();
-        pool.get_or_parse("const y = 2;", SourceType::mjs()).unwrap();
+        pool.get_or_parse("const x = 1;", SourceType::mjs())
+            .unwrap();
+        pool.get_or_parse("const y = 2;", SourceType::mjs())
+            .unwrap();
         assert_eq!(pool.len(), 2);
 
         pool.clear();
@@ -581,17 +591,17 @@ mod tests {
         let handle = pool.get_or_parse(source, SourceType::mjs()).unwrap();
 
         // Consumer 1: dynamic import detection (read-only)
-        let imports = pool.with_program(handle, |prog| {
-            crate::transform::detect_dynamic_imports_from_program(prog)
-        }).unwrap();
+        let imports = pool
+            .with_program(handle, |prog| {
+                crate::transform::detect_dynamic_imports_from_program(prog)
+            })
+            .unwrap();
         assert_eq!(imports, vec!["./dynamic".to_string()]);
 
-        // Consumer 2: i18n key extraction (read-only)
-        let i18n = pool.with_program(handle, |prog| {
-            crate::i18n::extract_i18n_keys_from_program(prog, source, "test.tsx")
-        });
-        assert!(i18n.is_some());
-        let i18n = i18n.unwrap();
+        // Consumer 2: i18n key extraction — the public API is source-based
+        // (`extract_i18n_keys` parses internally); no program-based variant
+        // exists yet, so this consumer doesn't read the pooled AST.
+        let i18n = crate::i18n::extract_i18n_keys(source, "test.tsx");
         assert_eq!(i18n.keys.len(), 1);
         assert_eq!(i18n.keys[0].key, "hello");
 
@@ -612,15 +622,16 @@ mod tests {
             "export default function() {}",
             "import x from 'y';",
         ];
-        let handles: Vec<AstHandle> = sources
-            .iter()
-            .map(|s| AstHandle::from_source(s))
-            .collect();
+        let handles: Vec<AstHandle> = sources.iter().map(|s| AstHandle::from_source(s)).collect();
 
         // All handles should be unique
         for i in 0..handles.len() {
             for j in (i + 1)..handles.len() {
-                assert_ne!(handles[i], handles[j], "Collision between sources {} and {}", i, j);
+                assert_ne!(
+                    handles[i], handles[j],
+                    "Collision between sources {} and {}",
+                    i, j
+                );
             }
         }
     }
@@ -639,11 +650,17 @@ mod tests {
         assert_eq!(ast.kind, "tsx");
         assert_eq!(ast.file_path, "test.tsx");
 
-        // The summary should contain the dynamic import
+        // The ESTree JSON contains the full program — the dynamic import
+        // appears as an ImportExpression node carrying the "./dynamic"
+        // source literal.
         let parsed: serde_json::Value = serde_json::from_str(&ast.ast_json).unwrap();
         assert_eq!(parsed["type"], "Program");
-        let dynamic_imports = parsed["dynamicImports"].as_array().unwrap();
-        assert!(dynamic_imports.contains(&serde_json::Value::String("./dynamic".to_string())));
+        assert!(parsed["body"].as_array().is_some_and(|b| !b.is_empty()));
+        assert!(
+            ast.ast_json.contains("ImportExpression") && ast.ast_json.contains("./dynamic"),
+            "ESTree JSON should contain the dynamic import: {}",
+            &ast.ast_json[..ast.ast_json.len().min(500)]
+        );
     }
 
     #[test]

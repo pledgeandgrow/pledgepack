@@ -39,7 +39,7 @@ pub enum ModuleKind {
 
 impl ModuleKind {
     pub fn from_extension(ext: &str) -> Self {
-        match ext {
+        match ext.to_ascii_lowercase().as_str() {
             ".tsx" => Self::Tsx,
             ".ts" => Self::TypeScript,
             ".jsx" => Self::Jsx,
@@ -66,6 +66,27 @@ impl ModuleKind {
             | ".ttf" | ".otf" | ".eot" | ".mp4" | ".webm" | ".mp3" | ".wav" | ".pdf" => Self::Asset,
             _ => Self::Unknown,
         }
+    }
+
+    /// Classify a file by its full name. Unlike [`from_extension`](Self::from_extension)
+    /// (which only ever sees the last extension, so the compound `.worker.js` /
+    /// `.worker.ts` arms can never match there), this recognises
+    /// `*.worker.js` / `*.worker.ts` files as [`ModuleKind::Worker`].
+    pub fn from_path(path: &std::path::Path) -> Self {
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if name.ends_with(".worker.js") || name.ends_with(".worker.ts") {
+            return Self::Worker;
+        }
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| format!(".{e}"))
+            .unwrap_or_default();
+        Self::from_extension(&ext)
     }
 
     pub fn is_typescript(&self) -> bool {
@@ -101,5 +122,40 @@ impl ResolvedModule {
             .and_then(|e| e.to_str())
             .map(|e| format!(".{}", e))
             .unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_path_recognises_worker_files() {
+        use std::path::Path;
+        assert_eq!(
+            ModuleKind::from_path(Path::new("src/a.worker.ts")),
+            ModuleKind::Worker
+        );
+        assert_eq!(
+            ModuleKind::from_path(Path::new("src/A.Worker.JS")),
+            ModuleKind::Worker
+        );
+        assert_eq!(
+            ModuleKind::from_path(Path::new("src/a.ts")),
+            ModuleKind::TypeScript
+        );
+        assert_eq!(
+            ModuleKind::from_path(Path::new("src/workerish.js")),
+            ModuleKind::JavaScript
+        );
+        // The old extension-only lookup can never see a compound extension.
+        assert_eq!(ModuleKind::from_extension(".ts"), ModuleKind::TypeScript);
+    }
+
+    #[test]
+    fn from_extension_is_case_insensitive() {
+        assert_eq!(ModuleKind::from_extension(".PNG"), ModuleKind::Asset);
+        assert_eq!(ModuleKind::from_extension(".TSX"), ModuleKind::Tsx);
+        assert_eq!(ModuleKind::from_extension(".Css"), ModuleKind::Css);
     }
 }

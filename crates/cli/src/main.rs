@@ -86,6 +86,61 @@ fn framework_deps(template: &str) -> serde_json::Value {
     }
 }
 
+/// The `tsconfig.json` shipped with every scaffolded template. All templates
+/// use a TypeScript entry (`src/index.tsx`), so all of them get one; only the
+/// JSX settings differ per framework.
+fn template_tsconfig(template: &str) -> serde_json::Value {
+    let mut opts = serde_json::json!({
+        "target": "ES2022",
+        "useDefineForClassFields": true,
+        "lib": ["ES2022", "DOM", "DOM.Iterable"],
+        "module": "ESNext",
+        "moduleResolution": "bundler",
+        "strict": true,
+        "noEmit": true,
+        "isolatedModules": true,
+        "esModuleInterop": true,
+        "resolveJsonModule": true,
+        "skipLibCheck": true
+    });
+    let map = opts.as_object_mut().expect("object literal");
+    match template {
+        "solid" => {
+            map.insert("jsx".into(), "preserve".into());
+            map.insert("jsxImportSource".into(), "solid-js".into());
+        }
+        "vue" => {
+            map.insert("jsx".into(), "preserve".into());
+            map.insert("jsxImportSource".into(), "vue".into());
+        }
+        "svelte" | "vanilla" => {
+            map.insert("jsx".into(), "preserve".into());
+        }
+        // pledge / react / next / tanstack (React runtime) and anything unknown.
+        _ => {
+            map.insert("jsx".into(), "react-jsx".into());
+        }
+    }
+    serde_json::json!({
+        "compilerOptions": opts,
+        "include": ["src", "app", "pledge-env.d.ts"]
+    })
+}
+
+/// Write `tsconfig.json` into a freshly scaffolded project unless one exists
+/// (e.g. copied from a template cache that predates it).
+fn ensure_tsconfig(project_dir: &std::path::Path, template: &str) -> Result<()> {
+    let path = project_dir.join("tsconfig.json");
+    if !path.exists() {
+        std::fs::write(
+            path,
+            serde_json::to_string_pretty(&template_tsconfig(template))? + "
+",
+        )?;
+    }
+    Ok(())
+}
+
 /// Build the CSS framework devDependencies JSON object for a given CSS choice.
 fn css_framework_dev_deps(css: &str) -> serde_json::Value {
     match css {
@@ -197,6 +252,14 @@ enum Commands {
         /// Port to serve on
         #[arg(short, long)]
         port: Option<u16>,
+
+        /// Host to bind to
+        #[arg(long)]
+        host: Option<String>,
+
+        /// Output directory to serve (overrides config.out_dir)
+        #[arg(long)]
+        out_dir: Option<PathBuf>,
     },
 
     /// Serve a production build (alias for preview)
@@ -204,6 +267,14 @@ enum Commands {
         /// Port to serve on
         #[arg(short, long)]
         port: Option<u16>,
+
+        /// Host to bind to
+        #[arg(long)]
+        host: Option<String>,
+
+        /// Output directory to serve (overrides config.out_dir)
+        #[arg(long)]
+        out_dir: Option<PathBuf>,
     },
 
     /// Scaffold a new project (defaults to PledgeStack if no template given)
@@ -405,6 +476,30 @@ enum PluginAction {
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
+
+    /// Sign a plugin file — writes a `<file>.sig.json` trust sidecar that
+    /// plugin hosts verify at load time (see `plugin_security` config)
+    Sign {
+        /// Path to the plugin file to sign
+        file: PathBuf,
+
+        /// Signer identity (e.g. "@myorg" or "github:username")
+        #[arg(long)]
+        identity: String,
+
+        /// Ed25519 secret key (64 hex chars). Defaults to the
+        /// PLEDGEPACK_PLUGIN_SIGNING_KEY environment variable.
+        #[arg(long)]
+        secret_key: Option<String>,
+
+        /// Capability to declare in the sidecar (repeatable), e.g.
+        /// --capability fs:read --capability network
+        #[arg(long = "capability")]
+        capabilities: Vec<String>,
+    },
+
+    /// Generate a fresh Ed25519 keypair for plugin signing
+    Keygen,
 }
 
 #[derive(Subcommand)]
@@ -451,8 +546,7 @@ async fn main() -> Result<()> {
     } else {
         PledgeConfig::load(&root_path)?
     };
-    config.root = std::fs::canonicalize(&root_path).unwrap_or(root_path);
-    config.normalize();
+    anchor_config_to_root(&mut config, root_path);
 
     // Feature 94: Apply plugin presets
     if !config.presets.is_empty() {
@@ -475,7 +569,7 @@ async fn main() -> Result<()> {
         if ws_config.shared_cache {
             let shared_cache = pledgepack_core::ecosystem::resolve_shared_cache_dir(&ws, ws_config);
             config.cache.dir = shared_cache;
-            tracing::info!("Shared cache: {}", config.cache.dir.display());
+            tracing::info!("Shared cache: {}", pledgepack_core::display_path(&config.cache.dir));
         }
     }
 
@@ -535,7 +629,9 @@ async fn main() -> Result<()> {
             type_check,
         } => {
             if let Some(out) = out_dir {
-                config.out_dir = out.into_std_path_buf();
+                let out = out.into_std_path_buf();
+                // A `--out` given on the command line is relative to the cwd.
+                config.out_dir = std::path::absolute(&out).unwrap_or(out);
             }
             if no_sourcemap {
                 config.source_maps = false;
@@ -601,7 +697,7 @@ async fn main() -> Result<()> {
                         } else {
                             println!(
                                 "  \x1b[33m⚠\x1b[0m GraphQL schema not found: {}",
-                                schema_path.display()
+                                pledgepack_core::display_path(&schema_path)
                             );
                         }
                     } else {
@@ -631,6 +727,61 @@ async fn main() -> Result<()> {
                 );
             }
 
+            // Load JS plugins (signature/capability policy enforced) and run
+            // their `buildStart` hooks BEFORE the build so they can prepare
+            // state the build depends on.
+            let plugin_host = if !config.plugins.is_empty() {
+                let mut host = JsPluginHost::new();
+                let (verifier, auditor) = config.plugin_security.policy();
+                if let Some(v) = verifier {
+                    host = host.with_signing_verifier(v);
+                }
+                if let Some(a) = auditor {
+                    host = host.with_capability_auditor(a);
+                }
+                // Plugin paths are project-relative (like `entry`), not
+                // cwd-relative: with `--root` the two differ. A configured
+                // plugin that does not exist is an error — silently building
+                // without it would ship output the plugin was meant to shape.
+                let plugin_paths: Vec<String> = config
+                    .plugins
+                    .iter()
+                    .map(|p| {
+                        let path = std::path::Path::new(p);
+                        if path.is_absolute() {
+                            p.clone()
+                        } else {
+                            config.root.join(path).to_string_lossy().into_owned()
+                        }
+                    })
+                    .collect();
+                if let Some(missing) = plugin_paths
+                    .iter()
+                    .find(|p| !std::path::Path::new(p.as_str()).is_file())
+                {
+                    anyhow::bail!("Configured plugin not found: {missing}");
+                }
+                host.load_plugins(&plugin_paths).map_err(|e| {
+                    anyhow::anyhow!(
+                        "{e}\n  → To load unsigned plugins set `plugin_security.require_signed = false`, \
+                         or sign the plugin (`pledge plugin sign <path>`) and add the signer's \
+                         public key to `plugin_security.trusted_keys`."
+                    )
+                })?;
+                if host.plugins().len() != plugin_paths.len() {
+                    anyhow::bail!(
+                        "Only {} of {} configured plugins loaded (see the error above) — refusing to build without them",
+                        host.plugins().len(),
+                        plugin_paths.len()
+                    );
+                }
+                tracing::info!("Loaded {} JS plugins", host.plugins().len());
+                host.build_start()?;
+                Some(host)
+            } else {
+                None
+            };
+
             println!("\n  \x1b[36mpledge\x1b[0m building for production...\n");
 
             use indicatif::{ProgressBar, ProgressStyle};
@@ -646,7 +797,13 @@ async fn main() -> Result<()> {
 
             pb.set_message("Building modules");
             let mut engine = BuildEngine::new(Arc::new(config.clone()));
-            let result = engine.build().await?;
+            // Per-module plugin hooks (resolveId/load/transform during the
+            // build; renderChunk/transformIndexHtml at emit) are driven by the
+            // same host that runs the lifecycle hooks.
+            let plugin_hooks: Option<&dyn pledgepack_core::plugin_hooks::PluginHooks> = plugin_host
+                .as_ref()
+                .map(|h| h as &dyn pledgepack_core::plugin_hooks::PluginHooks);
+            let result = engine.build_with_hooks(plugin_hooks)?;
             pb.inc(1);
 
             // #71: Type checking during build
@@ -701,7 +858,7 @@ async fn main() -> Result<()> {
                     is_entry: c.chunk_type == pledgepack_optimizer::ChunkType::Entry,
                 })
                 .collect();
-            engine.emit_with_chunks(&emit_chunks)?;
+            engine.emit_with_chunks_hooks(&emit_chunks, plugin_hooks)?;
             let emit_ms = emit_start.elapsed().as_millis();
             pb.inc(1);
 
@@ -852,7 +1009,7 @@ async fn main() -> Result<()> {
                     let router_module = route_table.generate_router_module_build(&prefix);
                     let router_path = out_dir_full.join("__pledge_router.js");
                     std::fs::write(&router_path, &router_module)?;
-                    tracing::info!("  Generated router: {}", router_path.display());
+                    tracing::info!("  Generated router: {}", pledgepack_core::display_path(&router_path));
                 }
             }
 
@@ -865,12 +1022,11 @@ async fn main() -> Result<()> {
             pb.inc(1);
             pb.finish_and_clear();
 
-            // Load JS plugins if configured
-            if !config.plugins.is_empty() {
-                let mut plugin_host = JsPluginHost::new();
-                plugin_host.load_plugins(&config.plugins)?;
-                plugin_host.build_start();
-                tracing::info!("Loaded {} JS plugins", plugin_host.plugins().len());
+            // Plugin lifecycle: `generateBundle` sees the fully emitted output,
+            // then `buildEnd` closes the build (`buildStart` ran before it).
+            if let Some(ref host) = plugin_host {
+                host.generate_bundle()?;
+                host.build_end()?;
             }
 
             // Generate edge bundle if configured
@@ -1245,30 +1401,37 @@ async fn main() -> Result<()> {
             }
         }
 
-        Commands::Preview { port } => {
+        Commands::Preview {
+            port,
+            host,
+            out_dir,
+        } => {
             let port = port.unwrap_or(4000);
-            let out_dir = config.out_dir.clone();
+            let host = host.unwrap_or_else(|| "127.0.0.1".to_string());
+            let out_dir = out_dir.unwrap_or_else(|| config.out_dir.clone());
+            let out_dir = if out_dir.is_absolute() {
+                out_dir
+            } else {
+                config.root.join(out_dir)
+            };
 
             if !out_dir.exists() {
                 anyhow::bail!(
                     "Output directory '{}' not found. Run `pledge build` first.",
-                    out_dir.display()
+                    pledgepack_core::display_path(&out_dir)
                 );
             }
 
             println!(
-                "\n  \x1b[36mpledge preview\x1b[0m — serving {} on http://localhost:{}\n",
-                out_dir.display(),
+                "\n  \x1b[36mpledge preview\x1b[0m — serving {} on http://{}:{}\n",
+                pledgepack_core::display_path(&out_dir),
+                host,
                 port
             );
 
-            // SPA fallback: serve index.html for any route that doesn't match a static file
-            let index_path = out_dir.join("index.html");
-            let serve_dir = tower_http::services::ServeDir::new(&out_dir)
-                .fallback(tower_http::services::ServeFile::new(index_path));
-            let app = axum::Router::new().fallback_service(serve_dir);
+            let app = static_site_service(&out_dir);
 
-            let addr = format!("127.0.0.1:{}", port);
+            let addr = format!("{}:{}", host, port);
             let listener = tokio::net::TcpListener::bind(&addr).await?;
             axum::serve(listener, app).await?;
         }
@@ -2326,6 +2489,10 @@ export default defineConfig({
                 }
             }
 
+            // Ship a tsconfig.json (the doctor warns without one); also covers
+            // template caches created before tsconfig was part of the scaffold.
+            ensure_tsconfig(project_dir, &template)?;
+
             // #8: Pre-warmed module graph — scan source files on create
             let pledge_dir = project_dir.join(".pledge");
             let _ = std::fs::create_dir_all(&pledge_dir);
@@ -2776,7 +2943,10 @@ export default defineConfig({
             println!("  \x1b[1mCurrent configuration:\x1b[0m\n");
             println!("    Entry:          {:?}", config.entry);
             println!("    Framework:      {:?}", config.framework);
-            println!("    Out dir:        {:?}", config.out_dir);
+            println!(
+                "    Out dir:        {}",
+                pledgepack_core::display_path(&config.out_dir)
+            );
             println!(
                 "    Dev server:     {}:{}",
                 config.dev_server.host, config.dev_server.port
@@ -2798,13 +2968,13 @@ export default defineConfig({
                 }
             );
             println!(
-                "    Cache:          {} ({:?})",
+                "    Cache:          {} ({})",
                 if config.cache.enabled {
                     "enabled"
                 } else {
                     "disabled"
                 },
-                config.cache.dir
+                pledgepack_core::display_path(&config.cache.dir)
             );
             println!("    Env prefix:     {:?}", config.env_prefix);
             println!("    Plugins:        {} configured", config.plugins.len());
@@ -2814,9 +2984,19 @@ export default defineConfig({
             println!();
         }
 
-        Commands::Serve { port } => {
+        Commands::Serve {
+            port,
+            host,
+            out_dir,
+        } => {
             let port = port.unwrap_or(4000);
-            let out_dir = config.out_dir.clone();
+            let host = host.unwrap_or_else(|| "127.0.0.1".to_string());
+            let out_dir = out_dir.unwrap_or_else(|| config.out_dir.clone());
+            let out_dir = if out_dir.is_absolute() {
+                out_dir
+            } else {
+                config.root.join(out_dir)
+            };
 
             if !out_dir.exists() {
                 println!(
@@ -2826,18 +3006,15 @@ export default defineConfig({
             }
 
             println!(
-                "\n  \x1b[36mpledge serve\x1b[0m — serving {} on http://localhost:{}\n",
-                out_dir.display(),
+                "\n  \x1b[36mpledge serve\x1b[0m — serving {} on http://{}:{}\n",
+                pledgepack_core::display_path(&out_dir),
+                host,
                 port
             );
 
-            // SPA fallback: serve index.html for any route that doesn't match a static file
-            let index_path = out_dir.join("index.html");
-            let serve_dir = tower_http::services::ServeDir::new(&out_dir)
-                .fallback(tower_http::services::ServeFile::new(index_path));
-            let app = axum::Router::new().fallback_service(serve_dir);
+            let app = static_site_service(&out_dir);
 
-            let addr = format!("127.0.0.1:{}", port);
+            let addr = format!("{}:{}", host, port);
             let listener = tokio::net::TcpListener::bind(&addr).await?;
             axum::serve(listener, app).await?;
         }
@@ -2847,7 +3024,7 @@ export default defineConfig({
                 let cache_dir = config.cache.dir.clone();
                 if cache_dir.exists() {
                     std::fs::remove_dir_all(&cache_dir)?;
-                    println!("\n  \x1b[32m✓\x1b[0m Cache cleared: {:?}\n", cache_dir);
+                    println!("\n  \x1b[32m✓\x1b[0m Cache cleared: {}\n", pledgepack_core::display_path(&cache_dir));
                 } else {
                     println!("\n  \x1b[90mCache directory does not exist\x1b[0m\n");
                 }
@@ -2858,7 +3035,11 @@ export default defineConfig({
                     let entries = std::fs::read_dir(&cache_dir)?
                         .filter_map(|e| e.ok())
                         .count();
-                    println!("\n  Cache: {:?}\n  Entries: {}\n", cache_dir, entries);
+                    println!(
+                        "\n  Cache: {}\n  Entries: {}\n",
+                        pledgepack_core::display_path(&cache_dir),
+                        entries
+                    );
                 } else {
                     println!("\n  \x1b[90mNo cache directory\x1b[0m\n");
                 }
@@ -2959,12 +3140,8 @@ export default defineConfig({
         Commands::Analyze { port, graph } => {
             println!("\n  \x1b[36mpledge analyze\x1b[0m — analyzing bundle...\n");
 
-            config.mode = pledgepack_core::config::BuildMode::Production;
-
-            let mut engine = BuildEngine::new(Arc::new(config.clone()));
-            let _ = engine.build().await?;
-
-            let analysis = pledgepack_core::analyzer::analyze_build(&engine)?;
+            // Same build + analysis as `pledge why` (production, minified).
+            let (_engine, analysis) = pledgepack_core::analyzer::build_and_analyze(&config).await?;
             let html_output = if graph {
                 // Generate interactive dependency graph (#104)
                 let cycles = pledgepack_core::analyzer::detect_circular_deps(&analysis);
@@ -2986,9 +3163,8 @@ export default defineConfig({
             let port = port.unwrap_or(4200);
 
             println!(
-                "  \x1b[32m✓\x1b[0m {} modules, {:.1}KB total",
-                analysis.total_modules,
-                analysis.total_transformed_size as f64 / 1024.0
+                "  \x1b[32m✓\x1b[0m {}",
+                pledgepack_core::analyzer::format_size_summary(&analysis)
             );
             println!(
                 "\n  \x1b[90mAnalysis server: http://localhost:{}\x1b[0m\n",
@@ -3162,7 +3338,7 @@ export default defineConfig({
                             std::fs::write(&report_path, &html)?;
                             println!(
                                 "  \x1b[90mVisual report: {}\x1b[0m\n",
-                                report_path.display()
+                                pledgepack_core::display_path(&report_path)
                             );
 
                             if !update_baselines {
@@ -3294,7 +3470,7 @@ export default defineConfig({
 
                 println!(
                     "  \x1b[32m✓\x1b[0m Test report written to {}\n",
-                    report_path.display()
+                    pledgepack_core::display_path(&report_path)
                 );
 
                 // Serve the report on a local server
@@ -3441,7 +3617,7 @@ export default defineConfig({
 
             println!(
                 "\n  \x1b[36mpledge manpages\x1b[0m — generating man pages in {}\n",
-                out_dir.display()
+                pledgepack_core::display_path(&out_dir)
             );
 
             // Generate main man page
@@ -3450,7 +3626,7 @@ export default defineConfig({
             man.render(&mut buffer)?;
             let man_path = out_dir.join(format!("{}.1", bin_name));
             std::fs::write(&man_path, &buffer)?;
-            println!("  \x1b[32m✓\x1b[0m {}", man_path.display());
+            println!("  \x1b[32m✓\x1b[0m {}", pledgepack_core::display_path(&man_path));
 
             // Generate subcommand man pages
             for sub in cmd.get_subcommands() {
@@ -3460,7 +3636,7 @@ export default defineConfig({
                 if sub_man.render(&mut sub_buffer).is_ok() {
                     let sub_path = out_dir.join(format!("{}-{}.1", bin_name, name));
                     if std::fs::write(&sub_path, &sub_buffer).is_ok() {
-                        println!("  \x1b[32m✓\x1b[0m {}", sub_path.display());
+                        println!("  \x1b[32m✓\x1b[0m {}", pledgepack_core::display_path(&sub_path));
                     }
                 }
             }
@@ -3478,7 +3654,7 @@ export default defineConfig({
                 std::fs::write(&path, &pretty)?;
                 println!(
                     "  \x1b[32m✓\x1b[0m JSON Schema written to {}",
-                    path.display()
+                    pledgepack_core::display_path(&path)
                 );
             } else {
                 println!("{}", pretty);
@@ -3557,7 +3733,7 @@ export default defineConfig({
                     Ok(()) => {
                         println!(
                             "  \x1b[32m✓\x1b[0m Plugin scaffolded: {}\n",
-                            out_dir.display()
+                            pledgepack_core::display_path(&out_dir)
                         );
                         println!("  \x1b[90mcd {} && pledge dev\x1b[0m\n", name);
                     }
@@ -3572,7 +3748,7 @@ export default defineConfig({
                 let source = match std::fs::read_to_string(&file) {
                     Ok(s) => s,
                     Err(e) => {
-                        anyhow::bail!("Cannot read {}: {}", file.display(), e);
+                        anyhow::bail!("Cannot read {}: {}", pledgepack_core::display_path(&file), e);
                     }
                 };
 
@@ -3583,7 +3759,7 @@ export default defineConfig({
                             std::fs::write(&out_path, &markdown)?;
                             println!(
                                 "  \x1b[32m✓\x1b[0m Docs written to {}\n",
-                                out_path.display()
+                                pledgepack_core::display_path(&out_path)
                             );
                         } else {
                             println!("{}", markdown);
@@ -3594,6 +3770,51 @@ export default defineConfig({
                     }
                 }
             }
+            PluginAction::Sign {
+                file,
+                identity,
+                secret_key,
+                capabilities,
+            } => {
+                let key =
+                    secret_key.or_else(|| std::env::var("PLEDGEPACK_PLUGIN_SIGNING_KEY").ok());
+                let Some(key) = key else {
+                    anyhow::bail!(
+                        "No signing key — pass --secret-key or set PLEDGEPACK_PLUGIN_SIGNING_KEY \
+                         (generate one with `pledge plugin keygen`)"
+                    );
+                };
+                let caps: Vec<pledgepack_core::plugin_system::PluginCapability> = capabilities
+                    .iter()
+                    .map(|c| pledgepack_core::plugin_system::PluginCapability::parse(c))
+                    .collect();
+                match pledgepack_core::plugin_registry::sign_plugin(&file, &identity, &key, &caps) {
+                    Ok(sidecar) => {
+                        println!(
+                            "  \x1b[32m✓\x1b[0m Signed {} → {}",
+                            pledgepack_core::display_path(&file),
+                            pledgepack_core::display_path(&sidecar)
+                        );
+                        println!(
+                            "  \x1b[90m→\x1b[0m Consumers must add `\"{identity}\": \"<public-key>\"` \
+                             to plugin_security.trusted_keys for this plugin to load\n"
+                        );
+                    }
+                    Err(e) => {
+                        anyhow::bail!("Failed: {}", e);
+                    }
+                }
+            }
+            PluginAction::Keygen => {
+                let (secret, public) = pledgepack_core::plugin_registry::generate_signing_key();
+                println!("\n  \x1b[36mPlugin signing keypair\x1b[0m (keep the secret private)\n");
+                println!("  secret key:  {secret}");
+                println!("  public key:  {public}\n");
+                println!(
+                    "  \x1b[90m→\x1b[0m Sign with `pledge plugin sign <file> --identity <id>`"
+                );
+                println!("  \x1b[90m→\x1b[0m Consumers trust via plugin_security.trusted_keys\n");
+            }
         },
 
         Commands::Why { module } => {
@@ -3602,10 +3823,9 @@ export default defineConfig({
                 module
             );
 
-            let mut engine = BuildEngine::new(Arc::new(config.clone()));
-            let _ = engine.build().await?;
-
-            let analysis = pledgepack_core::analyzer::analyze_build(&engine)?;
+            // Same build + analysis as `pledge analyze` (production, minified),
+            // so both commands report identical sizes for the same project.
+            let (_engine, analysis) = pledgepack_core::analyzer::build_and_analyze(&config).await?;
             let chains = pledgepack_core::analyzer::find_import_chains(&analysis, &module);
 
             if chains.is_empty() {
@@ -3623,6 +3843,23 @@ export default defineConfig({
                     }
                     println!();
                 }
+                // Sizes of the matched module(s), labelled raw / minified / gzip.
+                let needle = module.to_lowercase();
+                for m in analysis
+                    .modules
+                    .iter()
+                    .filter(|m| m.path.to_lowercase().contains(&needle))
+                {
+                    println!(
+                        "  \x1b[90m{}\x1b[0m  {}",
+                        m.path,
+                        pledgepack_core::analyzer::format_module_sizes(m)
+                    );
+                }
+                println!(
+                    "\n  \x1b[90mBundle: {}\x1b[0m\n",
+                    pledgepack_core::analyzer::format_size_summary(&analysis)
+                );
             }
         }
 
@@ -3870,6 +4107,37 @@ fn collect_test_files_fallback(
     }
 
     Ok(())
+}
+
+/// Point `config` at `root_path` (canonicalised) and anchor its relative
+/// output / cache directories to it.
+///
+/// `--root` may differ from the working directory. The engine writes to
+/// `config.out_dir` / `config.cache.dir` as-is (cwd-relative), while the
+/// post-build steps join them onto the root — anchoring relative paths to the
+/// root once makes both agree.
+fn anchor_config_to_root(config: &mut PledgeConfig, root_path: std::path::PathBuf) {
+    config.root = std::fs::canonicalize(&root_path).unwrap_or(root_path);
+    config.normalize();
+    if config.out_dir.is_relative() {
+        config.out_dir = config.root.join(&config.out_dir);
+    }
+    if config.cache.dir.is_relative() {
+        config.cache.dir = config.root.join(&config.cache.dir);
+    }
+}
+
+/// Static-file service shared by `pledge preview` and `pledge serve`:
+/// pre-compressed `.br` / `.gz` siblings are served (with the right
+/// `Content-Encoding`) to clients that accept them, and any path that is not
+/// a file falls back to `index.html` (SPA routing).
+fn static_site_service(out_dir: &std::path::Path) -> axum::Router {
+    let index_path = out_dir.join("index.html");
+    let serve_dir = tower_http::services::ServeDir::new(out_dir)
+        .precompressed_gzip()
+        .precompressed_br()
+        .fallback(tower_http::services::ServeFile::new(index_path));
+    axum::Router::new().fallback_service(serve_dir)
 }
 
 #[cfg(test)]
@@ -4188,6 +4456,41 @@ mod tests {
     }
 
     #[test]
+    fn every_template_gets_a_valid_tsconfig_with_the_right_jsx_mode() {
+        for tpl in [
+            "pledge", "react", "vue", "svelte", "solid", "vanilla", "next", "tanstack",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            ensure_tsconfig(dir.path(), tpl).unwrap();
+            let text = std::fs::read_to_string(dir.path().join("tsconfig.json")).unwrap();
+            let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert!(
+                v["compilerOptions"]["jsx"].is_string(),
+                "{tpl}: jsx option missing"
+            );
+            assert_eq!(v["compilerOptions"]["moduleResolution"], "bundler");
+            assert!(v["include"].as_array().unwrap().iter().any(|i| i == "src"));
+        }
+        assert_eq!(template_tsconfig("react")["compilerOptions"]["jsx"], "react-jsx");
+        assert_eq!(
+            template_tsconfig("solid")["compilerOptions"]["jsxImportSource"],
+            "solid-js"
+        );
+        assert_eq!(template_tsconfig("vue")["compilerOptions"]["jsx"], "preserve");
+    }
+
+    #[test]
+    fn ensure_tsconfig_never_overwrites_an_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("tsconfig.json"), "{\"mine\":true}").unwrap();
+        ensure_tsconfig(dir.path(), "react").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("tsconfig.json")).unwrap(),
+            "{\"mine\":true}"
+        );
+    }
+
+    #[test]
     fn framework_deps_unknown_template_returns_empty_object() {
         let deps = framework_deps("some-unknown-template");
         assert_eq!(deps, serde_json::json!({}));
@@ -4218,5 +4521,104 @@ mod tests {
     fn css_framework_dev_deps_unknown_choice_returns_empty_object() {
         assert_eq!(css_framework_dev_deps("none"), serde_json::json!({}));
         assert_eq!(css_framework_dev_deps(""), serde_json::json!({}));
+    }
+
+    // ── --root handling ───────────────────────────────────────────────
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn root_flag_anchors_relative_out_and_cache_dirs_to_the_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut config = PledgeConfig::default();
+        config.out_dir = std::path::PathBuf::from("dist");
+        config.cache.dir = std::path::PathBuf::from(".cache/pledge");
+        anchor_config_to_root(&mut config, root.clone());
+        let canon = std::fs::canonicalize(&root).unwrap();
+        assert_eq!(config.root, canon);
+        // Not cwd-relative: both directories live under `--root`.
+        assert_eq!(config.out_dir, canon.join("dist"));
+        assert_eq!(config.cache.dir, canon.join(".cache/pledge"));
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn root_flag_keeps_absolute_out_dir_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let elsewhere = tmp.path().join("elsewhere");
+        let mut config = PledgeConfig::default();
+        config.out_dir = elsewhere.clone();
+        anchor_config_to_root(&mut config, tmp.path().to_path_buf());
+        assert_eq!(config.out_dir, elsewhere);
+    }
+
+    // ── preview / serve static service ────────────────────────────────
+
+    /// Minimal blocking HTTP/1.1 GET → (lower-cased header block, body).
+    fn http_get(
+        addr: std::net::SocketAddr,
+        path: &str,
+        accept_encoding: Option<&str>,
+    ) -> (String, Vec<u8>) {
+        use std::io::{Read, Write};
+        let mut stream = std::net::TcpStream::connect(addr).unwrap();
+        let mut req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n");
+        if let Some(enc) = accept_encoding {
+            req.push_str(&format!("Accept-Encoding: {enc}\r\n"));
+        }
+        req.push_str("\r\n");
+        stream.write_all(req.as_bytes()).unwrap();
+        let mut raw = Vec::new();
+        stream.read_to_end(&mut raw).unwrap();
+        let split = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+        let head = String::from_utf8_lossy(&raw[..split]).to_lowercase();
+        (head, raw[split + 4..].to_vec())
+    }
+
+    #[tokio::test]
+    async fn static_service_serves_precompressed_files_and_spa_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::write(dir.join("index.html"), "<html>INDEX</html>").unwrap();
+        std::fs::write(dir.join("app.js"), "PLAIN").unwrap();
+        std::fs::write(dir.join("app.js.br"), "BROTLI-BYTES").unwrap();
+        std::fs::write(dir.join("app.js.gz"), "GZIP-BYTES").unwrap();
+        std::fs::write(dir.join("only-gz.js"), "PLAIN2").unwrap();
+        std::fs::write(dir.join("only-gz.js.gz"), "GZ2").unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = static_site_service(dir);
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let get = move |path: &'static str, enc: Option<&'static str>| async move {
+            tokio::task::spawn_blocking(move || http_get(addr, path, enc))
+                .await
+                .unwrap()
+        };
+
+        // Brotli preferred when the client accepts it.
+        let (head, body) = get("/app.js", Some("br, gzip")).await;
+        assert!(head.contains("content-encoding: br"), "{head}");
+        assert_eq!(body, b"BROTLI-BYTES");
+        // Gzip when brotli is not accepted.
+        let (head, body) = get("/app.js", Some("gzip")).await;
+        assert!(head.contains("content-encoding: gzip"), "{head}");
+        assert_eq!(body, b"GZIP-BYTES");
+        // Only a .gz sibling exists.
+        let (head, body) = get("/only-gz.js", Some("br, gzip")).await;
+        assert!(head.contains("content-encoding: gzip"), "{head}");
+        assert_eq!(body, b"GZ2");
+        // No Accept-Encoding → the plain file, no Content-Encoding.
+        let (head, body) = get("/app.js", None).await;
+        assert!(!head.contains("content-encoding"), "{head}");
+        assert_eq!(body, b"PLAIN");
+        // Unknown route falls back to index.html (SPA routing).
+        let (head, body) = get("/some/client/route", None).await;
+        assert!(head.starts_with("http/1.1 200"), "{head}");
+        assert_eq!(body, b"<html>INDEX</html>");
     }
 }

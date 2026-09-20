@@ -272,7 +272,7 @@ pub fn generate_csp_from_build(html: &str, out_dir: &Path) -> String {
     if let Err(e) = std::fs::write(&headers_path, &headers) {
         warn!("Failed to write _headers file: {}", e);
     } else {
-        info!("Generated CSP _headers file at {}", headers_path.display());
+        info!("Generated CSP _headers file at {}", crate::display_path(&headers_path));
     }
 
     csp_gen.generate()

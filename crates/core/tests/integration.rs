@@ -406,3 +406,76 @@ fn test_binary_resolution_platform_detection() {
     };
     assert!(binary_name.starts_with("pledgepack"));
 }
+
+// ── Task-graph engine: cross-process cache reuse ──
+//
+// The task-driven pipeline is the default build path. This test proves its
+// core claim: a fresh BuildEngine over the same project + cache dir serves
+// unchanged modules from the task disk cache — no previous-graph comparison,
+// no git tree hash, just content-addressed TaskIds.
+
+#[tokio::test]
+async fn test_second_engine_build_uses_task_cache() {
+    let tmp = TempDir::new().unwrap();
+    let src = tmp.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(
+        src.join("index.tsx"),
+        r#"import { helper } from "./helper";
+export default function App() { return helper(); }"#,
+    )
+    .unwrap();
+    fs::write(
+        src.join("helper.ts"),
+        r#"export function helper() { return "hello"; }"#,
+    )
+    .unwrap();
+
+    // Pin the cache dir inside the tempdir — the default
+    // "node_modules/.pledge-cache" is relative to the process cwd.
+    let make_config = || PledgeConfig {
+        root: tmp.path().to_path_buf(),
+        entry: vec!["src/index.tsx".to_string()],
+        mode: BuildMode::Production,
+        framework: Framework::Pledge,
+        cache: pledgepack_core::config::CacheConfig {
+            dir: tmp.path().join(".cache"),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let mut engine1 = BuildEngine::new(Arc::new(make_config()));
+    let first = engine1.build().await.expect("first build should succeed");
+    assert_eq!(
+        first.modules_built, 2,
+        "cold build computes every module, got built={} cached={}",
+        first.modules_built, first.modules_cached
+    );
+
+    let mut engine2 = BuildEngine::new(Arc::new(make_config()));
+    let second = engine2.build().await.expect("second build should succeed");
+    assert_eq!(
+        second.modules_cached, 2,
+        "warm build must hit the task disk cache for every unchanged module, \
+         got built={} cached={}",
+        second.modules_built, second.modules_cached
+    );
+
+    // Changing one file must invalidate exactly that module's task — the
+    // untouched module still hits the cache.
+    fs::write(
+        src.join("helper.ts"),
+        r#"export function helper() { return "changed"; }"#,
+    )
+    .unwrap();
+
+    let mut engine3 = BuildEngine::new(Arc::new(make_config()));
+    let third = engine3.build().await.expect("third build should succeed");
+    assert_eq!(
+        third.modules_cached, 1,
+        "only the unchanged module should hit cache, got built={} cached={}",
+        third.modules_built, third.modules_cached
+    );
+    assert_eq!(third.modules_built, 1);
+}

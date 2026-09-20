@@ -115,7 +115,9 @@ impl Environment {
                 // 'static so we can keep the &'static str return type (the
                 // registry stores owned Strings). Falls back to "custom" if
                 // the environment was never registered.
-                let registry = registry().read().unwrap();
+                let registry = registry()
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 match registry.get(id) {
                     Some(name) => Box::leak(name.clone().into_boxed_str()) as &'static str,
                     None => "custom",
@@ -129,7 +131,7 @@ impl Environment {
         match self {
             Environment::Custom(id) => registry()
                 .read()
-                .unwrap()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .get(id)
                 .cloned()
                 .unwrap_or_else(|| format!("custom-{}", id)),
@@ -145,7 +147,9 @@ impl Environment {
     pub fn register_custom(name: &str) -> Environment {
         let hash = blake3::hash(name.as_bytes());
         let id = u64::from_be_bytes(hash.as_bytes()[..8].try_into().unwrap());
-        let mut registry = registry().write().unwrap();
+        let mut registry = registry()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(existing) = registry.get(&id) {
             if existing != name {
                 tracing::error!(

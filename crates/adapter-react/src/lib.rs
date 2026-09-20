@@ -101,10 +101,14 @@ impl ReactAdapter {
         let codegen_result = Codegen::new()
             .with_options(CodegenOptions {
                 minify: is_production,
+                // Emit a v3 source map. Fast Refresh code is appended *after*
+                // the generated code, so the mappings stay valid.
+                source_map_path: Some(path.to_path_buf()),
                 ..CodegenOptions::default()
             })
             .build(&program);
 
+        let source_map = codegen_result.map.as_ref().map(|m| m.to_json_string());
         let mut code = codegen_result.code;
 
         // Inject Fast Refresh in dev mode using AST-based component detection
@@ -117,6 +121,7 @@ impl ReactAdapter {
         Ok(ReactTransformResult {
             code,
             fast_refresh_boundaries,
+            source_map,
         })
     }
 
@@ -155,6 +160,8 @@ if (import.meta.hot) {{
 pub struct ReactTransformResult {
     pub code: String,
     pub fast_refresh_boundaries: Vec<String>,
+    /// Source map (v3 JSON) for `code`, from Oxc's codegen.
+    pub source_map: Option<String>,
 }
 
 fn extract_function_name(line: &str) -> Option<String> {
@@ -262,5 +269,23 @@ mod tests {
         );
         assert!(result.is_ok(), "transform failed: {:?}", result.err());
         assert!(result.unwrap().code.contains("hello"));
+    }
+
+    #[test]
+    fn transform_emits_a_source_map_for_the_generated_code() {
+        let adapter = ReactAdapter::new();
+        let result = adapter
+            .transform(
+                "function App() { return <div>hello</div>; }",
+                pledgepack_core::module::ModuleKind::Jsx,
+                "App.jsx",
+                true,
+            )
+            .unwrap();
+        let map: serde_json::Value =
+            serde_json::from_str(result.source_map.as_deref().expect("no source map")).unwrap();
+        assert_eq!(map["version"], 3);
+        assert!(!map["mappings"].as_str().unwrap().is_empty());
+        assert!(map["sources"].to_string().contains("App.jsx"));
     }
 }

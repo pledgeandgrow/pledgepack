@@ -16,6 +16,27 @@ extern "c" fn fclose(stream: *anyopaque) c_int;
 extern "c" fn fread(ptr: [*]u8, size: usize, nmemb: usize, stream: *anyopaque) usize;
 extern "c" fn fwrite(ptr: [*]const u8, size: usize, nmemb: usize, stream: *anyopaque) usize;
 extern "c" fn remove(path: [*:0]const u8) c_int;
+extern "c" fn _wfopen(path: [*:0]const u16, mode: [*:0]const u16) ?*anyopaque;
+
+/// Open `path` (UTF-8) for reading (`write == false`) or writing.
+///
+/// Rejects embedded NULs (the C APIs would silently truncate the path at the
+/// NUL and open a different file). On Windows the path is converted to UTF-16
+/// and opened with `_wfopen`: plain `fopen` interprets the bytes in the ANSI
+/// code page, so any non-ASCII path was opened wrongly or not at all.
+fn openFile(path: []const u8, write: bool) ?*anyopaque {
+    if (std.mem.indexOfScalar(u8, path, 0) != null) return null;
+    const alloc = std.heap.page_allocator;
+    if (@import("builtin").os.tag == .windows) {
+        const path_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, path) catch return null;
+        defer alloc.free(path_w);
+        const mode = if (write) std.unicode.utf8ToUtf16LeStringLiteral("wb") else std.unicode.utf8ToUtf16LeStringLiteral("rb");
+        return _wfopen(path_w.ptr, mode);
+    }
+    const path_z = alloc.dupeZ(u8, path) catch return null;
+    defer alloc.free(path_z);
+    return fopen(path_z.ptr, if (write) "wb" else "rb");
+}
 
 /// A module in the dependency graph.
 /// Stored contiguously in arena memory for cache-friendly traversal.
@@ -62,17 +83,16 @@ pub const ModuleGraph = struct {
     /// Path strings stored in arena
     path_storage: std.ArrayList(u8),
 
-    pub fn init() ModuleGraph {
-        var g: ModuleGraph = .{
-            .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator),
-            .allocator = undefined,
-            .modules = .empty,
-            .edges = .empty,
-            .reverse_edges = .empty,
-            .path_storage = .empty,
-        };
-        g.allocator = g.arena.allocator();
-        return g;
+    /// Initialize in place at the caller's final address.
+    /// A by-value init() cannot work here: allocator() captures a pointer
+    /// to `self.arena`, which would dangle once the struct is moved.
+    pub fn init(self: *ModuleGraph) void {
+        self.arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        self.allocator = self.arena.allocator();
+        self.modules = .empty;
+        self.edges = .empty;
+        self.reverse_edges = .empty;
+        self.path_storage = .empty;
     }
 
     pub fn deinit(self: *ModuleGraph) void {
@@ -108,15 +128,54 @@ pub const ModuleGraph = struct {
     }
 
     /// Add a dependency edge: `from` depends on `to`.
+    ///
+    /// The flat arrays store each module's segment contiguously at
+    /// [start, start+count). Adds for different modules interleave, so when
+    /// a module's segment is no longer at the array tail it is copied
+    /// forward to restore contiguity (same fix as TaskGraph.addDependency).
+    /// Stale segments stay in the arena (freed wholesale on deinit).
     pub fn addDependency(self: *ModuleGraph, from: u32, to: u32) !void {
-        const from_mod = &self.modules.items[from];
-        try self.edges.append(self.allocator, to);
-        from_mod.deps_count += 1;
+        // ── from's deps segment ──
+        {
+            const from_mod = &self.modules.items[from];
+            const tail = self.edges.items.len;
+            if (from_mod.deps_count == 0) {
+                from_mod.deps_start = @intCast(tail);
+                try self.edges.append(self.allocator, to);
+            } else if (from_mod.deps_start + from_mod.deps_count == tail) {
+                try self.edges.append(self.allocator, to);
+            } else {
+                // Reserve first so the `old` slice can't dangle across a
+                // realloc, then append without capacity checks.
+                const old_start = from_mod.deps_start;
+                try self.edges.ensureUnusedCapacity(self.allocator, from_mod.deps_count + 1);
+                const old = self.edges.items[old_start .. old_start + from_mod.deps_count];
+                from_mod.deps_start = @intCast(self.edges.items.len);
+                self.edges.appendSliceAssumeCapacity(old);
+                self.edges.appendAssumeCapacity(to);
+            }
+            from_mod.deps_count += 1;
+        }
 
-        // Update reverse edge
-        const to_mod = &self.modules.items[to];
-        try self.reverse_edges.append(self.allocator, from);
-        to_mod.dependents_count += 1;
+        // ── to's dependents segment ──
+        {
+            const to_mod = &self.modules.items[to];
+            const tail = self.reverse_edges.items.len;
+            if (to_mod.dependents_count == 0) {
+                to_mod.dependents_start = @intCast(tail);
+                try self.reverse_edges.append(self.allocator, from);
+            } else if (to_mod.dependents_start + to_mod.dependents_count == tail) {
+                try self.reverse_edges.append(self.allocator, from);
+            } else {
+                const old_start = to_mod.dependents_start;
+                try self.reverse_edges.ensureUnusedCapacity(self.allocator, to_mod.dependents_count + 1);
+                const old = self.reverse_edges.items[old_start .. old_start + to_mod.dependents_count];
+                to_mod.dependents_start = @intCast(self.reverse_edges.items.len);
+                self.reverse_edges.appendSliceAssumeCapacity(old);
+                self.reverse_edges.appendAssumeCapacity(from);
+            }
+            to_mod.dependents_count += 1;
+        }
     }
 
     /// Get the path string for a module.
@@ -135,7 +194,7 @@ pub const ModuleGraph = struct {
     /// Returns the number of dependents written to out_ids.
     pub fn getDependents(self: *const ModuleGraph, id: u32, out_ids: []u32) usize {
         const mod = self.modules.items[id];
-        const count = @min(mod.dependents_count, @as(u32, @intCast(out_ids.len)));
+        const count: u32 = @intCast(@min(@as(usize, mod.dependents_count), out_ids.len));
         const start = mod.dependents_start;
         @memcpy(out_ids[0..count], self.reverse_edges.items[start .. start + count]);
         return count;
@@ -194,10 +253,7 @@ pub const ModuleGraph = struct {
 /// Create a new module graph (C ABI).
 pub fn create() !*ModuleGraph {
     const g = try std.heap.page_allocator.create(ModuleGraph);
-    g.* = ModuleGraph.init();
-    // Re-assign allocator after move — the arena.allocator() pointer
-    // from init() pointed to the stack copy, which is now invalid.
-    g.allocator = g.arena.allocator();
+    ModuleGraph.init(g); // binds allocator at the heap-stable address
     return g;
 }
 
@@ -394,6 +450,10 @@ const DEPENDENTS_COUNT_MASK: u32 = (1 << DEPENDENTS_COUNT_BITS) - 1;
 const STATUS_SHIFT: u6 = DEPS_COUNT_BITS + DEPENDENTS_COUNT_BITS;
 const STATUS_MASK: u32 = 0x7;
 
+/// Largest edge counts representable in the packed node word.
+pub const MAX_DEPS_PER_NODE: u32 = DEPS_COUNT_MASK;
+pub const MAX_DEPENDENTS_PER_NODE: u32 = DEPENDENTS_COUNT_MASK;
+
 fn packNode(deps_count: u32, dependents_count: u32, status: TaskStatus) u32 {
     return (deps_count & DEPS_COUNT_MASK) |
         ((dependents_count & DEPENDENTS_COUNT_MASK) << DEPENDENTS_COUNT_SHIFT) |
@@ -439,20 +499,20 @@ pub const TaskGraph = struct {
     /// G8.10: Parallel to nodes — LRU next index (intrusive list)
     lru_next: std.ArrayList(u32),
 
-    pub fn init() TaskGraph {
-        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-        const allocator = arena.allocator();
-        return .{
-            .arena = arena,
-            .allocator = allocator,
-            .nodes = .empty,
-            .edges = .empty,
-            .reverse_edges = .empty,
-            .dependents_offsets = .empty,
-            .id_to_index = std.AutoHashMap(TaskId, u32).init(allocator),
-            .lru_prev = .empty,
-            .lru_next = .empty,
-        };
+    /// Initialize in place at the caller's final address (see ModuleGraph
+    /// .init). The HashMap captures the arena allocator, so it too must be
+    /// built after the struct has its final address.
+    pub fn init(self: *TaskGraph) void {
+        self.arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        self.allocator = self.arena.allocator();
+        self.nodes = .empty;
+        self.edges = .empty;
+        self.reverse_edges = .empty;
+        self.dependents_offsets = .empty;
+        self.id_to_index = std.AutoHashMap(TaskId, u32).init(self.allocator);
+        self.lru = .{};
+        self.lru_prev = .empty;
+        self.lru_next = .empty;
     }
 
     pub fn deinit(self: *TaskGraph) void {
@@ -487,30 +547,75 @@ pub const TaskGraph = struct {
 
     /// Add a dependency edge: `from` depends on `to`.
     /// Both nodes must already exist in the graph.
+    ///
+    /// The flat arrays store each node's segment contiguously at
+    /// [start, start+count). A naive append corrupts that invariant when
+    /// edges for different nodes interleave, so when a node's segment is
+    /// not already at the array tail we copy it forward (old deps + new
+    /// edge) and repoint it — O(degree) per add, and degrees are small.
+    /// Stale segments stay in the arena (freed wholesale on deinit).
     pub fn addDependency(self: *TaskGraph, from: TaskId, to: TaskId) !void {
         const from_idx = self.id_to_index.get(from) orelse return error.TaskNotFound;
         const to_idx = self.id_to_index.get(to) orelse return error.TaskNotFound;
 
-        // If this is the first dependency for `from`, set deps_start
-        // to the current end of the edges array.
-        if (unpackDepsCount(self.nodes.items[from_idx].packed_flags) == 0) {
-            self.nodes.items[from_idx].deps_start = @intCast(self.edges.items.len);
-        }
-        try self.edges.append(self.allocator, to_idx);
-        const dc = unpackDepsCount(self.nodes.items[from_idx].packed_flags);
-        const dpc = unpackDependentsCount(self.nodes.items[from_idx].packed_flags);
-        const st = unpackStatus(self.nodes.items[from_idx].packed_flags);
-        self.nodes.items[from_idx].packed_flags = packNode(dc + 1, dpc, st);
+        // The per-node edge counts live in 15/14-bit packed fields. Exceeding
+        // them used to wrap silently (packNode masks), corrupting the node's
+        // segment length. Check BOTH counters before mutating anything so a
+        // rejected edge leaves the graph untouched.
+        if (unpackDepsCount(self.nodes.items[from_idx].packed_flags) >= MAX_DEPS_PER_NODE)
+            return error.TooManyDependencies;
+        if (unpackDependentsCount(self.nodes.items[to_idx].packed_flags) >= MAX_DEPENDENTS_PER_NODE)
+            return error.TooManyDependents;
 
-        // If this is the first dependent for `to`, set dependents_offset
-        if (unpackDependentsCount(self.nodes.items[to_idx].packed_flags) == 0) {
-            self.dependents_offsets.items[to_idx] = @intCast(self.reverse_edges.items.len);
+        // ── from's deps segment ──
+        {
+            const node = &self.nodes.items[from_idx];
+            const dc = unpackDepsCount(node.packed_flags);
+            const dpc = unpackDependentsCount(node.packed_flags);
+            const st = unpackStatus(node.packed_flags);
+            const tail = self.edges.items.len;
+            if (dc == 0) {
+                node.deps_start = @intCast(tail);
+                try self.edges.append(self.allocator, to_idx);
+            } else if (node.deps_start + dc == tail) {
+                // Segment is already at the tail — extend in place.
+                try self.edges.append(self.allocator, to_idx);
+            } else {
+                // Interleaved adds broke contiguity: copy forward.
+                // Reserve first so `old` (a slice into items) can't dangle
+                // across a realloc, then append without capacity checks.
+                const old_start = node.deps_start;
+                try self.edges.ensureUnusedCapacity(self.allocator, dc + 1);
+                const old = self.edges.items[old_start .. old_start + dc];
+                node.deps_start = @intCast(self.edges.items.len);
+                self.edges.appendSliceAssumeCapacity(old);
+                self.edges.appendAssumeCapacity(to_idx);
+            }
+            node.packed_flags = packNode(dc + 1, dpc, st);
         }
-        try self.reverse_edges.append(self.allocator, from_idx);
-        const dc2 = unpackDepsCount(self.nodes.items[to_idx].packed_flags);
-        const dpc2 = unpackDependentsCount(self.nodes.items[to_idx].packed_flags);
-        const st2 = unpackStatus(self.nodes.items[to_idx].packed_flags);
-        self.nodes.items[to_idx].packed_flags = packNode(dc2, dpc2 + 1, st2);
+
+        // ── to's dependents segment ──
+        {
+            const node = &self.nodes.items[to_idx];
+            const dc = unpackDepsCount(node.packed_flags);
+            const dpc = unpackDependentsCount(node.packed_flags);
+            const st = unpackStatus(node.packed_flags);
+            const tail = self.reverse_edges.items.len;
+            const start = self.dependents_offsets.items[to_idx];
+            if (dpc == 0) {
+                self.dependents_offsets.items[to_idx] = @intCast(tail);
+                try self.reverse_edges.append(self.allocator, from_idx);
+            } else if (start + dpc == tail) {
+                try self.reverse_edges.append(self.allocator, from_idx);
+            } else {
+                try self.reverse_edges.ensureUnusedCapacity(self.allocator, dpc + 1);
+                const old = self.reverse_edges.items[start .. start + dpc];
+                self.dependents_offsets.items[to_idx] = @intCast(self.reverse_edges.items.len);
+                self.reverse_edges.appendSliceAssumeCapacity(old);
+                self.reverse_edges.appendAssumeCapacity(from_idx);
+            }
+            node.packed_flags = packNode(dc, dpc + 1, st);
+        }
     }
 
     /// Get the dependencies of a task (forward edges).
@@ -526,7 +631,7 @@ pub const TaskGraph = struct {
         const node = self.nodes.items[index];
         const dpc = unpackDependentsCount(node.packed_flags);
         const start = self.dependents_offsets.items[index];
-        const count = @min(dpc, @as(u32, @intCast(out.len)));
+        const count: u32 = @intCast(@min(@as(usize, dpc), out.len));
         @memcpy(out[0..count], self.reverse_edges.items[start .. start + count]);
         return count;
     }
@@ -629,6 +734,137 @@ pub const TaskGraph = struct {
         return count;
     }
 
+    /// Get the dependents of a task by TaskId (reverse edges).
+    /// Translates internal node indices back to TaskIds.
+    /// Returns the number of ids written (at most out_ids.len).
+    pub fn getDependents(
+        self: *const TaskGraph,
+        id: TaskId,
+        out_ids: []TaskId,
+    ) usize {
+        const idx = self.id_to_index.get(id) orelse return 0;
+        const dpc = unpackDependentsCount(self.nodes.items[idx].packed_flags);
+        const start = self.dependents_offsets.items[idx];
+        const count: u32 = @intCast(@min(@as(usize, dpc), out_ids.len));
+        for (self.reverse_edges.items[start .. start + count], 0..) |dep_idx, i| {
+            out_ids[i] = self.nodes.items[dep_idx].id;
+        }
+        return count;
+    }
+
+    /// Get the dependencies of a task by TaskId (forward edges).
+    /// Returns the number of ids written (at most out_ids.len).
+    pub fn getDependencies(
+        self: *const TaskGraph,
+        id: TaskId,
+        out_ids: []TaskId,
+    ) usize {
+        const idx = self.id_to_index.get(id) orelse return 0;
+        const node = self.nodes.items[idx];
+        const dc = unpackDepsCount(node.packed_flags);
+        const count: u32 = @intCast(@min(@as(usize, dc), out_ids.len));
+        for (self.edges.items[node.deps_start .. node.deps_start + count], 0..) |dep_idx, i| {
+            out_ids[i] = self.nodes.items[dep_idx].id;
+        }
+        return count;
+    }
+
+    /// Mark a task dirty and propagate to all transitive dependents in one
+    /// pass — the FFI-call fusion of getInvalidationSet + setStatus(dirty).
+    /// BFS through the reverse edge array, marking every visited node dirty.
+    /// Writes all dirtied TaskIds to out_ids, returns the count.
+    ///
+    /// Statuses are updated even when out_ids is too small (dirtying is
+    /// idempotent), so callers may retry with a larger buffer safely.
+    pub fn markDirty(
+        self: *TaskGraph,
+        id: TaskId,
+        out_ids: []TaskId,
+    ) usize {
+        const start_idx = self.id_to_index.get(id) orelse return 0;
+        const n = self.nodes.items.len;
+        if (n == 0) return 0;
+
+        const allocator = std.heap.page_allocator;
+        const visited = allocator.alloc(bool, n) catch return 0;
+        defer allocator.free(visited);
+        @memset(visited, false);
+
+        const queue = allocator.alloc(u32, n) catch return 0;
+        defer allocator.free(queue);
+        var queue_head: usize = 0;
+        var queue_tail: usize = 0;
+
+        queue[queue_tail] = start_idx;
+        queue_tail += 1;
+        visited[start_idx] = true;
+
+        var count: usize = 0;
+        while (queue_head < queue_tail) {
+            const current = queue[queue_head];
+            queue_head += 1;
+
+            self.setStatus(current, .dirty);
+            if (count < out_ids.len) {
+                out_ids[count] = self.nodes.items[current].id;
+                count += 1;
+            }
+
+            const node = self.nodes.items[current];
+            const dpc = unpackDependentsCount(node.packed_flags);
+            const dstart = self.dependents_offsets.items[current];
+            for (self.reverse_edges.items[dstart .. dstart + dpc]) |dep| {
+                if (dep < n and !visited[dep]) {
+                    visited[dep] = true;
+                    if (queue_tail < queue.len) {
+                        queue[queue_tail] = dep;
+                        queue_tail += 1;
+                    }
+                }
+            }
+        }
+
+        return count;
+    }
+
+    /// Flat scan over the contiguous nodes array: write the TaskIds of every
+    /// node whose packed status matches `status`. Returns the count written.
+    /// This is the bitset-style dirty/clean scan — one pass over 24-byte
+    /// nodes, no hashing.
+    pub fn idsByStatus(
+        self: *const TaskGraph,
+        status: TaskStatus,
+        out_ids: []TaskId,
+    ) usize {
+        var count: usize = 0;
+        for (self.nodes.items) |node| {
+            if (unpackStatus(node.packed_flags) == status) {
+                if (count < out_ids.len) {
+                    out_ids[count] = node.id;
+                    count += 1;
+                }
+            }
+        }
+        return count;
+    }
+
+    /// Write every TaskId in the graph. Size out_ids with taskCount() first.
+    /// Returns the number of ids written (at most out_ids.len).
+    pub fn allIds(self: *const TaskGraph, out_ids: []TaskId) usize {
+        const n = @min(self.nodes.items.len, out_ids.len);
+        for (self.nodes.items[0..n], 0..) |node, i| {
+            out_ids[i] = node.id;
+        }
+        return n;
+    }
+
+    /// Clear the graph — frees the arena and re-initializes in place,
+    /// keeping the TaskGraph pointer valid for callers.
+    pub fn clear(self: *TaskGraph) void {
+        self.deinit();
+        self.init();
+    }
+
     /// Serialize the task graph to a flat binary format.
     ///
     /// Format (all little-endian):
@@ -650,15 +886,15 @@ pub const TaskGraph = struct {
     /// The format is a single contiguous block with no pointers —
     /// suitable for mmap.
     pub fn serializeToFile(self: *const TaskGraph, path: []const u8) !void {
-        var path_buf: [4096]u8 = undefined;
-        if (path.len >= path_buf.len) return error.PathTooLong;
-        @memcpy(path_buf[0..path.len], path);
-        path_buf[path.len] = 0;
-        const path_z: [*:0]const u8 = @ptrCast(&path_buf);
-
-        const fp = fopen(path_z, "wb") orelse return error.OpenFailed;
+        const fp = openFile(path, true) orelse return error.OpenFailed;
         defer _ = fclose(fp);
 
+        // Lengths are stored as u32 - reject (rather than @intCast-trap on)
+        // graphs that do not fit.
+        const max: usize = std.math.maxInt(u32);
+        if (self.nodes.items.len > max or self.edges.items.len > max or
+            self.reverse_edges.items.len > max or self.id_to_index.count() > max)
+            return error.GraphTooLarge;
         const node_count: u32 = @intCast(self.nodes.items.len);
         const edge_count: u32 = @intCast(self.edges.items.len);
         const reverse_edge_count: u32 = @intCast(self.reverse_edges.items.len);
@@ -673,7 +909,7 @@ pub const TaskGraph = struct {
         std.mem.writeInt(u32, header[16..20], reverse_edge_count, .little);
         std.mem.writeInt(u32, header[20..24], id_to_index_count, .little);
         // header[24..28] reserved (already zero)
-        _ = fwrite(&header, 1, 32, fp);
+        try writeAll(fp, &header);
 
         // Nodes (each 24 bytes: 16 id + 4 deps_start + 4 packed)
         for (self.nodes.items) |node| {
@@ -681,28 +917,28 @@ pub const TaskGraph = struct {
             @memcpy(buf[0..16], &node.id);
             std.mem.writeInt(u32, buf[16..20], node.deps_start, .little);
             std.mem.writeInt(u32, buf[20..24], node.packed_flags, .little);
-            _ = fwrite(&buf, 1, 24, fp);
+            try writeAll(fp, &buf);
         }
 
         // Dependents offsets (parallel to nodes, 4 bytes each)
         for (self.dependents_offsets.items) |offset| {
             var buf: [4]u8 = undefined;
             std.mem.writeInt(u32, &buf, offset, .little);
-            _ = fwrite(&buf, 1, 4, fp);
+            try writeAll(fp, &buf);
         }
 
         // Edges
         for (self.edges.items) |edge| {
             var buf: [4]u8 = undefined;
             std.mem.writeInt(u32, &buf, edge, .little);
-            _ = fwrite(&buf, 1, 4, fp);
+            try writeAll(fp, &buf);
         }
 
         // Reverse edges
         for (self.reverse_edges.items) |edge| {
             var buf: [4]u8 = undefined;
             std.mem.writeInt(u32, &buf, edge, .little);
-            _ = fwrite(&buf, 1, 4, fp);
+            try writeAll(fp, &buf);
         }
 
         // id_to_index entries (20 bytes each: 16 id + 4 index)
@@ -711,20 +947,67 @@ pub const TaskGraph = struct {
             var buf: [20]u8 = undefined;
             @memcpy(buf[0..16], &entry.key_ptr.*);
             std.mem.writeInt(u32, buf[16..20], entry.value_ptr.*, .little);
-            _ = fwrite(&buf, 1, 20, fp);
+            try writeAll(fp, &buf);
         }
     }
 
-    /// Deserialize a task graph from a flat binary file.
-    /// Reconstructs all arrays and the id_to_index hash map.
-    pub fn loadFromFile(path: []const u8) !TaskGraph {
-        var path_buf: [4096]u8 = undefined;
-        if (path.len >= path_buf.len) return error.PathTooLong;
-        @memcpy(path_buf[0..path.len], path);
-        path_buf[path.len] = 0;
-        const path_z: [*:0]const u8 = @ptrCast(&path_buf);
+    fn writeAll(fp: *anyopaque, bytes: []const u8) !void {
+        if (fwrite(bytes.ptr, 1, bytes.len, fp) != bytes.len) return error.WriteFailed;
+    }
 
-        const fp = fopen(path_z, "rb") orelse return error.OpenFailed;
+    /// Append the per-node parallel LRU slots for a node just added by a
+    /// loader (graphs restored from disk previously had EMPTY lru arrays, so
+    /// touchLru on a loaded graph indexed out of bounds).
+    fn appendLruSlots(self: *TaskGraph) !void {
+        try self.lru_prev.append(self.allocator, LruList.NULL_INDEX);
+        try self.lru_next.append(self.allocator, LruList.NULL_INDEX);
+    }
+
+    fn loadFromBytes(self: *TaskGraph, data: []const u8) !void {
+        return loadFromBytesImpl(self, data);
+    }
+
+    /// Structural validation of a graph produced by a loader. Files and
+    /// compressed snapshots are untrusted input: every offset/index is
+    /// range-checked so later accessors (which slice without checks in
+    /// release builds) cannot read out of bounds.
+    pub fn validate(self: *const TaskGraph) !void {
+        const n = self.nodes.items.len;
+        if (self.dependents_offsets.items.len != n) return error.InvalidData;
+        if (self.lru_prev.items.len != n or self.lru_next.items.len != n) return error.InvalidData;
+        if (self.id_to_index.count() != n) return error.InvalidData;
+        for (self.nodes.items, 0..) |node, i| {
+            const status_bits = (node.packed_flags >> STATUS_SHIFT) & STATUS_MASK;
+            if (status_bits > @intFromEnum(TaskStatus.evicted)) return error.InvalidData;
+            const dc: u64 = unpackDepsCount(node.packed_flags);
+            const dpc: u64 = unpackDependentsCount(node.packed_flags);
+            if (@as(u64, node.deps_start) + dc > self.edges.items.len) return error.InvalidData;
+            if (@as(u64, self.dependents_offsets.items[i]) + dpc > self.reverse_edges.items.len) return error.InvalidData;
+            const mapped = self.id_to_index.get(node.id) orelse return error.InvalidData;
+            if (mapped != i) return error.InvalidData;
+        }
+        for (self.edges.items) |e| if (e >= n) return error.InvalidData;
+        for (self.reverse_edges.items) |e| if (e >= n) return error.InvalidData;
+    }
+
+    /// Deserialize a task graph from a flat binary file.
+    ///
+    /// Returns a heap-allocated graph (release with `destroyTaskGraph`). It
+    /// used to return `TaskGraph` BY VALUE, but the graph's arena allocator
+    /// and `id_to_index` hash map capture pointers to the struct's own
+    /// address, so the returned copy referenced the dead stack frame of the
+    /// loader (use-after-return). The graph is now built in place at its
+    /// final heap address.
+    pub fn loadFromFile(path: []const u8) !*TaskGraph {
+        const graph = try createTaskGraph();
+        errdefer destroyTaskGraph(graph);
+        try graph.loadInto(path);
+        try graph.validate();
+        return graph;
+    }
+
+    fn loadInto(graph: *TaskGraph, path: []const u8) !void {
+        const fp = openFile(path, false) orelse return error.OpenFailed;
         defer _ = fclose(fp);
 
         // Helper to read N bytes
@@ -754,12 +1037,12 @@ pub const TaskGraph = struct {
         const edge_count = std.mem.readInt(u32, header[12..16], .little);
         const reverse_edge_count = std.mem.readInt(u32, header[16..20], .little);
         const id_to_index_count = std.mem.readInt(u32, header[20..24], .little);
+        // One entry per node - anything else is a corrupt/hostile header.
+        if (id_to_index_count != node_count) return error.InvalidData;
 
-        var graph = TaskGraph.init();
-        graph.allocator = graph.arena.allocator(); // re-assign after move
-        graph.id_to_index = std.AutoHashMap(TaskId, u32).init(graph.allocator);
-
-        // Nodes (24 bytes each: 16 id + 4 deps_start + 4 packed)
+        // Nodes (24 bytes each: 16 id + 4 deps_start + 4 packed). Each
+        // iteration consumes file bytes, so a lying header cannot force an
+        // allocation larger than the file itself.
         var i: u32 = 0;
         while (i < node_count) : (i += 1) {
             var node_buf: [24]u8 = undefined;
@@ -770,12 +1053,14 @@ pub const TaskGraph = struct {
             const deps_start = std.mem.readInt(u32, node_buf[16..20], .little);
             const packed_val = std.mem.readInt(u32, node_buf[20..24], .little);
 
+            if (graph.id_to_index.contains(id)) return error.InvalidData; // duplicate id
             try graph.nodes.append(graph.allocator, .{
                 .id = id,
                 .deps_start = deps_start,
                 .packed_flags = packed_val,
             });
             try graph.id_to_index.put(id, i);
+            try graph.appendLruSlots();
         }
 
         // Dependents offsets (parallel to nodes, 4 bytes each)
@@ -799,8 +1084,8 @@ pub const TaskGraph = struct {
             try graph.reverse_edges.append(graph.allocator, edge);
         }
 
-        // id_to_index entries (already populated during node loading,
-        // but read and skip if present)
+        // id_to_index entries: redundant with the node table (already
+        // populated above) - verify each agrees instead of trusting it.
         i = 0;
         while (i < id_to_index_count) : (i += 1) {
             var id_buf: [16]u8 = undefined;
@@ -808,32 +1093,16 @@ pub const TaskGraph = struct {
             const index = readU32(fp) orelse return error.UnexpectedEof;
             var id: TaskId = undefined;
             @memcpy(&id, &id_buf);
-            if (!graph.id_to_index.contains(id)) {
-                try graph.id_to_index.put(id, index);
-            }
+            const mapped = graph.id_to_index.get(id) orelse return error.InvalidData;
+            if (mapped != index) return error.InvalidData;
         }
-
-        return graph;
     }
 };
 
 /// Create a new task graph (C ABI).
 pub fn createTaskGraph() !*TaskGraph {
     const g = try std.heap.page_allocator.create(TaskGraph);
-    // Initialize directly in heap memory (not via init() which returns by value)
-    g.* = .{
-        .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator),
-        .allocator = undefined,
-        .nodes = .empty,
-        .edges = .empty,
-        .reverse_edges = .empty,
-        .dependents_offsets = .empty,
-        .id_to_index = undefined,
-        .lru_prev = .empty,
-        .lru_next = .empty,
-    };
-    g.allocator = g.arena.allocator();
-    g.id_to_index = std.AutoHashMap(TaskId, u32).init(g.allocator);
+    g.init(); // binds allocator + map at the heap-stable address
     return g;
 }
 
@@ -874,6 +1143,9 @@ pub fn compressZstd(allocator: Allocator, data: []const u8) ![]u8 {
     return allocator.dupe(u8, out_buf[0..written]);
 }
 
+/// Upper bound on decompressed snapshot size (256 MiB).
+pub const MAX_DECOMPRESSED_SIZE: usize = 256 * 1024 * 1024;
+
 /// G8.12: Decompress a zlib-compressed byte slice.
 /// Returns a decompressed buffer allocated from the given allocator.
 pub fn decompressZstd(allocator: Allocator, compressed: []const u8) ![]u8 {
@@ -894,6 +1166,9 @@ pub fn decompressZstd(allocator: Allocator, compressed: []const u8) ![]u8 {
     while (true) {
         const n = decompressor.reader.readSliceShort(&chunk) catch break;
         if (n == 0) break;
+        // Decompression-bomb guard: bound the output regardless of the
+        // (untrusted) compressed input.
+        if (result.items.len + n > MAX_DECOMPRESSED_SIZE) return error.DecompressionTooLarge;
         try result.appendSlice(allocator, chunk[0..n]);
     }
 
@@ -959,10 +1234,22 @@ pub fn compressTaskGraph(allocator: Allocator, g: *const TaskGraph) ![]u8 {
 }
 
 /// G8.12: Decompress and restore a TaskGraph from a zstd buffer.
-pub fn decompressTaskGraph(allocator: Allocator, compressed: []const u8) !TaskGraph {
+///
+/// Returns a heap-allocated graph (release with `destroyTaskGraph`); see
+/// `TaskGraph.loadFromFile` for why it cannot be returned by value.
+/// `allocator` is only used for the temporary decompression buffers.
+pub fn decompressTaskGraph(allocator: Allocator, compressed: []const u8) !*TaskGraph {
     const data = try decompressZstd(allocator, compressed);
     defer allocator.free(data);
 
+    const graph = try createTaskGraph();
+    errdefer destroyTaskGraph(graph);
+    try graph.loadFromBytes(data);
+    try graph.validate();
+    return graph;
+}
+
+fn loadFromBytesImpl(graph: *TaskGraph, data: []const u8) !void {
     if (data.len < 32) return error.InvalidData;
     if (!std.mem.eql(u8, data[0..4], "PTGZ")) return error.InvalidMagic;
     const version = std.mem.readInt(u32, data[4..8], .little);
@@ -972,10 +1259,7 @@ pub fn decompressTaskGraph(allocator: Allocator, compressed: []const u8) !TaskGr
     const reverse_edge_count = std.mem.readInt(u32, data[16..20], .little);
     const dependents_count = std.mem.readInt(u32, data[20..24], .little);
     const id_to_index_count = std.mem.readInt(u32, data[24..28], .little);
-
-    var graph = TaskGraph.init();
-    graph.allocator = graph.arena.allocator();
-    graph.id_to_index = std.AutoHashMap(TaskId, u32).init(graph.allocator);
+    if (dependents_count != node_count or id_to_index_count != node_count) return error.InvalidData;
 
     var offset: usize = 32;
 
@@ -987,14 +1271,14 @@ pub fn decompressTaskGraph(allocator: Allocator, compressed: []const u8) !TaskGr
         @memcpy(&id, data[offset .. offset + 16]);
         const deps_start = std.mem.readInt(u32, data[offset + 16 .. offset + 20][0..4], .little);
         const packed_val = std.mem.readInt(u32, data[offset + 20 .. offset + 24][0..4], .little);
+        if (graph.id_to_index.contains(id)) return error.InvalidData; // duplicate id
         try graph.nodes.append(graph.allocator, .{
             .id = id,
             .deps_start = deps_start,
             .packed_flags = packed_val,
         });
         try graph.id_to_index.put(id, i);
-        try graph.lru_prev.append(graph.allocator, LruList.NULL_INDEX);
-        try graph.lru_next.append(graph.allocator, LruList.NULL_INDEX);
+        try graph.appendLruSlots();
         offset += 24;
     }
 
@@ -1025,20 +1309,17 @@ pub fn decompressTaskGraph(allocator: Allocator, compressed: []const u8) !TaskGr
         offset += 4;
     }
 
-    // Read id_to_index (already populated, but skip if present)
+    // id_to_index is redundant with the node table - verify it agrees.
     i = 0;
     while (i < id_to_index_count) : (i += 1) {
         if (offset + 20 > data.len) return error.UnexpectedEof;
         var id: TaskId = undefined;
         @memcpy(&id, data[offset .. offset + 16]);
         const idx = std.mem.readInt(u32, data[offset + 16 .. offset + 20][0..4], .little);
-        if (!graph.id_to_index.contains(id)) {
-            try graph.id_to_index.put(id, idx);
-        }
+        const mapped = graph.id_to_index.get(id) orelse return error.InvalidData;
+        if (mapped != idx) return error.InvalidData;
         offset += 20;
     }
-
-    return graph;
 }
 
 // ─── G8.13: Arena snapshotting (COW) ─────────────────────────────────
@@ -1070,8 +1351,9 @@ pub fn snapshotTaskGraph(allocator: Allocator, g: *const TaskGraph) !ArenaSnapsh
 }
 
 /// G8.13: Restore a TaskGraph from a snapshot.
-/// Creates a fresh arena with the snapshot's data. The original graph is unaffected.
-pub fn restoreTaskGraph(snapshot: *const ArenaSnapshot) !TaskGraph {
+/// Creates a fresh heap-allocated graph (release with `destroyTaskGraph`).
+/// The original graph is unaffected.
+pub fn restoreTaskGraph(snapshot: *const ArenaSnapshot) !*TaskGraph {
     return decompressTaskGraph(snapshot.allocator, snapshot.data);
 }
 
@@ -1224,44 +1506,95 @@ pub const SlabArena = struct {
 pub fn compactTaskGraph(g: *TaskGraph) !void {
     if (g.nodes.items.len == 0) return;
 
+    const n = g.nodes.items.len;
     var live_count: u32 = 0;
-    var remap = std.ArrayList(u32).empty;
-    defer remap.deinit(g.allocator);
-    try remap.appendNTimes(g.allocator, LruList.NULL_INDEX, g.nodes.items.len);
+    for (g.nodes.items) |node| {
+        if (unpackStatus(node.packed_flags) != .evicted) live_count += 1;
+    }
+    if (live_count == n) return;
 
-    for (g.nodes.items, 0..) |node, i| {
-        const status = unpackStatus(node.packed_flags);
-        if (status != .evicted) {
-            remap.items[i] = live_count;
-            if (live_count != i) {
-                g.nodes.items[live_count] = node;
+    // old index -> new index (NULL_INDEX for evicted nodes)
+    const remap = try g.allocator.alloc(u32, n);
+    {
+        var next: u32 = 0;
+        for (g.nodes.items, 0..) |node, i| {
+            if (unpackStatus(node.packed_flags) == .evicted) {
+                remap[i] = LruList.NULL_INDEX;
+            } else {
+                remap[i] = next;
+                next += 1;
             }
-            live_count += 1;
         }
     }
 
-    if (live_count == g.nodes.items.len) return;
+    // Rebuild BOTH flat edge arrays for the surviving nodes only. Edges that
+    // touch an evicted node are dropped (they used to be left in place,
+    // pointing at whichever unrelated node had been renumbered into that
+    // slot), and each survivor's segment start is recomputed (they used to
+    // keep their old, now-stale offsets). Everything fallible happens before
+    // any live state is modified, so an OOM leaves the graph untouched.
+    var new_edges: std.ArrayList(u32) = .empty;
+    var new_rev: std.ArrayList(u32) = .empty;
+    const Seg = struct { ds: u32, dc: u32, rs: u32, rc: u32 };
+    const segs = try g.allocator.alloc(Seg, live_count);
 
-    g.nodes.items.len = live_count;
-    try g.lru_prev.resize(g.allocator, live_count);
-    try g.lru_next.resize(g.allocator, live_count);
+    var w: usize = 0;
+    for (g.nodes.items, 0..) |node, i| {
+        if (remap[i] == LruList.NULL_INDEX) continue;
+        const dc = unpackDepsCount(node.packed_flags);
+        const dpc = unpackDependentsCount(node.packed_flags);
+        const ds = node.deps_start;
+        const rs = g.dependents_offsets.items[i];
+
+        const seg_ds: u32 = @intCast(new_edges.items.len);
+        var kept_d: u32 = 0;
+        for (g.edges.items[ds .. ds + dc]) |e| {
+            if (e < n and remap[e] != LruList.NULL_INDEX) {
+                try new_edges.append(g.allocator, remap[e]);
+                kept_d += 1;
+            }
+        }
+        const seg_rs: u32 = @intCast(new_rev.items.len);
+        var kept_r: u32 = 0;
+        for (g.reverse_edges.items[rs .. rs + dpc]) |e| {
+            if (e < n and remap[e] != LruList.NULL_INDEX) {
+                try new_rev.append(g.allocator, remap[e]);
+                kept_r += 1;
+            }
+        }
+        segs[w] = .{ .ds = seg_ds, .dc = kept_d, .rs = seg_rs, .rc = kept_r };
+        w += 1;
+    }
+
+    // Reserve the id map growth up front so the commit below cannot fail.
+    try g.id_to_index.ensureTotalCapacity(live_count);
+
+    // ---- commit (infallible) ----
+    w = 0;
+    for (0..n) |i| {
+        if (remap[i] == LruList.NULL_INDEX) continue;
+        const status = unpackStatus(g.nodes.items[i].packed_flags);
+        var node = g.nodes.items[i];
+        node.deps_start = segs[w].ds;
+        node.packed_flags = packNode(segs[w].dc, segs[w].rc, status);
+        g.nodes.items[w] = node;
+        g.dependents_offsets.items[w] = segs[w].rs;
+        w += 1;
+    }
+    g.nodes.shrinkRetainingCapacity(live_count);
+    g.dependents_offsets.shrinkRetainingCapacity(live_count);
+    g.lru_prev.shrinkRetainingCapacity(live_count);
+    g.lru_next.shrinkRetainingCapacity(live_count);
+    g.edges = new_edges;
+    g.reverse_edges = new_rev;
 
     g.id_to_index.clearRetainingCapacity();
     for (g.nodes.items, 0..) |node, i| {
-        try g.id_to_index.put(node.id, @intCast(i));
+        g.id_to_index.putAssumeCapacity(node.id, @intCast(i));
     }
 
-    for (g.edges.items) |*edge| {
-        if (edge.* < remap.items.len and remap.items[edge.*] != LruList.NULL_INDEX) {
-            edge.* = remap.items[edge.*];
-        }
-    }
-    for (g.reverse_edges.items) |*edge| {
-        if (edge.* < remap.items.len and remap.items[edge.*] != LruList.NULL_INDEX) {
-            edge.* = remap.items[edge.*];
-        }
-    }
-
+    // The LRU order is index-based and cannot survive renumbering; reset it
+    // (callers re-touch nodes as they are used).
     g.lru.count = 0;
     g.lru.head = LruList.NULL_INDEX;
     g.lru.tail = LruList.NULL_INDEX;
@@ -1283,10 +1616,15 @@ pub const MmapArena = struct {
 
     pub fn open(path: []const u8, size: usize) !MmapArena {
         if (@import("builtin").os.tag == .linux or @import("builtin").os.tag == .macos) {
+            // mmap of length 0 is EINVAL; reject up front with a clear error.
+            if (size == 0) return error.InvalidSize;
             var file = try std.fs.cwd().createFile(path, .{ .read = true, .truncate = false });
             errdefer file.close();
 
-            try file.setEndPos(size);
+            // Only ever GROW the file. Unconditionally calling setEndPos(size)
+            // truncated an existing, larger arena file (silent data loss) when
+            // it was re-opened with a smaller size.
+            if ((try file.getEndPos()) < size) try file.setEndPos(size);
 
             const data = try std.posix.mmap(
                 null,
@@ -1331,7 +1669,7 @@ pub const MmapArena = struct {
     pub fn sync(self: *MmapArena) !void {
         if (self.is_mapped and self.data.len > 0) {
             if (@import("builtin").os.tag == .linux or @import("builtin").os.tag == .macos) {
-                std.posix.msync(self.data, .SYNC);
+                try std.posix.msync(self.data, .SYNC);
             }
         }
     }
@@ -1388,9 +1726,12 @@ pub const TieredArena = struct {
     }
 
     pub fn markCold(self: *TieredArena, index: u32, data: []const u8) !void {
-        _ = self.hot.remove(index);
         const copy = try self.allocator.dupe(u8, data);
-        try self.cold.put(index, copy);
+        errdefer self.allocator.free(copy);
+        // fetchPut hands back a previous cold copy for this index so it can
+        // be freed (it used to be overwritten and leaked).
+        if (try self.cold.fetchPut(index, copy)) |old| self.allocator.free(old.value);
+        _ = self.hot.remove(index);
     }
 
     pub fn getTier(self: *const TieredArena, index: u32) Tier {
@@ -1400,10 +1741,11 @@ pub const TieredArena = struct {
     }
 
     pub fn promote(self: *TieredArena, index: u32) !?[]u8 {
-        if (self.cold.fetchRemove(index)) |entry| {
-            try self.hot.put(index, {});
-            return entry.value;
-        }
+        // Reserve the hot-set slot first: if this fails the cold copy is still
+        // owned by the map (previously it was removed first and lost on OOM).
+        if (!self.cold.contains(index)) return null;
+        try self.hot.put(index, {});
+        if (self.cold.fetchRemove(index)) |entry| return entry.value;
         return null;
     }
 
@@ -1430,7 +1772,8 @@ pub fn prefetchNode(g: *const TaskGraph, index: u32) void {
 }
 
 pub fn prefetchNext(g: *const TaskGraph, start_index: u32, count: u32) void {
-    const end = @min(start_index + count, @as(u32, @intCast(g.nodes.items.len)));
+    // Saturating add: start_index + count could overflow u32.
+    const end: usize = @min(@as(usize, start_index) + count, g.nodes.items.len);
     for (start_index..end) |i| {
         prefetchNode(g, @intCast(i));
         if (i + 1 < g.nodes.items.len) {
@@ -1444,10 +1787,12 @@ pub fn prefetchNext(g: *const TaskGraph, start_index: u32, count: u32) void {
 }
 
 pub fn prefetchTraversal(g: *const TaskGraph, start_index: u32) void {
+    if (start_index >= g.nodes.items.len) return;
     prefetchNext(g, start_index, 8);
     const deps_start = g.nodes.items[start_index].deps_start;
     const deps_count = unpackDepsCount(g.nodes.items[start_index].packed_flags);
     for (0..deps_count) |d| {
+        if (deps_start + d >= g.edges.items.len) break;
         const dep_idx = g.edges.items[deps_start + d];
         prefetchNode(g, dep_idx);
     }
@@ -1458,7 +1803,8 @@ test "TaskNode is 24 bytes" {
 }
 
 test "addModule and getModulePath" {
-    var g = ModuleGraph.init();
+    var g: ModuleGraph = undefined;
+    g.init();
     defer g.deinit();
 
     const id = try g.addModule("src/index.tsx");
@@ -1468,7 +1814,8 @@ test "addModule and getModulePath" {
 }
 
 test "addDependency and getDependencies" {
-    var g = ModuleGraph.init();
+    var g: ModuleGraph = undefined;
+    g.init();
     defer g.deinit();
 
     const a = try g.addModule("a.ts");
@@ -1490,7 +1837,8 @@ test "addDependency and getDependencies" {
 }
 
 test "getInvalidationSet" {
-    var g = ModuleGraph.init();
+    var g: ModuleGraph = undefined;
+    g.init();
     defer g.deinit();
 
     // c ← b ← a  (a imports b, b imports c)
@@ -1513,8 +1861,8 @@ test "getInvalidationSet" {
 
 test "TaskGraph serialize and load round-trip" {
     // Build a task graph with 3 nodes and 2 edges
-    var g = TaskGraph.init();
-    g.allocator = g.arena.allocator(); // re-assign after move
+    var g: TaskGraph = undefined;
+    g.init();
     g.id_to_index = std.AutoHashMap(TaskId, u32).init(g.allocator);
     defer g.deinit();
 
@@ -1545,8 +1893,8 @@ test "TaskGraph serialize and load round-trip" {
     }
 
     // Load back
-    var loaded = try TaskGraph.loadFromFile(tmp_path);
-    defer loaded.deinit();
+    const loaded = try TaskGraph.loadFromFile(tmp_path);
+    defer destroyTaskGraph(loaded);
 
     // Verify node count
     try std.testing.expectEqual(@as(usize, 3), loaded.taskCount());
@@ -1572,12 +1920,140 @@ test "TaskGraph serialize and load round-trip" {
 
     const deps_c = loaded.getDependencyIndices(idx_c);
     try std.testing.expectEqual(@as(usize, 0), deps_c.len);
+
+    // The loaded graph is heap-allocated at its final address: mutating it
+    // (which reallocates the arena-backed arrays and the id map) must not
+    // touch a dangling stack frame, and the LRU slots must exist.
+    const id_d = [_]u8{ 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    const idx_d = try loaded.addTask(id_d);
+    try loaded.addDependency(id_d, id_a);
+    loaded.touchLru(idx_a);
+    try std.testing.expectEqual(idx_d, loaded.getIndex(id_d).?);
+}
+
+test "loadFromFile rejects a corrupt graph instead of trusting offsets" {
+    var g: TaskGraph = undefined;
+    g.init();
+    defer g.deinit();
+    const id_a = [_]u8{ 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    const id_b = [_]u8{ 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    _ = try g.addTask(id_a);
+    _ = try g.addTask(id_b);
+    try g.addDependency(id_a, id_b);
+    // Corrupt: an edge that points past the node table.
+    g.edges.items[0] = 99;
+    const tmp_path = ".pledge_test_taskgraph_bad.ptg";
+    try g.serializeToFile(tmp_path);
+    defer {
+        var rm_buf: [256]u8 = undefined;
+        @memcpy(rm_buf[0..tmp_path.len], tmp_path);
+        rm_buf[tmp_path.len] = 0;
+        _ = remove(@as([*:0]const u8, @ptrCast(&rm_buf)));
+    }
+    try std.testing.expectError(error.InvalidData, TaskGraph.loadFromFile(tmp_path));
+}
+
+test "openFile rejects embedded NUL" {
+    try std.testing.expect(openFile("a\x00b", false) == null);
+}
+
+test "addDependency rejects counts that would wrap the packed fields" {
+    var g: TaskGraph = undefined;
+    g.init();
+    defer g.deinit();
+    const hub = [_]u8{ 0xFF, 0xFF } ++ ([_]u8{0} ** 14);
+    _ = try g.addTask(hub);
+    // Fill hub's dependents counter (14 bits) by making leaves depend on it.
+    var i: u32 = 0;
+    while (i < MAX_DEPENDENTS_PER_NODE) : (i += 1) {
+        var id: TaskId = [_]u8{0} ** 16;
+        std.mem.writeInt(u32, id[0..4], i, .little);
+        id[4] = 1;
+        _ = try g.addTask(id);
+        try g.addDependency(id, hub);
+    }
+    var extra: TaskId = [_]u8{0} ** 16;
+    extra[15] = 7;
+    _ = try g.addTask(extra);
+    try std.testing.expectError(error.TooManyDependents, g.addDependency(extra, hub));
+    // Rejected edge must leave both nodes untouched.
+    try std.testing.expectEqual(@as(usize, 0), g.getDependencyIndices(g.getIndex(extra).?).len);
+    // Forward direction: the 15-bit deps counter.
+    var j: u32 = 0;
+    const src = [_]u8{ 0xEE, 0xEE } ++ ([_]u8{0} ** 14);
+    _ = try g.addTask(src);
+    while (j < MAX_DEPS_PER_NODE) : (j += 1) {
+        var id: TaskId = [_]u8{0} ** 16;
+        std.mem.writeInt(u32, id[0..4], j, .little);
+        id[5] = 2;
+        _ = try g.addTask(id);
+        try g.addDependency(src, id);
+    }
+    try std.testing.expectError(error.TooManyDependencies, g.addDependency(src, extra));
+}
+
+test "compactTaskGraph drops edges to evicted nodes and refreshes offsets" {
+    var g: TaskGraph = undefined;
+    g.init();
+    defer g.deinit();
+    const id_a = [_]u8{ 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    const id_b = [_]u8{ 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    const id_c = [_]u8{ 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    const idx_a = try g.addTask(id_a);
+    const idx_b = try g.addTask(id_b);
+    _ = try g.addTask(id_c);
+    try g.addDependency(id_a, id_b);
+    try g.addDependency(id_a, id_c);
+    try g.addDependency(id_c, id_b);
+    _ = idx_a;
+    g.setStatus(idx_b, .evicted);
+    try compactTaskGraph(&g);
+
+    try std.testing.expectEqual(@as(usize, 2), g.taskCount());
+    const na = g.getIndex(id_a).?;
+    const nc = g.getIndex(id_c).?;
+    // a -> c survives (renumbered), a -> b and c -> b are gone.
+    const deps_a = g.getDependencyIndices(na);
+    try std.testing.expectEqual(@as(usize, 1), deps_a.len);
+    try std.testing.expectEqual(nc, deps_a[0]);
+    try std.testing.expectEqual(@as(usize, 0), g.getDependencyIndices(nc).len);
+    var out: [4]u32 = undefined;
+    try std.testing.expectEqual(@as(usize, 1), g.getDependentIndices(nc, &out));
+    try std.testing.expectEqual(na, out[0]);
+    try g.validate();
+}
+
+test "BPlusTreeAggregation builds a real root for more than 16 leaves" {
+    var tree = BPlusTreeAggregation.init(std.testing.allocator);
+    defer tree.deinit();
+    var leaves: [40]u32 = undefined;
+    for (&leaves) |*l| l.* = 2;
+    try tree.buildFromLeaves(&leaves);
+    try std.testing.expectEqual(@as(u32, 80), tree.totalTasks());
+    tree.markLeafDirty(3);
+    try std.testing.expectEqual(@as(u32, 1), tree.totalDirty());
+}
+
+test "AggregationGraph.markDirtyRecursive terminates on a cycle" {
+    var agg: AggregationGraph = undefined;
+    agg.init(std.testing.allocator);
+    defer agg.deinit();
+    _ = try agg.addAggregation(.chunk, 0, 1);
+    _ = try agg.addAggregation(.chunk, 1, 1);
+    try agg.addChild(0, 1);
+    try agg.addChild(1, 0);
+    agg.setStatus(0, .done);
+    agg.setStatus(1, .done);
+    agg.markDirtyRecursive(0);
+    try std.testing.expectEqual(AggregationStatus.dirty, agg.getStatus(1));
+    try std.testing.expectError(error.InvalidIndex, agg.addChild(0, 9));
 }
 
 // ─── G8.10: Intrusive LRU list tests ─────────────────────────────────
 
 test "G8.10: LruList moveToFront and evictTail" {
-    var g = TaskGraph.init();
+    var g: TaskGraph = undefined;
+    g.init();
     g.allocator = g.arena.allocator();
     g.id_to_index = std.AutoHashMap(TaskId, u32).init(g.allocator);
     defer g.deinit();
@@ -1612,7 +2088,8 @@ test "G8.10: LruList moveToFront and evictTail" {
 }
 
 test "G8.10: LruList moveToFront reorders correctly" {
-    var g = TaskGraph.init();
+    var g: TaskGraph = undefined;
+    g.init();
     g.allocator = g.arena.allocator();
     g.id_to_index = std.AutoHashMap(TaskId, u32).init(g.allocator);
     defer g.deinit();
@@ -1685,7 +2162,8 @@ test "G8.12: compressZstd and decompressZstd round-trip" {
 }
 
 test "G8.12: compressTaskGraph and decompressTaskGraph round-trip" {
-    var g = TaskGraph.init();
+    var g: TaskGraph = undefined;
+    g.init();
     g.allocator = g.arena.allocator();
     g.id_to_index = std.AutoHashMap(TaskId, u32).init(g.allocator);
     defer g.deinit();
@@ -1709,8 +2187,8 @@ test "G8.12: compressTaskGraph and decompressTaskGraph round-trip" {
     defer std.testing.allocator.free(compressed);
 
     // Decompress
-    var restored = try decompressTaskGraph(std.testing.allocator, compressed);
-    defer restored.deinit();
+    const restored = try decompressTaskGraph(std.testing.allocator, compressed);
+    defer destroyTaskGraph(restored);
 
     // Verify
     try std.testing.expectEqual(@as(usize, 3), restored.taskCount());
@@ -1729,7 +2207,8 @@ test "G8.12: compressTaskGraph and decompressTaskGraph round-trip" {
 // ─── G8.13: Arena snapshotting (COW) tests ───────────────────────────
 
 test "G8.13: snapshot and restore preserves graph state" {
-    var g = TaskGraph.init();
+    var g: TaskGraph = undefined;
+    g.init();
     g.allocator = g.arena.allocator();
     g.id_to_index = std.AutoHashMap(TaskId, u32).init(g.allocator);
     defer g.deinit();
@@ -1750,8 +2229,8 @@ test "G8.13: snapshot and restore preserves graph state" {
     g.setStatus(idx_b, .dirty);
 
     // Restore from snapshot — should NOT see the post-snapshot change
-    var restored = try restoreTaskGraph(&snap);
-    defer restored.deinit();
+    const restored = try restoreTaskGraph(&snap);
+    defer destroyTaskGraph(restored);
 
     try std.testing.expectEqual(@as(usize, 2), restored.taskCount());
     try std.testing.expectEqual(TaskStatus.clean, restored.getStatus(idx_a));
@@ -1763,7 +2242,8 @@ test "G8.13: snapshot and restore preserves graph state" {
 }
 
 test "G8.13: multiple snapshots are independent" {
-    var g = TaskGraph.init();
+    var g: TaskGraph = undefined;
+    g.init();
     g.allocator = g.arena.allocator();
     g.id_to_index = std.AutoHashMap(TaskId, u32).init(g.allocator);
     defer g.deinit();
@@ -1786,13 +2266,13 @@ test "G8.13: multiple snapshots are independent" {
     defer snap2.deinit();
 
     // Restore snapshot 1 — should have 2 nodes
-    var r1 = try restoreTaskGraph(&snap1);
-    defer r1.deinit();
+    const r1 = try restoreTaskGraph(&snap1);
+    defer destroyTaskGraph(r1);
     try std.testing.expectEqual(@as(usize, 2), r1.taskCount());
 
     // Restore snapshot 2 — should have 3 nodes
-    var r2 = try restoreTaskGraph(&snap2);
-    defer r2.deinit();
+    const r2 = try restoreTaskGraph(&snap2);
+    defer destroyTaskGraph(r2);
     try std.testing.expectEqual(@as(usize, 3), r2.taskCount());
 
     // Original should still have 3 nodes
@@ -1859,7 +2339,8 @@ test "G8.5: SlabArena handles alignment" {
 }
 
 test "G8.6: compactTaskGraph removes evicted nodes" {
-    var g = TaskGraph.init();
+    var g: TaskGraph = undefined;
+    g.init();
     g.allocator = g.arena.allocator();
     g.id_to_index = std.AutoHashMap(TaskId, u32).init(g.allocator);
     defer g.deinit();
@@ -1885,7 +2366,8 @@ test "G8.6: compactTaskGraph removes evicted nodes" {
 }
 
 test "G8.6: compactTaskGraph is no-op when no evictions" {
-    var g = TaskGraph.init();
+    var g: TaskGraph = undefined;
+    g.init();
     g.allocator = g.arena.allocator();
     g.id_to_index = std.AutoHashMap(TaskId, u32).init(g.allocator);
     defer g.deinit();
@@ -1922,7 +2404,8 @@ test "G8.8: TieredArena marks hot and cold" {
 }
 
 test "G8.9: prefetchNode does not crash" {
-    var g = TaskGraph.init();
+    var g: TaskGraph = undefined;
+    g.init();
     g.allocator = g.arena.allocator();
     g.id_to_index = std.AutoHashMap(TaskId, u32).init(g.allocator);
     defer g.deinit();
@@ -1993,22 +2476,20 @@ pub const AggregationGraph = struct {
     /// Child aggregation edges (flat array of u32 pairs: parent, child)
     child_edges: std.ArrayList(u32),
 
-    pub fn init(parent_allocator: std.mem.Allocator) AggregationGraph {
-        var arena = std.heap.ArenaAllocator.init(parent_allocator);
-        const allocator = arena.allocator();
-        return .{
-            .arena = arena,
-            .allocator = allocator,
-            .nodes = std.ArrayList(AggregationNode).init(allocator),
-            .task_to_agg = std.AutoHashMap(u32, u32).init(allocator),
-            .child_edges = std.ArrayList(u32).init(allocator),
-        };
+    /// Initialize in place (see ModuleGraph.init) — the arena allocator
+    /// and the task_to_agg map both capture `self`'s address.
+    pub fn init(self: *AggregationGraph, parent_allocator: std.mem.Allocator) void {
+        self.arena = std.heap.ArenaAllocator.init(parent_allocator);
+        self.allocator = self.arena.allocator();
+        self.nodes = .empty;
+        self.task_to_agg = std.AutoHashMap(u32, u32).init(self.allocator);
+        self.child_edges = .empty;
     }
 
     pub fn deinit(self: *AggregationGraph) void {
-        self.nodes.deinit();
+        self.nodes.deinit(self.allocator);
         self.task_to_agg.deinit();
-        self.child_edges.deinit();
+        self.child_edges.deinit(self.allocator);
         self.arena.deinit();
     }
 
@@ -2020,21 +2501,33 @@ pub const AggregationGraph = struct {
         first_task: u32,
         task_count: u32,
     ) !u32 {
+        // Reject a task range that overflows u32 up front (it used to trap in
+        // the mapping loop AFTER the node had already been appended).
+        const last_task = std.math.add(u32, first_task, task_count) catch return error.TaskRangeOverflow;
+        _ = last_task;
         const index: u32 = @intCast(self.nodes.items.len);
         const packed_flags: u32 = (@as(u32, @intFromEnum(agg_type)) << 28) |
             (@as(u32, @intFromEnum(AggregationStatus.dirty)) << 24);
 
-        try self.nodes.append(.{
+        try self.nodes.append(self.allocator, .{
             .first_task = first_task,
             .task_count = task_count,
             .packed_flags = packed_flags,
             .output_hash = [_]u8{0} ** 16,
         });
+        // Roll the node (and any task mappings made so far) back if the
+        // mapping cannot be completed, so a failed add leaves no
+        // half-registered aggregation behind.
+        var mapped: u32 = 0;
+        errdefer {
+            self.nodes.shrinkRetainingCapacity(index);
+            var k: u32 = 0;
+            while (k < mapped) : (k += 1) _ = self.task_to_agg.remove(first_task + k);
+        }
 
         // Map each task to this aggregation
-        var i: u32 = 0;
-        while (i < task_count) : (i += 1) {
-            try self.task_to_agg.put(first_task + i, index);
+        while (mapped < task_count) : (mapped += 1) {
+            try self.task_to_agg.put(first_task + mapped, index);
         }
 
         return index;
@@ -2042,8 +2535,13 @@ pub const AggregationGraph = struct {
 
     /// Add a child aggregation edge (parent → child)
     pub fn addChild(self: *AggregationGraph, parent: u32, child: u32) !void {
-        try self.child_edges.append(parent);
-        try self.child_edges.append(child);
+        // Unknown indices used to be accepted and then indexed out of bounds
+        // by markDirtyRecursive/setStatus.
+        if (parent >= self.nodes.items.len or child >= self.nodes.items.len) return error.InvalidIndex;
+        // Reserve both slots first so the (parent, child) pair is atomic.
+        try self.child_edges.ensureUnusedCapacity(self.allocator, 2);
+        self.child_edges.appendAssumeCapacity(parent);
+        self.child_edges.appendAssumeCapacity(child);
     }
 
     /// Get the aggregation type
@@ -2075,13 +2573,45 @@ pub const AggregationGraph = struct {
     }
 
     /// Mark an aggregation and all its children as dirty
+    ///
+    /// Iterative with a visited set: the previous recursive version had no
+    /// cycle guard (a -> b -> a recursed until stack overflow) and could
+    /// recurse as deep as the graph.
     pub fn markDirtyRecursive(self: *AggregationGraph, index: u32) void {
-        self.setStatus(index, .dirty);
-        // Walk child edges
-        var i: usize = 0;
-        while (i + 1 < self.child_edges.items.len) : (i += 2) {
-            if (self.child_edges.items[i] == index) {
-                self.markDirtyRecursive(self.child_edges.items[i + 1]);
+        const n = self.nodes.items.len;
+        if (index >= n) return;
+        const scratch = std.heap.page_allocator;
+        const visited = scratch.alloc(bool, n) catch {
+            // Cannot track visits: still mark the root so the caller sees
+            // at least the requested node dirty.
+            self.setStatus(index, .dirty);
+            return;
+        };
+        defer scratch.free(visited);
+        @memset(visited, false);
+        const stack = scratch.alloc(u32, n) catch {
+            self.setStatus(index, .dirty);
+            return;
+        };
+        defer scratch.free(stack);
+
+        var sp: usize = 0;
+        stack[sp] = index;
+        sp += 1;
+        visited[index] = true;
+        while (sp > 0) {
+            sp -= 1;
+            const cur = stack[sp];
+            self.setStatus(cur, .dirty);
+            var i: usize = 0;
+            while (i + 1 < self.child_edges.items.len) : (i += 2) {
+                if (self.child_edges.items[i] != cur) continue;
+                const child = self.child_edges.items[i + 1];
+                if (child < n and !visited[child]) {
+                    visited[child] = true;
+                    stack[sp] = child; // sp < n: each node is pushed at most once
+                    sp += 1;
+                }
             }
         }
     }
@@ -2098,7 +2628,8 @@ pub const AggregationGraph = struct {
 };
 
 test "G3.3: AggregationGraph arena-allocated" {
-    var agg = AggregationGraph.init(std.testing.allocator);
+    var agg: AggregationGraph = undefined;
+    agg.init(std.testing.allocator);
     defer agg.deinit();
 
     // Add aggregations
@@ -2141,8 +2672,9 @@ test "G3.3: AggregationGraph arena-allocated" {
     try std.testing.expectEqualSlices(u8, &hash, &agg.getOutputHash(0));
 }
 
-test "G3.3: AggregationNode is 24 bytes" {
-    try std.testing.expectEqual(@as(usize, 24), @sizeOf(AggregationNode));
+test "G3.3: AggregationNode is 28 bytes" {
+    // 3×u32 (first_task, task_count, packed_flags) + [16]u8 output_hash.
+    try std.testing.expectEqual(@as(usize, 28), @sizeOf(AggregationNode));
 }
 
 // ─── G3.6: B+tree Layout for Aggregation Graph ─────────────────────────
@@ -2191,17 +2723,19 @@ pub const BPlusTreeAggregation = struct {
     nodes: std.ArrayList(BPlusTreeNode),
     /// Layer boundaries: layer_starts[i] is the start index of layer i.
     layer_starts: std.ArrayList(u32),
+    allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator) BPlusTreeAggregation {
         return .{
-            .nodes = std.ArrayList(BPlusTreeNode).init(allocator),
-            .layer_starts = std.ArrayList(u32).init(allocator),
+            .nodes = .empty,
+            .layer_starts = .empty,
+            .allocator = allocator,
         };
     }
 
     pub fn deinit(self: *BPlusTreeAggregation) void {
-        self.nodes.deinit();
-        self.layer_starts.deinit();
+        self.nodes.deinit(self.allocator);
+        self.layer_starts.deinit(self.allocator);
     }
 
     /// Build a B+tree from a flat list of task count per leaf.
@@ -2210,24 +2744,26 @@ pub const BPlusTreeAggregation = struct {
         self.layer_starts.clearRetainingCapacity();
 
         // Layer 0: leaves
-        try self.layer_starts.append(0);
+        try self.layer_starts.append(self.allocator, 0);
         for (leaf_counts) |count| {
             var node = BPlusTreeNode.init();
             node.is_leaf = true;
             node.total_tasks = count;
             node.child_count = 1;
             node.children[0] = @intCast(self.nodes.items.len);
-            try self.nodes.append(node);
+            try self.nodes.append(self.allocator, node);
         }
-        try self.layer_starts.append(@intCast(self.nodes.items.len));
+        try self.layer_starts.append(self.allocator, @intCast(self.nodes.items.len));
 
-        // Build internal layers until we have a single root
+        // Build internal layers until we have a single root. layer_starts
+        // holds layer BOUNDARIES: the last two entries delimit the newest
+        // layer. (The next layer's end used to be pushed BEFORE building it,
+        // so the loop saw an empty layer and stopped after one internal
+        // layer - more than 16 leaves never got a real root.)
         while (self.layer_starts.items[self.layer_starts.items.len - 1] - self.layer_starts.items[self.layer_starts.items.len - 2] > 1) {
             const layer_start = self.layer_starts.items[self.layer_starts.items.len - 2];
             const layer_end = self.layer_starts.items[self.layer_starts.items.len - 1];
             const layer_count = layer_end - layer_start;
-
-            try self.layer_starts.append(@intCast(self.nodes.items.len));
 
             var i: u32 = 0;
             while (i < layer_count) {
@@ -2237,12 +2773,13 @@ pub const BPlusTreeAggregation = struct {
                 while (j < 16 and i + @as(u32, j) < layer_count) : (j += 1) {
                     const child_idx = layer_start + i + @as(u32, j);
                     node.addChild(child_idx);
-                    node.total_tasks += self.nodes.items[child_idx].total_tasks;
-                    node.dirty_count += self.nodes.items[child_idx].dirty_count;
+                    node.total_tasks +|= self.nodes.items[child_idx].total_tasks;
+                    node.dirty_count +|= self.nodes.items[child_idx].dirty_count;
                 }
-                try self.nodes.append(node);
+                try self.nodes.append(self.allocator, node);
                 i += 16;
             }
+            try self.layer_starts.append(self.allocator, @intCast(self.nodes.items.len));
         }
     }
 
@@ -2261,9 +2798,30 @@ pub const BPlusTreeAggregation = struct {
     /// Mark a leaf as dirty and propagate up.
     pub fn markLeafDirty(self: *BPlusTreeAggregation, leaf_idx: u32) void {
         if (leaf_idx >= self.nodes.items.len) return;
+        if (leaf_idx >= self.layer_starts.items[1]) return; // not a leaf
         self.nodes.items[leaf_idx].dirty_count = 1;
-        // Propagate up through layers (simplified: just increment parents)
-        // In a real implementation, we'd track parent pointers
+        self.recomputeDirty();
+    }
+
+    /// Recompute every internal node's dirty count from its children,
+    /// bottom-up, so `totalDirty()` (the root) reflects leaf changes.
+    /// (markLeafDirty used to set only the leaf, leaving the root at 0.)
+    pub fn recomputeDirty(self: *BPlusTreeAggregation) void {
+        if (self.layer_starts.items.len < 3) return;
+        var layer: usize = 1;
+        while (layer + 1 < self.layer_starts.items.len) : (layer += 1) {
+            const start = self.layer_starts.items[layer];
+            const end = self.layer_starts.items[layer + 1];
+            var idx = start;
+            while (idx < end) : (idx += 1) {
+                const node = &self.nodes.items[idx];
+                var sum: u32 = 0;
+                for (node.children[0..node.child_count]) |c| {
+                    sum +|= self.nodes.items[c].dirty_count;
+                }
+                node.dirty_count = sum;
+            }
+        }
     }
 };
 
@@ -2442,42 +3000,53 @@ pub const CowAggregationGraph = struct {
     nodes: std.ArrayList(CowAggregationNode),
     /// Root version tracking.
     root_version: u32,
+    allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator) CowAggregationGraph {
         return .{
-            .nodes = std.ArrayList(CowAggregationNode).init(allocator),
+            .nodes = .empty,
             .root_version = 0,
+            .allocator = allocator,
         };
     }
 
     pub fn deinit(self: *CowAggregationGraph) void {
-        self.nodes.deinit();
+        self.nodes.deinit(self.allocator);
     }
 
     /// Add a root node.
     pub fn addRoot(self: *CowAggregationGraph) !u32 {
         const idx: u32 = @intCast(self.nodes.items.len);
-        try self.nodes.append(CowAggregationNode.init());
+        try self.nodes.append(self.allocator, CowAggregationNode.init());
         return idx;
     }
 
     /// Modify a node — creates a copy if shared (ref_count > 1).
     pub fn modifyNode(self: *CowAggregationGraph, idx: u32) !u32 {
         if (idx >= self.nodes.items.len) return error.InvalidIndex;
-        const node = &self.nodes.items[idx];
-        if (node.ref_count > 1) {
-            // Copy-on-write: create a new node and decrement ref of old
-            node.ref_count -= 1;
-            var new_node = node.*;
+        if (self.nodes.items[idx].ref_count > 1) {
+            // Copy-on-write: create a new node and decrement ref of old.
+            // Append FIRST: the old node's ref_count used to be decremented
+            // before the (fallible) append, so an OOM permanently lost a
+            // reference.
+            var new_node = self.nodes.items[idx];
             new_node.ref_count = 1;
             new_node.modified = true;
-            new_node.version += 1;
+            new_node.version +|= 1;
             const new_idx: u32 = @intCast(self.nodes.items.len);
-            try self.nodes.append(new_node);
+            try self.nodes.append(self.allocator, new_node);
+            // append may have reallocated: re-derive pointers from items.
+            self.nodes.items[idx].ref_count -= 1;
+            // The copy now shares its children with the original, so each
+            // child gains a reference.
+            for (self.nodes.items[new_idx].children[0..self.nodes.items[new_idx].child_count]) |c| {
+                if (c < self.nodes.items.len) self.nodes.items[c].ref_count +|= 1;
+            }
             return new_idx;
         }
+        const node = &self.nodes.items[idx];
         node.modified = true;
-        node.version += 1;
+        node.version +|= 1;
         return idx;
     }
 

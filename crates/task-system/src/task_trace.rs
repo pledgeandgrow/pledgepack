@@ -25,13 +25,17 @@ static GLOBAL_TRACE: Mutex<Option<SchedulerTrace>> = Mutex::new(None);
 
 /// Begin a trace session. All subsequent task calls will be recorded.
 pub fn begin_session() {
-    let mut trace = GLOBAL_TRACE.lock().unwrap();
+    let mut trace = GLOBAL_TRACE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     *trace = Some(SchedulerTrace::new());
 }
 
 /// End the trace session and return the Chrome Trace JSON.
 pub fn end_session() -> String {
-    let mut trace = GLOBAL_TRACE.lock().unwrap();
+    let mut trace = GLOBAL_TRACE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(t) = trace.take() {
         t.to_json()
     } else {
@@ -41,7 +45,9 @@ pub fn end_session() -> String {
 
 /// Record the start of a task computation.
 pub fn trace_begin(name: &str) {
-    let mut trace = GLOBAL_TRACE.lock().unwrap();
+    let mut trace = GLOBAL_TRACE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(t) = trace.as_mut() {
         t.begin(name, 0, 0);
     }
@@ -49,7 +55,9 @@ pub fn trace_begin(name: &str) {
 
 /// Record the end of a task computation.
 pub fn trace_end(name: &str) {
-    let mut trace = GLOBAL_TRACE.lock().unwrap();
+    let mut trace = GLOBAL_TRACE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(t) = trace.as_mut() {
         t.end(name, 0, 0);
     }
@@ -57,7 +65,9 @@ pub fn trace_end(name: &str) {
 
 /// Record a complete event with a known duration.
 pub fn trace_complete(name: &str, dur_micros: u64) {
-    let mut trace = GLOBAL_TRACE.lock().unwrap();
+    let mut trace = GLOBAL_TRACE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(t) = trace.as_mut() {
         t.complete(name, 0, 0, dur_micros, None);
     }
@@ -65,7 +75,10 @@ pub fn trace_complete(name: &str, dur_micros: u64) {
 
 /// Check if a trace session is active.
 pub fn is_tracing() -> bool {
-    GLOBAL_TRACE.lock().unwrap().is_some()
+    GLOBAL_TRACE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .is_some()
 }
 
 #[cfg(test)]

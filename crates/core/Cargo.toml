@@ -23,6 +23,8 @@ hex = { workspace = true }
 # previously a non-empty-string check with the real check commented out.
 # See PRODUCTION-READINESS-100.md goal 11.
 ed25519-dalek = { workspace = true }
+# Constant-time comparison of public keys / hashes in plugin signing.
+subtle = { workspace = true }
 # CSPRNG for a genuinely unguessable build-time obfuscation key (was derived
 # from SystemTime::now(), see PRODUCTION-READINESS-100.md goal 15). Pinned to
 # "0.8" to match crates/cache's existing pin rather than adding a 4th locked
@@ -46,6 +48,10 @@ image = { workspace = true }
 
 # Cache (function-level incremental cache with disk persistence)
 pledgepack-cache = { path = "../cache" }
+
+# Task-graph engine backing task_transform.rs (also used by wasm-plugin-host
+# via pledgepack_core::task_transform::PluginTransformResult)
+pledgepack-task-system = { workspace = true }
 
 # FFI to Zig native library
 pledgepack-native-sys = { path = "../../native-sys" }
@@ -77,7 +83,7 @@ notify-debouncer-full = { workspace = true }
 notify = { workspace = true }
 
 # YAML parsing
-noyalib = { workspace = true }
+serde-saphyr = { workspace = true }
 
 # Source-context error diagnostics
 miette = { workspace = true }

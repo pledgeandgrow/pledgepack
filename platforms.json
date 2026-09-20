@@ -1,5 +1,6 @@
 {
-  "$comment": "Single source of truth for every platform PledgePack ships a prebuilt binary for. release.yml's build matrix, bin/postinstall.js's PLATFORM_MAP, and scripts/check-platform-lists.js all derive from (or are checked against) this file, so the three can no longer silently drift the way they did before — see PRODUCTION-READINESS-100.md goals 8-9. Add a platform here first, then update release.yml's matrix to match.",
+  "version": "1.0.0-rc.1",
+  "$comment": "Single source of truth for every platform PledgePack ships a prebuilt binary for. release.yml's build matrix, bin/postinstall.js's PLATFORM_MAP, and scripts/check-platform-lists.js all derive from (or are checked against) this file, so the three can no longer silently drift the way they did before — see PRODUCTION-READINESS-100.md goals 8-9. The top-level version field must equal package.json / Cargo.toml (scripts/check-versions.sh enforces it). Add a platform here first, then update release.yml's matrix to match.",
   "platforms": [
     {
       "npmPlatform": "linux",

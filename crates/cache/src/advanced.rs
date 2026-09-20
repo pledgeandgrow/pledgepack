@@ -294,11 +294,15 @@ impl DedupCache {
         }
 
         // Update mappings
-        if let Some(old_hash) = self
+        let previous = self
             .key_to_content
-            .insert(key.to_string(), content_hash.clone())
-        {
-            // Key existed before, decrement old ref count
+            .insert(key.to_string(), content_hash.clone());
+        // Re-storing the same key with identical content must neither release
+        // nor double-count the reference it already holds (releasing it would
+        // delete the file that was just kept).
+        let unchanged = previous.as_ref() == Some(&content_hash);
+        if let Some(old_hash) = previous.filter(|h| *h != content_hash) {
+            // Key pointed at different content before, decrement old ref count
             if let Some(count) = self.ref_counts.get_mut(&old_hash) {
                 *count = count.saturating_sub(1);
                 if *count == 0 {
@@ -311,7 +315,9 @@ impl DedupCache {
             }
         }
 
-        *self.ref_counts.entry(content_hash).or_insert(0) += 1;
+        if !unchanged {
+            *self.ref_counts.entry(content_hash).or_insert(0) += 1;
+        }
         Ok(())
     }
 
@@ -408,7 +414,7 @@ pub fn decompress_cache_entry(compressed: &[u8]) -> Result<Vec<u8>> {
 
 // ─── G9.13: Cache signing with ed25519 ───────────────────────────────
 
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
 
 /// G9.13: A signed cache entry
@@ -459,21 +465,36 @@ pub fn sign_cache_entry(data: &[u8], signing_key: &SigningKey) -> SignedCacheEnt
     }
 }
 
-/// G9.13: Verify a signed cache entry
-pub fn verify_cache_entry(entry: &SignedCacheEntry) -> Result<bool> {
-    let public_key = VerifyingKey::from_bytes(
-        entry
-            .public_key
-            .as_slice()
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("Invalid public key length"))?,
-    )
-    .map_err(|e| anyhow::anyhow!("Invalid public key: {}", e))?;
+/// Constant-time byte-slice equality (length is not treated as secret).
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
 
+/// G9.13: Verify a signed cache entry against a set of **trusted** keys.
+///
+/// The `public_key` embedded in the entry is only used to select which
+/// trusted key to verify with — it is never trusted by itself (an attacker
+/// can forge an entry signed with their own key and embed that key). Returns
+/// `Ok(true)` only if the embedded key matches one of `trusted_keys`
+/// (constant-time comparison) *and* the signature over `entry.data` verifies
+/// (strict Ed25519 verification) under that trusted key. An empty
+/// `trusted_keys` set never verifies.
+pub fn verify_cache_entry(entry: &SignedCacheEntry, trusted_keys: &[VerifyingKey]) -> Result<bool> {
     let signature = Signature::from_slice(&entry.signature)
         .map_err(|e| anyhow::anyhow!("Invalid signature: {}", e))?;
 
-    Ok(public_key.verify(&entry.data, &signature).is_ok())
+    let mut verified = false;
+    // No early exit: touch every trusted key so timing doesn't reveal which
+    // one (if any) matched.
+    for key in trusted_keys {
+        let key_matches = ct_eq(key.as_bytes(), &entry.public_key);
+        let sig_ok = key.verify_strict(&entry.data, &signature).is_ok();
+        verified |= key_matches & sig_ok;
+    }
+    Ok(verified)
 }
 
 // ─── G9.14: Air-gapped cache sync ────────────────────────────────────
@@ -499,9 +520,9 @@ pub fn export_cache(cache_dir: &Path, output_path: &Path) -> Result<ExportStats>
 
             // Simple format: [filename_len:u32][filename][data_len:u32][data]
             let fname_bytes = filename.as_bytes();
-            archive_data.extend_from_slice(&(fname_bytes.len() as u32).to_le_bytes());
+            archive_data.extend_from_slice(&u32::try_from(fname_bytes.len())?.to_le_bytes());
             archive_data.extend_from_slice(fname_bytes);
-            archive_data.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            archive_data.extend_from_slice(&u32::try_from(data.len())?.to_le_bytes());
             archive_data.extend_from_slice(&data);
 
             stats.files += 1;
@@ -568,6 +589,17 @@ pub fn import_cache(input_path: &Path, cache_dir: &Path) -> Result<ImportStats> 
         let data = &archive_data[offset..offset + data_len];
         offset += data_len;
 
+        // Archive names are untrusted: accept only a single plain file name so
+        // an entry like "../../x" or "C:\x" cannot write outside cache_dir.
+        let mut comps = Path::new(&filename).components();
+        let safe = matches!(
+            (comps.next(), comps.next()),
+            (Some(std::path::Component::Normal(_)), None)
+        ) && !filename.contains(['/', '\\', ':']);
+        if !safe {
+            warn!("Skipping unsafe cache archive entry name: {:?}", filename);
+            continue;
+        }
         let dest = cache_dir.join(&filename);
         std::fs::write(&dest, data)?;
 
@@ -843,6 +875,45 @@ mod tests {
     }
 
     #[test]
+    fn dedup_restoring_same_key_and_content_keeps_data() {
+        let dir = std::env::temp_dir().join(format!("pledgepack_dedup_rs_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut dedup = DedupCache::new();
+        let data = vec![7u8; 64];
+        dedup.store("k", &data, &dir).unwrap();
+        dedup.store("k", &data, &dir).unwrap();
+        assert_eq!(dedup.get("k").unwrap(), Some(data));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn import_cache_rejects_path_traversal_entries() {
+        let base =
+            std::env::temp_dir().join(format!("pledgepack_import_zs_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let cache_dir = base.join("cache");
+        std::fs::create_dir_all(&base).unwrap();
+        let mut raw = Vec::new();
+        for (name, body) in [("../escaped.txt", b"evil".as_slice()), ("ok", b"fine")] {
+            raw.extend_from_slice(&(name.len() as u32).to_le_bytes());
+            raw.extend_from_slice(name.as_bytes());
+            raw.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            raw.extend_from_slice(body);
+        }
+        let archive = base.join("a.zst");
+        std::fs::write(&archive, zstd::stream::encode_all(&raw[..], 3).unwrap()).unwrap();
+        let stats = import_cache(&archive, &cache_dir).unwrap();
+        assert!(
+            !base.join("escaped.txt").exists(),
+            "wrote outside cache_dir"
+        );
+        assert_eq!(stats.files, 1);
+        assert!(cache_dir.join("ok").exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn test_g912_compress_decompress() {
         let data =
             b"Hello, World! This is a test cache entry that should compress well. ".repeat(10);
@@ -855,21 +926,45 @@ mod tests {
 
     #[test]
     fn test_g913_sign_verify() {
-        let (signing_key, _) = generate_signing_keypair();
+        let (signing_key, verifying_key) = generate_signing_keypair();
         let data = b"test cache entry data";
 
         let signed = sign_cache_entry(data, &signing_key);
-        assert!(verify_cache_entry(&signed).unwrap());
+        assert!(verify_cache_entry(&signed, &[verifying_key]).unwrap());
     }
 
     #[test]
     fn test_g913_reject_tampered() {
-        let (signing_key, _) = generate_signing_keypair();
+        let (signing_key, verifying_key) = generate_signing_keypair();
         let data = b"test cache entry data";
 
         let mut signed = sign_cache_entry(data, &signing_key);
         signed.data[0] ^= 1; // Tamper
-        assert!(!verify_cache_entry(&signed).unwrap());
+        assert!(!verify_cache_entry(&signed, &[verifying_key]).unwrap());
+    }
+
+    #[test]
+    fn test_g913_reject_self_signed_by_untrusted_key() {
+        // An attacker signs a forged entry with their own key and embeds
+        // that key in the entry. It must NOT verify against the real key set
+        // (the old API trusted the embedded key and returned true).
+        let (_, trusted) = generate_signing_keypair();
+        let (attacker_sk, _) = generate_signing_keypair();
+        let forged = sign_cache_entry(b"malicious payload", &attacker_sk);
+        assert!(!verify_cache_entry(&forged, &[trusted]).unwrap());
+        // no trusted keys at all -> never verifies
+        assert!(!verify_cache_entry(&forged, &[]).unwrap());
+    }
+
+    #[test]
+    fn test_g913_reject_key_swap() {
+        // Valid signature under the attacker's key, but the entry claims the
+        // trusted key: signature check under the trusted key fails.
+        let (_, trusted) = generate_signing_keypair();
+        let (attacker_sk, _) = generate_signing_keypair();
+        let mut forged = sign_cache_entry(b"payload", &attacker_sk);
+        forged.public_key = trusted.to_bytes().to_vec();
+        assert!(!verify_cache_entry(&forged, &[trusted]).unwrap());
     }
 
     #[test]

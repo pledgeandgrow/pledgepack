@@ -1,178 +1,75 @@
 // Zig-backed task dependency graph.
 //
-// This module provides a `ZigTaskGraph` that wraps the Zig arena-allocated
-// `TaskGraph` (native-sys/zig/graph.zig) and exposes the same interface as
-// `DependencyGraph`. The Zig arena provides:
+// `ZigTaskGraph` wraps the Zig arena-allocated `TaskGraph`
+// (native-sys/zig/graph.zig) and implements `TaskGraphOps`, making it a
+// drop-in backend for `TaskEngine`'s dependency graph. The Zig arena
+// provides:
 //
-//   • 0 bytes overhead per node (vs 48+ bytes for DashMap + HashSet)
-//   • O(1) allocation (bump pointer)
-//   • O(1) cleanup (free arena pages)
-//   • 3x faster traversal (CPU cache locality — contiguous memory)
+//   • 24-byte nodes (vs ~48+B + HashSet overhead per DashMap entry)
+//   • Flat u32 edge arrays — traversal is sequential memory access
+//   • O(1) bump-pointer allocation; one arena free tears down everything
+//   • Single-FFI-call dirty propagation (`pledge_task_graph_mark_dirty`
+//     does BFS + status writes inside Zig, no per-node round trips)
+//   • Flat status scans (`ids_by_status`) — one pass over contiguous nodes
 //
-// The Zig graph stores nodes in a contiguous array with flat edge arrays,
-// while the Rust `DependencyGraph` uses DashMap<TaskId, HashSet<TaskId>>.
-// For large graphs (10k+ tasks), the Zig graph is significantly more
-// memory-efficient and faster for traversal.
-//
-// This is an optional backend — `DependencyGraph` remains the default for
-// compatibility. `ZigTaskGraph` can be used as a drop-in replacement when
-// the `zig-graph` feature is enabled.
+// The Zig side has no internal locking, so this wrapper serializes all
+// access through a `Mutex`. Reads that would benefit from lock-free access
+// still take the lock — correctness over speculation; the lock is
+// uncontended in the common single-build-thread case and cheap when
+// contended because critical sections are nanoseconds.
 
+use crate::graph::{TaskGraphOps, TaskStatus};
 use crate::task::TaskId;
-use pledgepack_native_sys::TaskGraph as ZigTaskGraphHandle;
+use pledgepack_native_sys::TaskGraph as ZigHandle;
 use std::collections::HashSet;
-use tracing::debug;
+use std::sync::Mutex;
 
-/// The status of a task in the Zig graph.
-///
-/// Mirrors `crate::graph::TaskStatus` but as a u8 for the C ABI.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[repr(u8)]
-pub enum ZigTaskStatus {
-    Clean = 0,
-    Dirty = 1,
-    Computing = 2,
-    Error = 3,
-    Pending = 4,
+/// Zig TaskStatus values (must match `TaskStatus` in native-sys/zig/graph.zig).
+mod status {
+    pub const CLEAN: u8 = 0;
+    pub const DIRTY: u8 = 1;
+    pub const COMPUTING: u8 = 2;
+    pub const ERROR: u8 = 3;
+    pub const PENDING: u8 = 4;
+    // 5 = evicted (no Rust counterpart; mapped to Pending on read)
 }
 
-impl From<crate::graph::TaskStatus> for ZigTaskStatus {
-    fn from(s: crate::graph::TaskStatus) -> Self {
-        match s {
-            crate::graph::TaskStatus::Clean => ZigTaskStatus::Clean,
-            crate::graph::TaskStatus::Dirty => ZigTaskStatus::Dirty,
-            crate::graph::TaskStatus::Computing => ZigTaskStatus::Computing,
-            crate::graph::TaskStatus::Error => ZigTaskStatus::Error,
-            crate::graph::TaskStatus::Pending => ZigTaskStatus::Pending,
-        }
+fn to_zig(status: TaskStatus) -> u8 {
+    match status {
+        TaskStatus::Clean => status::CLEAN,
+        TaskStatus::Dirty => status::DIRTY,
+        TaskStatus::Computing => status::COMPUTING,
+        TaskStatus::Error => status::ERROR,
+        TaskStatus::Pending => status::PENDING,
     }
 }
 
-impl From<ZigTaskStatus> for crate::graph::TaskStatus {
-    fn from(s: ZigTaskStatus) -> Self {
-        match s {
-            ZigTaskStatus::Clean => crate::graph::TaskStatus::Clean,
-            ZigTaskStatus::Dirty => crate::graph::TaskStatus::Dirty,
-            ZigTaskStatus::Computing => crate::graph::TaskStatus::Computing,
-            ZigTaskStatus::Error => crate::graph::TaskStatus::Error,
-            ZigTaskStatus::Pending => crate::graph::TaskStatus::Pending,
-        }
+fn from_zig(raw: u8) -> TaskStatus {
+    match raw {
+        status::CLEAN => TaskStatus::Clean,
+        status::DIRTY => TaskStatus::Dirty,
+        status::COMPUTING => TaskStatus::Computing,
+        status::ERROR => TaskStatus::Error,
+        _ => TaskStatus::Pending,
     }
 }
 
-/// A Zig-backed task dependency graph.
-///
-/// Wraps `pledgepack_native_sys::TaskGraph` (which wraps the Zig
-/// `TaskGraph` struct). Provides the same interface as `DependencyGraph`
-/// but with arena-allocated storage for 0B/node overhead.
-///
-/// # Thread Safety
-///
-/// The Zig graph is `Send + Sync` (the underlying handle is an opaque
-/// pointer). However, concurrent mutations are NOT safe — the Zig graph
-/// does not use locks. For concurrent access, wrap in a `Mutex` or use
-/// the `DependencyGraph` (which uses DashMap).
-///
-/// # Performance
-///
-/// For graphs with 10k+ tasks, the Zig graph uses ~10x less memory and
-/// is ~3x faster for traversal due to cache locality. For small graphs
-/// (<1k tasks), the difference is negligible.
+/// A Zig arena-backed task dependency graph — the default `TaskGraphOps`
+/// backend when the `zig-graph` feature is enabled.
 pub struct ZigTaskGraph {
-    handle: ZigTaskGraphHandle,
+    inner: Mutex<ZigHandle>,
 }
 
 impl ZigTaskGraph {
-    /// Create a new Zig-backed task graph.
+    /// Create an empty Zig-backed task graph.
     pub fn new() -> Self {
         Self {
-            handle: ZigTaskGraphHandle::new(),
+            inner: Mutex::new(ZigHandle::new()),
         }
     }
 
-    /// Add a task to the graph. If it already exists, this is a no-op.
-    pub fn add_task(&self, id: TaskId) {
-        self.handle.add_task(id.as_bytes());
-    }
-
-    /// Add a dependency edge: `parent` depends on `child`.
-    pub fn add_edge(&self, parent: TaskId, child: TaskId) {
-        self.add_task(parent);
-        self.add_task(child);
-        self.handle
-            .add_dependency(parent.as_bytes(), child.as_bytes());
-    }
-
-    /// Add multiple dependency edges at once.
-    pub fn add_edges(&self, parent: TaskId, children: &[TaskId]) {
-        self.add_task(parent);
-        for &child in children {
-            self.add_edge(parent, child);
-        }
-    }
-
-    /// Get all tasks that depend on `task` (direct dependents).
-    pub fn dependents(&self, task: &TaskId) -> HashSet<TaskId> {
-        let ids = self.handle.get_dependents(task.as_bytes(), 1024);
-        ids.into_iter().map(TaskId::from_bytes).collect()
-    }
-
-    /// Get all tasks that `task` depends on (direct dependencies).
-    pub fn dependencies(&self, task: &TaskId) -> HashSet<TaskId> {
-        let ids = self.handle.get_dependencies(task.as_bytes(), 1024);
-        ids.into_iter().map(TaskId::from_bytes).collect()
-    }
-
-    /// Set the status of a task.
-    pub fn set_status(&self, id: TaskId, status: crate::graph::TaskStatus) {
-        self.handle
-            .set_status(id.as_bytes(), ZigTaskStatus::from(status) as u8);
-    }
-
-    /// Get the status of a task.
-    pub fn status(&self, id: &TaskId) -> crate::graph::TaskStatus {
-        let raw = self.handle.get_status(id.as_bytes());
-        match raw {
-            0 => crate::graph::TaskStatus::Clean,
-            1 => crate::graph::TaskStatus::Dirty,
-            2 => crate::graph::TaskStatus::Computing,
-            3 => crate::graph::TaskStatus::Error,
-            _ => crate::graph::TaskStatus::Pending,
-        }
-    }
-
-    /// Get the number of tasks in the graph.
-    pub fn task_count(&self) -> usize {
-        self.handle.task_count()
-    }
-
-    /// Get the invalidation set for a task — all tasks that need to be
-    /// invalidated when the given task changes. This is a BFS through
-    /// the reverse dependency graph.
-    pub fn invalidation_set(&self, id: &TaskId) -> HashSet<TaskId> {
-        // Use a large buffer; the Zig side will fill up to this capacity.
-        // TODO: Query required size from Zig side for dynamic allocation.
-        const MAX_INVALIDATION: usize = 65536;
-        let ids = self
-            .handle
-            .get_invalidation_set(id.as_bytes(), MAX_INVALIDATION);
-        ids.into_iter().map(TaskId::from_bytes).collect()
-    }
-
-    /// Mark a task and all its dependents as dirty.
-    ///
-    /// This is the invalidation propagation: when a task's output changes,
-    /// all tasks that depend on it (transitively) need to be recomputed.
-    pub fn mark_dirty(&self, id: TaskId) {
-        let invalidation_set = self.invalidation_set(&id);
-        for tid in invalidation_set {
-            self.set_status(tid, crate::graph::TaskStatus::Dirty);
-        }
-    }
-
-    /// Get the raw handle (for advanced use).
-    pub fn handle(&self) -> &ZigTaskGraphHandle {
-        &self.handle
+    fn lock(&self) -> std::sync::MutexGuard<'_, ZigHandle> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -182,10 +79,97 @@ impl Default for ZigTaskGraph {
     }
 }
 
+impl TaskGraphOps for ZigTaskGraph {
+    fn add_edge(&self, parent: TaskId, child: TaskId) {
+        self.lock().add_edge(parent.as_bytes(), child.as_bytes());
+    }
+
+    fn add_edges(&self, parent: TaskId, children: &[TaskId]) {
+        let g = self.lock();
+        for child in children {
+            g.add_edge(parent.as_bytes(), child.as_bytes());
+        }
+    }
+
+    fn dependents(&self, task: &TaskId) -> HashSet<TaskId> {
+        self.lock()
+            .dependents(task.as_bytes())
+            .into_iter()
+            .map(TaskId::from_bytes)
+            .collect()
+    }
+
+    fn dependencies(&self, task: &TaskId) -> HashSet<TaskId> {
+        self.lock()
+            .dependencies(task.as_bytes())
+            .into_iter()
+            .map(TaskId::from_bytes)
+            .collect()
+    }
+
+    fn status(&self, task: &TaskId) -> TaskStatus {
+        from_zig(self.lock().status(task.as_bytes()))
+    }
+
+    fn set_status(&self, task: TaskId, status: TaskStatus) {
+        let g = self.lock();
+        g.add_task(task.as_bytes());
+        g.set_status(task.as_bytes(), to_zig(status));
+    }
+
+    fn mark_dirty(&self, task: TaskId) -> HashSet<TaskId> {
+        let g = self.lock();
+        // The Rust backend marks a task dirty even when it has no graph
+        // node yet (e.g. invalidated before first compute) — materialize
+        // the node first so dirty_tasks() reports it identically.
+        g.add_task(task.as_bytes());
+        g.mark_dirty(task.as_bytes())
+            .into_iter()
+            .map(TaskId::from_bytes)
+            .collect()
+    }
+
+    fn mark_clean(&self, task: TaskId) {
+        self.set_status(task, TaskStatus::Clean);
+    }
+
+    fn dirty_tasks(&self) -> Vec<TaskId> {
+        self.lock()
+            .ids_by_status(status::DIRTY)
+            .into_iter()
+            .map(TaskId::from_bytes)
+            .collect()
+    }
+
+    fn clean_tasks(&self) -> Vec<TaskId> {
+        self.lock()
+            .ids_by_status(status::CLEAN)
+            .into_iter()
+            .map(TaskId::from_bytes)
+            .collect()
+    }
+
+    fn all_tasks(&self) -> Vec<TaskId> {
+        self.lock()
+            .all_ids()
+            .into_iter()
+            .map(TaskId::from_bytes)
+            .collect()
+    }
+
+    fn clear(&self) {
+        self.lock().clear();
+    }
+
+    fn len(&self) -> usize {
+        self.lock().task_count()
+    }
+}
+
 impl std::fmt::Debug for ZigTaskGraph {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ZigTaskGraph")
-            .field("task_count", &self.task_count())
+            .field("task_count", &self.len())
             .finish()
     }
 }
@@ -205,42 +189,11 @@ mod tests {
         graph.add_edge(a, b);
         graph.add_edge(b, c);
 
-        assert_eq!(graph.task_count(), 3);
+        assert_eq!(graph.len(), 3);
         assert!(graph.dependencies(&a).contains(&b));
         assert!(graph.dependencies(&b).contains(&c));
         assert!(graph.dependents(&c).contains(&b));
         assert!(graph.dependents(&b).contains(&a));
-    }
-
-    #[test]
-    fn zig_graph_invalidation_set() {
-        let graph = ZigTaskGraph::new();
-        let a = TaskId::compute("test", b"a");
-        let b = TaskId::compute("test", b"b");
-        let c = TaskId::compute("test", b"c");
-
-        // a → b → c
-        graph.add_edge(a, b);
-        graph.add_edge(b, c);
-
-        // When c changes, both b and a should be invalidated
-        let invalid = graph.invalidation_set(&c);
-        assert!(invalid.contains(&c));
-        assert!(invalid.contains(&b));
-        assert!(invalid.contains(&a));
-    }
-
-    #[test]
-    fn zig_graph_status() {
-        let graph = ZigTaskGraph::new();
-        let a = TaskId::compute("test", b"a");
-        graph.add_task(a);
-
-        graph.set_status(a, crate::graph::TaskStatus::Dirty);
-        assert_eq!(graph.status(&a), crate::graph::TaskStatus::Dirty);
-
-        graph.set_status(a, crate::graph::TaskStatus::Clean);
-        assert_eq!(graph.status(&a), crate::graph::TaskStatus::Clean);
     }
 
     #[test]
@@ -250,20 +203,78 @@ mod tests {
         let b = TaskId::compute("test", b"b");
         let c = TaskId::compute("test", b"c");
 
-        // a → b → c
         graph.add_edge(a, b);
         graph.add_edge(b, c);
+        for t in [a, b, c] {
+            graph.set_status(t, TaskStatus::Clean);
+        }
 
-        // Initially all pending
-        graph.set_status(a, crate::graph::TaskStatus::Clean);
-        graph.set_status(b, crate::graph::TaskStatus::Clean);
-        graph.set_status(c, crate::graph::TaskStatus::Clean);
+        // Mark c dirty — one FFI call must dirty c, b, and a.
+        let dirtied = graph.mark_dirty(c);
+        assert_eq!(dirtied.len(), 3);
+        for t in [a, b, c] {
+            assert_eq!(graph.status(&t), TaskStatus::Dirty);
+        }
+        assert_eq!(graph.dirty_tasks().len(), 3);
+    }
 
-        // Mark c dirty — should propagate to b and a
-        graph.mark_dirty(c);
+    #[test]
+    fn zig_graph_status_scans_and_clear() {
+        let graph = ZigTaskGraph::new();
+        let a = TaskId::compute("test", b"a");
+        let b = TaskId::compute("test", b"b");
+        graph.add_edge(a, b);
+        graph.set_status(a, TaskStatus::Clean);
+        graph.set_status(b, TaskStatus::Dirty);
 
-        assert_eq!(graph.status(&c), crate::graph::TaskStatus::Dirty);
-        assert_eq!(graph.status(&b), crate::graph::TaskStatus::Dirty);
-        assert_eq!(graph.status(&a), crate::graph::TaskStatus::Dirty);
+        assert_eq!(graph.clean_tasks(), vec![a]);
+        assert_eq!(graph.dirty_tasks(), vec![b]);
+        assert_eq!(graph.all_tasks().len(), 2);
+
+        graph.clear();
+        assert_eq!(graph.len(), 0);
+        assert!(graph.all_tasks().is_empty());
+    }
+
+    /// Parity check: identical op sequences on the Rust DashMap backend and
+    /// the Zig backend must yield identical observable state.
+    #[test]
+    fn zig_graph_parity_with_rust_backend() {
+        let rust = crate::graph::DependencyGraph::new();
+        let zig = ZigTaskGraph::new();
+
+        let ids: Vec<TaskId> = (0..64u32)
+            .map(|i| TaskId::compute("parity", &i.to_le_bytes()))
+            .collect();
+
+        // Chain + fan-in edges: i depends on i-1; every 8th also on i-2, i-3.
+        for i in 1..ids.len() {
+            rust.add_edge(ids[i], ids[i - 1]);
+            zig.add_edge(ids[i], ids[i - 1]);
+            if i % 8 == 0 {
+                rust.add_edges(ids[i], &[ids[i - 2], ids[i - 3]]);
+                zig.add_edges(ids[i], &[ids[i - 2], ids[i - 3]]);
+            }
+        }
+        for &id in &ids {
+            rust.set_status(id, TaskStatus::Clean);
+            zig.set_status(id, TaskStatus::Clean);
+        }
+
+        assert_eq!(rust.len(), zig.len());
+        for &id in &ids {
+            assert_eq!(rust.dependencies(&id), zig.dependencies(&id));
+            assert_eq!(rust.dependents(&id), zig.dependents(&id));
+        }
+
+        let rust_dirty = rust.mark_dirty(ids[20]);
+        let zig_dirty = zig.mark_dirty(ids[20]);
+        assert_eq!(rust_dirty, zig_dirty);
+
+        let mut rust_list = rust.dirty_tasks();
+        let mut zig_list = zig.dirty_tasks();
+        rust_list.sort();
+        zig_list.sort();
+        assert_eq!(rust_list, zig_list);
     }
 }

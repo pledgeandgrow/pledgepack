@@ -23,11 +23,16 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{RwLock, mpsc};
-use tracing::info;
+use tracing::{info, warn};
 
+pub use plugin_hooks::PluginHookService;
+
+mod fs_guard;
 mod hmr_diff;
 mod lazy_pipeline;
 mod middleware;
+mod origin_guard;
+mod plugin_hooks;
 mod shell_generator;
 mod watcher;
 
@@ -236,6 +241,11 @@ pub struct DevServerState {
     pub middleware_chain: RwLock<Vec<middleware::MiddlewareFn>>,
     /// Multi-entry HTML files: entry name → HTML content
     pub entries: RwLock<Vec<EntryConfig>>,
+    /// Per-module plugin hooks (`resolveId` for `/@id/` virtual modules,
+    /// `load`, chained `transform`) driven through the same
+    /// [`pledgepack_core::plugin_hooks::PluginHooks`] trait as production
+    /// builds. `None` when no plugin defines any of those hooks.
+    pub plugin_hooks: Option<Arc<PluginHookService>>,
 }
 
 /// Configuration for a multi-entry dev server
@@ -310,18 +320,33 @@ fn ensure_crypto_provider() {
 
 /// Build the dev server router as a standalone app (for testing and embedding).
 /// Returns a `Router` with all core routes and state configured.
+///
+/// # Panics
+/// Panics if `dev_server.middleware` contains an entry that cannot be
+/// executed; use [`try_create_app`] for the non-panicking variant.
 pub fn create_app(config: PledgeConfig) -> Router {
+    try_create_app(config).expect("invalid dev_server.middleware configuration")
+}
+
+/// Like [`create_app`], but returns an error instead of panicking when
+/// `dev_server.middleware` contains an unsupported entry.
+pub fn try_create_app(config: PledgeConfig) -> Result<Router> {
+    try_create_app_with_plugin_hooks(config, None)
+}
+
+/// [`try_create_app`] with per-module plugin hooks attached (see
+/// [`DevServerState::plugin_hooks`] and [`PluginHookService::spawn`]).
+pub fn try_create_app_with_plugin_hooks(
+    config: PledgeConfig,
+    plugin_hooks: Option<Arc<PluginHookService>>,
+) -> Result<Router> {
     let (hmr_tx, _hmr_rx) = mpsc::unbounded_channel::<HmrUpdate>();
 
     let engine = BuildEngine::new(Arc::new(config.clone()));
 
-    // Build middleware chain from config
-    let middleware_fns: Vec<middleware::MiddlewareFn> = config
-        .dev_server
-        .middleware
-        .iter()
-        .filter_map(|src| middleware::MiddlewareFn::from_source(src))
-        .collect();
+    // Unsupported middleware entries are an error, never silently dropped.
+    let middleware_fns = middleware::build_chain(&config.dev_server.middleware)?;
+    let extra_headers = middleware::response_headers(&middleware_fns);
 
     let entries = detect_entries(&config);
 
@@ -336,9 +361,10 @@ pub fn create_app(config: PledgeConfig) -> Router {
         import_patterns: RwLock::new(std::collections::HashMap::new()),
         middleware_chain: RwLock::new(middleware_fns),
         entries: RwLock::new(entries),
+        plugin_hooks,
     });
 
-    Router::new()
+    let app = Router::new()
         .route("/", get(index_handler))
         .route("/__pledge_hmr", get(hmr_websocket_handler))
         .route("/__pledge_error", get(error_overlay_handler))
@@ -349,7 +375,46 @@ pub fn create_app(config: PledgeConfig) -> Router {
         .route("/@id/{*path}", get(virtual_id_handler))
         .route("/__pledge_public/{*path}", get(public_dir_handler))
         .route("/{*path}", get(app_route_handler))
-        .with_state(state)
+        .with_state(state);
+    let app = apply_response_headers(app, extra_headers);
+    Ok(apply_origin_guard(app, &config))
+}
+
+/// Attach the response headers configured via `dev_server.middleware`
+/// (`headers` entries) to every response.
+fn apply_response_headers(app: Router, headers: Vec<(HeaderName, HeaderValue)>) -> Router {
+    if headers.is_empty() {
+        return app;
+    }
+    let headers = Arc::new(headers);
+    app.layer(axum::middleware::from_fn(
+        move |req, next: axum::middleware::Next| {
+            let headers = headers.clone();
+            async move {
+                let mut resp = next.run(req).await;
+                for (k, v) in headers.iter() {
+                    resp.headers_mut().insert(k.clone(), v.clone());
+                }
+                resp
+            }
+        },
+    ))
+}
+
+/// Origin/Host validation (cross-site WebSocket hijacking and DNS-rebinding
+/// protection) for every route — see `origin_guard.rs`.
+fn apply_origin_guard(app: Router, config: &PledgeConfig) -> Router {
+    let policy = Arc::new(origin_guard::OriginPolicy::new(
+        &config.dev_server.host,
+        matches!(
+            config.dev_server.cors,
+            pledgepack_core::config::DevServerCors::Any
+        ),
+    ));
+    app.layer(axum::middleware::from_fn(move |req, next| {
+        let policy = policy.clone();
+        async move { origin_guard::enforce(policy, req, next).await }
+    }))
 }
 
 /// Start the dev server and run until shutdown (Ctrl+C).
@@ -410,18 +475,26 @@ pub async fn serve(engine: BuildEngine, config: &PledgeConfig) -> Result<()> {
         let watch_root = config.root.clone();
         let tx = hmr_tx.clone();
         let server_entry = config.server_entry.clone();
-        tokio::spawn(async move {
-            start_native_file_watcher(watch_root, tx, server_entry);
-        });
+        let watcher_config = config.clone();
+        // A dedicated OS thread, NOT `tokio::spawn`: the watcher loop blocks
+        // on a std channel forever, which starves a current-thread runtime
+        // (the server never accepts) and pins a worker on a multi-thread one.
+        // The plugin host is built inside the thread so the non-`Send` QuickJS
+        // host never crosses threads.
+        let spawned = std::thread::Builder::new()
+            .name("pledge-hmr-watcher".into())
+            .spawn(move || {
+                start_native_file_watcher(watch_root, tx, server_entry, &watcher_config);
+            });
+        if let Err(e) = spawned {
+            warn!("could not start the file watcher thread: {e}");
+        }
     }
 
-    // Build middleware chain from config
-    let middleware_fns: Vec<middleware::MiddlewareFn> = config
-        .dev_server
-        .middleware
-        .iter()
-        .filter_map(|src| middleware::MiddlewareFn::from_source(src))
-        .collect();
+    // Build middleware chain from config. Entries that cannot be executed are
+    // a hard error (before anything is started), never silently ignored.
+    let middleware_fns = middleware::build_chain(&config.dev_server.middleware)?;
+    let extra_headers = middleware::response_headers(&middleware_fns);
     if !middleware_fns.is_empty() {
         info!(
             "Middleware chain: {} functions registered",
@@ -430,6 +503,22 @@ pub async fn serve(engine: BuildEngine, config: &PledgeConfig) -> Result<()> {
     }
 
     // Detect multi-entry HTML files
+    // Per-module plugin hooks live on their own thread (QuickJS is `!Send`);
+    // `configureServer` is NOT re-run for this second host instance.
+    let serve_plugin_hooks = {
+        let cfg = config.clone();
+        PluginHookService::spawn(move || {
+            let host = load_dev_plugin_host_with(&cfg, false)?;
+            host.plugins()
+                .iter()
+                .any(|p| p.has_resolve_id || p.has_load || p.has_transform)
+                .then(|| Box::new(host) as Box<dyn pledgepack_core::plugin_hooks::PluginHooks>)
+        })
+    };
+    if serve_plugin_hooks.is_some() {
+        info!("Plugin hooks (resolveId/load/transform) active for dev module serving");
+    }
+
     let entries = detect_entries(config);
     if entries.len() > 1 {
         info!("Multi-entry dev server: {} entries detected", entries.len());
@@ -452,6 +541,7 @@ pub async fn serve(engine: BuildEngine, config: &PledgeConfig) -> Result<()> {
         import_patterns: RwLock::new(std::collections::HashMap::new()),
         middleware_chain: RwLock::new(middleware_fns),
         entries: RwLock::new(entries),
+        plugin_hooks: serve_plugin_hooks,
     });
 
     // Spawn HMR broadcast task
@@ -489,13 +579,17 @@ pub async fn serve(engine: BuildEngine, config: &PledgeConfig) -> Result<()> {
         .route("/{*path}", get(app_route_handler))
         .with_state(state.clone());
 
+    // Proxy routes are merged BEFORE the middleware layers below so they sit
+    // behind the same access-token gate, rate limit, and security headers as
+    // every other route (merging them afterwards left them unauthenticated).
+    let app = add_proxy_routes(app, &config.proxy);
+
     // Apply HTTP middleware: compression, body limits, security headers, and CORS
     // (feature 12: WebSocket per-message-deflate (RFC 7692) is NOT yet enabled —
     // axum's built-in WebSocketUpgrade does not expose an API to negotiate the
     // `permessage-deflate` extension during the handshake. This layer only
     // handles HTTP response compression (gzip/deflate/br).
-    // TODO: Once axum adds per-message-deflate support (or via a custom
-    // WebSocket upgrade layer), enable it here to compress HMR payloads.)
+    // Known limitation: enabling it would need a custom WebSocket upgrade layer.)
     // CORS: default to same-origin only (`CorsLayer::new()` with no
     // `allow_origin` emits no `Access-Control-*` headers at all, so a
     // browser's own same-origin policy applies). `DevServerCors::Any` opts
@@ -581,6 +675,9 @@ pub async fn serve(engine: BuildEngine, config: &PledgeConfig) -> Result<()> {
         )
         .layer(cors_layer);
 
+    // `dev_server.middleware` `headers` entries.
+    app = apply_response_headers(app, extra_headers);
+
     // Access-token gate (goal 18): only added when a token is actually
     // required (explicitly configured, or auto-generated above because the
     // server is bound to a non-loopback address). Loopback binds with no
@@ -593,6 +690,9 @@ pub async fn serve(engine: BuildEngine, config: &PledgeConfig) -> Result<()> {
             async move { require_access_token(expected_token, req, next).await }
         }));
     }
+
+    // Origin/Host validation, added after the token gate so it runs first.
+    app = apply_origin_guard(app, config);
 
     // Global rate limit: a generous cap (not per-client — `tower`'s
     // RateLimitLayer has no client-identity concept) against a runaway HMR
@@ -647,94 +747,14 @@ pub async fn serve(engine: BuildEngine, config: &PledgeConfig) -> Result<()> {
         app = app.layer(rate_limit_stack);
     }
 
-    // Execute configureServer hooks from JS plugins
-    let plugins_dir = config.root.join("plugins");
-    if plugins_dir.is_dir()
-        && let Ok(mut plugin_host) = JsPluginHost::load_from_dir(&plugins_dir)
-    {
-        let middlewares = plugin_host.configure_server();
-        for mw in &middlewares {
-            info!(
-                "[plugin:{}] configureServer registered middleware ({} bytes)",
-                mw.plugin_name,
-                mw.source.len()
-            );
-        }
-    }
-
-    // Log configured middleware (from config.dev_server.middleware)
-    for (i, mw_source) in config.dev_server.middleware.iter().enumerate() {
-        info!("Middleware #{} configured ({} bytes)", i, mw_source.len());
-    }
-
-    // Add proxy routes if configured
-    for proxy in &config.proxy {
-        let proxy_target = proxy.target.clone();
-        let proxy_rewrite = proxy.rewrite;
-        let proxy_path = proxy.path.clone();
-        let proxy_headers = proxy.headers.clone();
-        info!(
-            "Proxy: {} → {}{}",
-            proxy_path,
-            proxy_target,
-            if proxy_rewrite { " (rewrite)" } else { "" }
-        );
-        let proxy_router = Router::new().route(
-            &format!("/{}/*rest", proxy_path.trim_start_matches('/')),
-            axum::routing::any(
-                move |method: axum::http::Method,
-                      Path(rest): Path<String>,
-                      body: axum::body::Body| {
-                    let target = proxy_target.clone();
-                    let path_prefix = proxy_path.clone();
-                    let rewrite = proxy_rewrite;
-                    let headers = proxy_headers.clone();
-                    async move {
-                        proxy_handler(
-                            method,
-                            &rest,
-                            &target,
-                            &path_prefix,
-                            rewrite,
-                            &headers,
-                            body,
-                        )
-                        .await
-                    }
-                },
-            ),
-        );
-        app = app.merge(proxy_router);
-
-        // Add WebSocket proxy route if ws is enabled
-        if proxy.ws {
-            let ws_target = proxy.target.clone();
-            let ws_rewrite = proxy.rewrite;
-            let ws_path = proxy.path.clone();
-            info!("WS Proxy: {} → {}", ws_path, ws_target);
-            let ws_router = Router::new().route(
-                &format!("/{}/*rest", ws_path.trim_start_matches('/')),
-                get(
-                    move |ws: axum::extract::WebSocketUpgrade, Path(rest): Path<String>| {
-                        let target = ws_target.clone();
-                        let rewrite = ws_rewrite;
-                        let path_prefix = ws_path.clone();
-                        async move {
-                            ws.on_upgrade(move |socket| {
-                                let rest = rest.clone();
-                                let target = target.clone();
-                                let path_prefix = path_prefix.clone();
-                                async move {
-                                    ws_proxy_handler(socket, &rest, &target, &path_prefix, rewrite)
-                                        .await
-                                }
-                            })
-                        }
-                    },
-                ),
-            );
-            app = app.merge(ws_router);
-        }
+    // Execute configureServer hooks from JS plugins — same trust policy as
+    // `config.plugins` (deny unsigned by default, opt out via
+    // plugin_security.require_signed = false).
+    // With HMR enabled the host lives on the file-watcher thread (QuickJS
+    // contexts are not `Send`) so `handleHotUpdate` can run there; otherwise
+    // it is only needed for `configureServer` and is dropped right away.
+    if !config.dev_server.hmr {
+        let _ = load_dev_plugin_host(config);
     }
 
     let addr = format!("{}:{}", host, port);
@@ -769,22 +789,32 @@ pub async fn serve(engine: BuildEngine, config: &PledgeConfig) -> Result<()> {
         );
     }
 
+    // Bind every listener up-front so the banner reports what is really
+    // listening (`localhost` => both 127.0.0.1 and ::1).
+    let listeners = bind_listeners(&host, port).await?;
+    let bound: Vec<std::net::SocketAddr> = listeners
+        .iter()
+        .filter_map(|l| l.local_addr().ok())
+        .collect();
+    let scheme = if config.https.is_some() {
+        "https"
+    } else {
+        "http"
+    };
+
     // HTTPS support
     if let Some(ref https_config) = config.https {
-        info!("Dev server running at https://{}", addr);
-        if let Ok(ip) = local_ip_address::local_ip() {
-            info!("  → Network: https://{}:{}", ip, port);
-        }
         let cert_path = &https_config.cert;
         let key_path = &https_config.key;
 
         if !cert_path.exists() || !key_path.exists() {
             info!("HTTPS enabled but cert/key not found — generating self-signed certificate...");
             generate_self_signed_cert(cert_path, key_path)?;
-            info!("Self-signed certificate generated at {:?}", cert_path);
+            info!(
+                "Self-signed certificate generated at {}",
+                pledgepack_core::display_path(cert_path)
+            );
         }
-
-        println!("\n  \x1b[32mReady in {}ms\x1b[0m\n", elapsed_ms);
 
         // Use tokio-rustls for TLS
         let cert = match std::fs::read(cert_path) {
@@ -811,41 +841,136 @@ pub async fn serve(engine: BuildEngine, config: &PledgeConfig) -> Result<()> {
         tls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
         let tls_acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(tls_config));
-        let listener = tokio::net::TcpListener::bind(&addr).await?;
+
+        announce_listening(scheme, &host, &bound, elapsed_ms);
 
         // Serve with TLS using a custom Listener implementation
-        let tls_listener = TlsListener {
-            listener,
-            acceptor: tls_acceptor,
-        };
-        let shutdown = async {
-            tokio::signal::ctrl_c()
-                .await
-                .expect("Failed to install Ctrl+C handler");
-            tracing::info!("Shutdown signal received, draining connections...");
-        };
-        axum::serve(tls_listener, app)
-            .with_graceful_shutdown(shutdown)
-            .await?;
+        let shutdown = shutdown_signal();
+        let servers = listeners.into_iter().map(|listener| {
+            let tls_listener = TlsListener {
+                listener,
+                acceptor: tls_acceptor.clone(),
+            };
+            let mut rx = shutdown.clone();
+            let app = app.clone();
+            async move {
+                axum::serve(tls_listener, app)
+                    .with_graceful_shutdown(async move {
+                        let _ = rx.wait_for(|v| *v).await;
+                    })
+                    .await
+            }
+        });
+        futures_util::future::try_join_all(servers).await?;
     } else {
-        println!("\n  \x1b[32mReady in {}ms\x1b[0m\n", elapsed_ms);
-        info!("Dev server running at http://{}", addr);
-        if let Ok(ip) = local_ip_address::local_ip() {
-            info!("  → Network: http://{}:{}", ip, port);
-        }
-        let listener = tokio::net::TcpListener::bind(&addr).await?;
-        let shutdown = async {
-            tokio::signal::ctrl_c()
-                .await
-                .expect("Failed to install Ctrl+C handler");
-            tracing::info!("Shutdown signal received, draining connections...");
-        };
-        axum::serve(listener, app)
-            .with_graceful_shutdown(shutdown)
-            .await?;
+        announce_listening(scheme, &host, &bound, elapsed_ms);
+        let shutdown = shutdown_signal();
+        let servers = listeners.into_iter().map(|listener| {
+            let mut rx = shutdown.clone();
+            let app = app.clone();
+            async move {
+                axum::serve(listener, app)
+                    .with_graceful_shutdown(async move {
+                        let _ = rx.wait_for(|v| *v).await;
+                    })
+                    .await
+            }
+        });
+        futures_util::future::try_join_all(servers).await?;
     }
 
     Ok(())
+}
+
+/// Bind the dev server's TCP listener(s) for `host:port`.
+///
+/// `localhost` is bound on BOTH loopback families (127.0.0.1 and ::1): binding
+/// only whichever address the resolver returns first (::1 on Windows) makes
+/// `http://127.0.0.1:<port>` refuse connections. IPv6 loopback is optional (it
+/// may be disabled), but IPv4 must succeed. Any other host binds exactly the
+/// address it names.
+async fn bind_listeners(host: &str, port: u16) -> Result<Vec<tokio::net::TcpListener>> {
+    use std::net::{Ipv4Addr, Ipv6Addr};
+    if host.eq_ignore_ascii_case("localhost") {
+        let v4 = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port))
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to bind 127.0.0.1:{port}: {e}"))?;
+        // With port 0 the OS picks one: reuse it for the IPv6 twin.
+        let v6_port = v4.local_addr().map(|a| a.port()).unwrap_or(port);
+        let mut out = vec![v4];
+        match tokio::net::TcpListener::bind((Ipv6Addr::LOCALHOST, v6_port)).await {
+            Ok(v6) => out.push(v6),
+            Err(e) => tracing::debug!("IPv6 loopback [::1]:{v6_port} not bound: {e}"),
+        }
+        return Ok(out);
+    }
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    let listener = tokio::net::TcpListener::bind((bare, port))
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to bind {host}:{port}: {e}"))?;
+    Ok(vec![listener])
+}
+
+/// A `watch` receiver that flips to `true` on Ctrl+C, so several servers (one
+/// per listener) shut down together.
+fn shutdown_signal() -> tokio::sync::watch::Receiver<bool> {
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            tracing::info!("Shutdown signal received, draining connections...");
+            let _ = tx.send(true);
+        }
+    });
+    rx
+}
+
+/// Format an address as a URL (`[::1]` brackets for IPv6).
+fn url_for(scheme: &str, ip: std::net::IpAddr, port: u16) -> String {
+    match ip {
+        std::net::IpAddr::V4(v4) => format!("{scheme}://{v4}:{port}"),
+        std::net::IpAddr::V6(v6) => format!("{scheme}://[{v6}]:{port}"),
+    }
+}
+
+/// The LAN URLs to advertise: only for listeners actually bound to a
+/// non-loopback address (`0.0.0.0`/`::` => this machine's LAN IP). Loopback
+/// binds are not reachable from the network, so they yield nothing.
+fn network_urls(
+    scheme: &str,
+    bound: &[std::net::SocketAddr],
+    lan_ip: Option<std::net::IpAddr>,
+) -> Vec<String> {
+    let mut urls = Vec::new();
+    for addr in bound {
+        let ip = addr.ip();
+        let url = if ip.is_unspecified() {
+            lan_ip.map(|lan| url_for(scheme, lan, addr.port()))
+        } else if !ip.is_loopback() {
+            Some(url_for(scheme, ip, addr.port()))
+        } else {
+            None
+        };
+        if let Some(u) = url
+            && !urls.contains(&u)
+        {
+            urls.push(u);
+        }
+    }
+    urls
+}
+
+/// Print the "Ready" banner plus the addresses that are really listening.
+fn announce_listening(scheme: &str, host: &str, bound: &[std::net::SocketAddr], elapsed_ms: u128) {
+    println!("\n  \x1b[32mReady in {}ms\x1b[0m\n", elapsed_ms);
+    for addr in bound {
+        info!("Dev server running at {}", url_for(scheme, addr.ip(), addr.port()));
+    }
+    if bound.is_empty() {
+        info!("Dev server running on {host}");
+    }
+    for url in network_urls(scheme, bound, local_ip_address::local_ip().ok()) {
+        info!("  → Network: {url}");
+    }
 }
 
 /// Cookie name used to remember a validated dev-server access token (see
@@ -856,6 +981,19 @@ pub async fn serve(engine: BuildEngine, config: &PledgeConfig) -> Result<()> {
 /// handshake automatically (it's a plain HTTP GET with an Upgrade header),
 /// so this covers that case with no client-script changes needed.
 const ACCESS_TOKEN_COOKIE: &str = "pledge_token";
+
+/// Length-independent-timing comparison so the access token can't be
+/// recovered byte-by-byte from response latency.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    let mut diff = a.len() ^ b.len();
+    let n = a.len().max(b.len());
+    for i in 0..n {
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
+        diff |= (x ^ y) as usize;
+    }
+    diff == 0
+}
 
 fn token_from_query(uri: &axum::http::Uri) -> Option<String> {
     uri.query()?.split('&').find_map(|pair| {
@@ -890,9 +1028,13 @@ async fn require_access_token(
     next: axum::middleware::Next,
 ) -> Response {
     let query_token = token_from_query(req.uri());
-    let authorized = query_token.as_deref() == Some(&*expected_token)
-        || token_from_header(req.headers()).as_deref() == Some(&*expected_token)
-        || token_from_cookie(req.headers()).as_deref() == Some(&*expected_token);
+    let matches = |candidate: Option<String>| {
+        candidate.is_some_and(|c| constant_time_eq(c.as_bytes(), expected_token.as_bytes()))
+    };
+    let query_ok = matches(query_token.clone());
+    let authorized = query_ok
+        || matches(token_from_header(req.headers()))
+        || matches(token_from_cookie(req.headers()));
 
     if !authorized {
         return (
@@ -905,7 +1047,10 @@ async fn require_access_token(
     }
 
     let mut response = next.run(req).await;
-    if query_token.is_some()
+    // Only remember the token when the query token itself was the valid one
+    // (previously any `?token=` value — even a wrong one, alongside a valid
+    // header — caused the cookie to be issued).
+    if query_ok
         && let Ok(cookie) = HeaderValue::from_str(&format!(
             "{ACCESS_TOKEN_COOKIE}={expected_token}; Path=/; HttpOnly; SameSite=Strict"
         ))
@@ -1377,6 +1522,8 @@ async fn index_handler(State(state): State<Arc<DevServerState>>) -> impl IntoRes
 async fn app_route_handler(
     State(state): State<Arc<DevServerState>>,
     Path(path): Path<String>,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
+    headers: HeaderMap,
 ) -> Response {
     // If the path looks like a static asset (has a file extension), serve it as a module
     let has_extension = path
@@ -1386,7 +1533,8 @@ async fn app_route_handler(
         .unwrap_or(false);
 
     if has_extension {
-        return module_handler(State(state), Path(path)).await;
+        return module_handler(State(state), Path(path), wants_module(query.as_deref(), &headers))
+            .await;
     }
 
     // Non-asset path — serve the index.html shell for client-side routing
@@ -1935,10 +2083,58 @@ async fn error_overlay_handler(State(_state): State<Arc<DevServerState>>) -> Res
     Html(html).into_response()
 }
 
+/// JS module served in place of a module whose transform failed. The path and
+/// message are JSON-encoded: raw interpolation into a `'...'` literal broke
+/// (and allowed code injection) whenever the message contained a quote or
+/// newline.
+fn transform_error_module(path: &str, message: &str) -> String {
+    let quoted_path = serde_json::to_string(path).unwrap_or_else(|_| "\"\"".to_string());
+    let quoted_msg = serde_json::to_string(message).unwrap_or_else(|_| "\"\"".to_string());
+    format!(
+        "/* Pledge Transform Error */\nconsole.error('[pledge] Transform error in ' + {quoted_path} + ': ' + {quoted_msg});\nthrow new Error('Transform error: ' + {quoted_msg});"
+    )
+}
+
+/// Map the `/@fs/<path>` wildcard to a filesystem path: POSIX absolute paths
+/// arrive without their leading `/`, but Windows drive paths (`C:/proj/a.js`)
+/// must be used as-is — prefixing `/` yields an invalid `/C:/...`.
+fn fs_path_from_request(path: &str) -> std::path::PathBuf {
+    let b = path.as_bytes();
+    if (b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':') || path.starts_with('/') {
+        std::path::PathBuf::from(path)
+    } else {
+        std::path::PathBuf::from(format!("/{}", path))
+    }
+}
+
+fn denied_response(d: fs_guard::Denied) -> Response {
+    match d {
+        fs_guard::Denied::NotFound => (StatusCode::NOT_FOUND, "Not found").into_response(),
+        fs_guard::Denied::Forbidden => (StatusCode::FORBIDDEN, "Access denied").into_response(),
+    }
+}
+
+/// Whether a request is an ES-module import (as opposed to a plain fetch):
+/// an explicit `?import` marker, or a browser module-script fetch
+/// (`Sec-Fetch-Dest: script`). Only matters for JSON files: they are served
+/// wrapped as a JS module for imports and as `application/json` otherwise.
+fn wants_module(query: Option<&str>, headers: &HeaderMap) -> bool {
+    let has_import_flag = query.is_some_and(|q| {
+        q.split('&')
+            .any(|kv| kv == "import" || kv.starts_with("import="))
+    });
+    has_import_flag
+        || headers
+            .get("sec-fetch-dest")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.eq_ignore_ascii_case("script"))
+}
+
 /// Serve a transformed module on-demand
 async fn module_handler(
     State(state): State<Arc<DevServerState>>,
     Path(path): Path<String>,
+    as_module: bool,
 ) -> Response {
     // First, try serving from the configured public directory (static assets)
     let public_dir = &state.config.dev_server.public_dir;
@@ -1949,15 +2145,20 @@ async fn module_handler(
         return (StatusCode::FORBIDDEN, "Path traversal denied").into_response();
     }
 
-    if public_path.exists()
-        && public_path.is_file()
-        && let Ok(content) = tokio::fs::read(&public_path).await
-    {
-        if content.len() > MAX_RESPONSE_SIZE {
-            return (StatusCode::PAYLOAD_TOO_LARGE, "Response too large").into_response();
+    if public_path.is_file() {
+        match fs_guard::resolve_servable(&state.config.root, &path, &public_path) {
+            Ok(canonical) => {
+                if let Ok(content) = tokio::fs::read(&canonical).await {
+                    if content.len() > MAX_RESPONSE_SIZE {
+                        return (StatusCode::PAYLOAD_TOO_LARGE, "Response too large")
+                            .into_response();
+                    }
+                    let content_type = guess_content_type(&path);
+                    return ([(header::CONTENT_TYPE, content_type)], content).into_response();
+                }
+            }
+            Err(d) => return denied_response(d),
         }
-        let content_type = guess_content_type(&path);
-        return ([(header::CONTENT_TYPE, content_type)], content).into_response();
     }
 
     let full_path = state.config.root.join(&path);
@@ -1990,6 +2191,41 @@ async fn module_handler(
         }
     };
 
+    // Deny-list / allowed-roots / extension allowlist on the final resolved
+    // file (after the extension fallback above, and after symlink resolution).
+    // (The canonical path is only used for validation; the un-prefixed path is
+    // kept for reading so downstream tooling never sees `\\?\` paths.)
+    let is_json = full_path
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("json"));
+    let guarded = if is_json && as_module {
+        fs_guard::resolve_servable_module(&state.config.root, &path, &full_path)
+    } else {
+        fs_guard::resolve_servable(&state.config.root, &path, &full_path)
+    };
+    if let Err(d) = guarded {
+        return denied_response(d);
+    }
+
+    // A JSON file fetched as data (not imported as a module) is served as
+    // JSON, not wrapped into an ES module with the HMR polyfill.
+    if is_json && !as_module {
+        return match tokio::fs::read(&full_path).await {
+            Ok(content) if content.len() > MAX_RESPONSE_SIZE => {
+                (StatusCode::PAYLOAD_TOO_LARGE, "Response too large").into_response()
+            }
+            Ok(content) => (
+                [
+                    (header::CONTENT_TYPE, "application/json; charset=utf-8"),
+                    (header::CACHE_CONTROL, "no-cache"),
+                ],
+                content,
+            )
+                .into_response(),
+            Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Failed to read").into_response(),
+        };
+    }
+
     // Read source via Zig I/O
     let source = match pledgepack_native_sys::read_file(full_path.to_str().unwrap_or("")) {
         Ok(content) => content,
@@ -2001,6 +2237,33 @@ async fn module_handler(
     }
 
     let source_str = String::from_utf8_lossy(&source).to_string();
+
+    // Plugin `load` (may replace the file's content) then the chained
+    // `transform` hooks, exactly as the production build applies them - before
+    // the built-in transform. `node_modules` is skipped (dev serves
+    // dependencies untouched, and running JS hooks per dependency file would
+    // dominate cold start). The plugin map traces the result back to the file.
+    let mut plugin_map: Option<String> = None;
+    let source_str = match state.plugin_hooks.as_ref() {
+        Some(hooks) if !path.starts_with("node_modules/") => {
+            let id = normalize_path(&full_path);
+            match run_plugin_module_hooks(hooks, &id, source_str).await {
+                Ok((code, map)) => {
+                    plugin_map = map;
+                    code
+                }
+                Err(e) => {
+                    return plugin_hook_error_response(
+                        &state,
+                        &path,
+                        full_path.to_str().unwrap_or(""),
+                        &e,
+                    );
+                }
+            }
+        }
+        _ => source_str,
+    };
 
     // CJS → ESM conversion for node_modules files
     // Browser can't use require()/module.exports, so wrap them in ESM
@@ -2064,10 +2327,7 @@ async fn module_handler(
                 };
                 let _ = state.hmr_tx.send(error_update);
                 // Also return an error response with proper content type
-                let error_body = format!(
-                    "/* Pledge Transform Error */\nconsole.error('[pledge] Transform error in {}: {}');\nthrow new Error('Transform error: {}');",
-                    path, e, e
-                );
+                let error_body = transform_error_module(&path, &e.to_string());
                 return (
                     [
                         (
@@ -2113,7 +2373,13 @@ async fn module_handler(
         if let Some(ref css_module_map) = transform_output.css_modules {
             let mut exports = String::new();
             for (original, scoped) in css_module_map {
-                exports.push_str(&format!("  {}: \"{}\",\n", original, scoped));
+                // JSON-quote both sides: class names like `my-class` are not
+                // valid bare identifiers.
+                exports.push_str(&format!(
+                    "  {}: {},\n",
+                    serde_json::to_string(original).unwrap_or_else(|_| "\"\"".to_string()),
+                    serde_json::to_string(scoped).unwrap_or_else(|_| "\"\"".to_string())
+                ));
             }
             // Rewrite class names in CSS to scoped versions
             let mut scoped_css = css_code.clone();
@@ -2240,13 +2506,97 @@ __existing.textContent = __css;
 
     // JS/TS files: rewrite imports and add HMR boundary
     let transformed = rewrite_imports(&transform_output.code, &path, &state.config.resolve_alias);
-    serve_js_module(
-        &path,
-        &transformed,
+    // Chain the plugins' map into the built-in transform's map so the browser
+    // maps back to the file on disk, not the plugin's intermediate output.
+    let source_map = match (
         transform_output.source_map.as_deref(),
-        &state,
+        plugin_map.as_deref(),
+    ) {
+        (Some(outer), Some(inner)) => Some(
+            pledgepack_core::sourcemap_compose::compose_source_maps(outer, inner)
+                .unwrap_or_else(|| outer.to_string()),
+        ),
+        (Some(outer), None) => Some(outer.to_string()),
+        _ => None,
+    };
+    serve_js_module(&path, &transformed, source_map.as_deref(), &state).await
+}
+
+/// Run the plugin `load` hook (replacing `code` when a plugin provides the
+/// module) and then the chained `transform` hooks for `id`. Returns the final
+/// code and a source map tracing it back to the module's origin (`None` when
+/// no plugin in the chain supplied a usable map).
+async fn run_plugin_module_hooks(
+    hooks: &PluginHookService,
+    id: &str,
+    code: String,
+) -> Result<(String, Option<String>)> {
+    match hooks.load(id).await? {
+        Some(loaded) => run_plugin_transform(hooks, id, loaded.code, loaded.map).await,
+        None => run_plugin_transform(hooks, id, code, None).await,
+    }
+}
+
+/// The chained `transform` half of [`run_plugin_module_hooks`]: `map` is the
+/// map already relating `code` to the module's origin (from `load`).
+async fn run_plugin_transform(
+    hooks: &PluginHookService,
+    id: &str,
+    code: String,
+    map: Option<String>,
+) -> Result<(String, Option<String>)> {
+    let Some(t) = hooks.transform(&code, id).await? else {
+        return Ok((code, map));
+    };
+    let map = match (t.map, map.as_deref()) {
+        // Both supplied maps: compose (transform output -> load output -> origin).
+        (Some(t_map), Some(l_map)) => {
+            pledgepack_core::sourcemap_compose::compose_source_maps(&t_map, l_map)
+        }
+        // The input has no map (it IS the origin): the transform map is relative to it.
+        (Some(t_map), None) => Some(t_map),
+        // Code changed without a map: lineage broken, report none.
+        (None, _) => None,
+    };
+    Ok((t.code, map))
+}
+
+/// Respond to a failing plugin hook the same way a failing built-in
+/// transform does: push an error to connected HMR clients (overlay) and serve
+/// a module that throws with the message.
+fn plugin_hook_error_response(
+    state: &Arc<DevServerState>,
+    path: &str,
+    file_path: &str,
+    e: &anyhow::Error,
+) -> Response {
+    let message = format!("{e:#}");
+    let _ = state.hmr_tx.send(HmrUpdate {
+        update_type: "error".to_string(),
+        path: path.to_string(),
+        message: Some(message.clone()),
+        file: Some(file_path.to_string()),
+        css: None,
+        stack: Some(format!("{e:?}")),
+        line: None,
+        column: None,
+        deps: Vec::new(),
+        full_reload: None,
+        diff: None,
+        full_code: None,
+        module_map: None,
+    });
+    (
+        [
+            (
+                header::CONTENT_TYPE,
+                "application/javascript; charset=utf-8",
+            ),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        transform_error_module(path, &message),
     )
-    .await
+        .into_response()
 }
 
 /// Serve a JS module with HMR polyfill, dependency tracking, and source maps
@@ -2519,9 +2869,12 @@ fn rewrite_imports(
 
             if closing_quote == '(' {
                 // Dynamic import: find the string inside
-                if let Some(quote_pos) = rest.find(['"', '\'']) {
-                    let quote_char = rest.as_bytes()[quote_pos] as char;
-                    let spec_start = quote_pos + 1;
+                // Only a string literal directly inside the parens counts:
+                // `import(name)` must not pick up an unrelated later string.
+                let trimmed = rest.trim_start();
+                if let Some(quote_char) = trimmed.chars().next().filter(|c| matches!(c, '"' | '\''))
+                {
+                    let spec_start = (rest.len() - trimmed.len()) + 1;
                     let spec_rest = &rest[spec_start..];
                     if let Some(end) = spec_rest.find(quote_char) {
                         let specifier = &spec_rest[..end];
@@ -2533,7 +2886,9 @@ fn rewrite_imports(
                         }
                     }
                 }
-                search_from = after_pattern + 1;
+                // Resume right after the `(`: `+ 1` could land inside a
+                // multi-byte character and panic on the next slice.
+                search_from = after_pattern;
                 continue;
             }
 
@@ -2601,7 +2956,11 @@ fn add_js_extension(specifier: &str) -> String {
         || specifier.ends_with(".json")
         || specifier.ends_with(".css");
 
-    if has_ext {
+    if specifier.ends_with(".json") {
+        // A JSON specifier in import position is a module import: mark it so
+        // the server wraps it as a module (plain fetches get raw JSON).
+        format!("{specifier}?import")
+    } else if has_ext {
         specifier.to_string()
     } else {
         // Use .tsx as default — the dev server module_handler tries
@@ -2630,7 +2989,15 @@ async fn handle_hmr_connection(socket: axum::extract::ws::WebSocket, state: Arc<
         "type": "connected",
         "message": "Pledge HMR connected"
     });
-    drop(socket_tx.send(Message::Text(hello.to_string().into())));
+    // Must be awaited: a `SinkExt::send` future that is merely dropped never
+    // writes anything, so clients previously never received this message.
+    if socket_tx
+        .send(Message::Text(hello.to_string().into()))
+        .await
+        .is_err()
+    {
+        return;
+    }
 
     // Register this client to receive HMR updates
     let (client_tx, mut client_rx) = mpsc::unbounded_channel::<HmrUpdate>();
@@ -2656,7 +3023,7 @@ async fn handle_hmr_connection(socket: axum::extract::ws::WebSocket, state: Arc<
                 }
             };
             // For small messages, use text; for larger ones, use binary
-            // (per-message-deflate is not yet enabled — see TODO above)
+            // (per-message-deflate is not enabled — see the known-limitation note above)
             if json.len() < 4096 {
                 if socket_tx.send(Message::Text(json.into())).await.is_err() {
                     break;
@@ -2689,6 +3056,10 @@ async fn handle_hmr_connection(socket: axum::extract::ws::WebSocket, state: Arc<
 
     // Clean up: remove this client from the registered list
     send_task.abort();
+    // Wait for the aborted task to drop its receiver so the `is_closed()`
+    // sweep below removes this client's sender now, not at some later
+    // disconnect.
+    let _ = send_task.await;
     {
         let mut clients = state.hmr_clients.write().await;
         clients.retain(|tx| !tx.is_closed());
@@ -2698,11 +3069,87 @@ async fn handle_hmr_connection(socket: axum::extract::ws::WebSocket, state: Arc<
 
 /// Native file watcher — uses platform-specific APIs (ReadDirectoryChangesW/inotify/FSEvents)
 /// with automatic fallback to notify crate
+/// Load `<root>/plugins/*.js` into a JS plugin host under the configured
+/// signing/capability policy (deny-unsigned by default; opt out with
+/// `plugin_security.require_signed = false`) and run `configureServer`.
+/// Returns `None` when there is no plugins dir or the trust check failed.
+fn load_dev_plugin_host(config: &PledgeConfig) -> Option<JsPluginHost> {
+    load_dev_plugin_host_with(config, true)
+}
+
+/// [`load_dev_plugin_host`], optionally skipping `configureServer` (the
+/// per-module hook host is a second instance of the same plugins and must not
+/// run their server-configuration side effects twice).
+fn load_dev_plugin_host_with(
+    config: &PledgeConfig,
+    run_configure_server: bool,
+) -> Option<JsPluginHost> {
+    let plugins_dir = config.root.join("plugins");
+    if !plugins_dir.is_dir() {
+        return None;
+    }
+    let mut plugin_host = JsPluginHost::new();
+    let (verifier, auditor) = config.plugin_security.policy();
+    if let Some(v) = verifier {
+        plugin_host = plugin_host.with_signing_verifier(v);
+    }
+    if let Some(a) = auditor {
+        plugin_host = plugin_host.with_capability_auditor(a);
+    }
+    match plugin_host.load_dir(&plugins_dir) {
+        Ok(()) => {
+            let middlewares = if run_configure_server {
+                plugin_host.configure_server()
+            } else {
+                Vec::new()
+            };
+            for mw in &middlewares {
+                info!(
+                    "[plugin:{}] configureServer registered middleware ({} bytes)",
+                    mw.plugin_name,
+                    mw.source.len()
+                );
+            }
+            Some(plugin_host)
+        }
+        Err(e) => {
+            warn!(
+                "Skipping plugins/ dir plugins — trust check failed: {e} \
+                 (set plugin_security.require_signed = false to load unsigned plugins)"
+            );
+            None
+        }
+    }
+}
+
+/// What the dev server should do with a changed file after the plugins'
+/// `handleHotUpdate` hooks have run (Vite semantics: the returned module
+/// list *replaces* the default affected-module set).
+#[derive(Debug, PartialEq, Eq)]
+enum HotUpdatePlan {
+    /// No plugin claimed the change — normal single-file update.
+    Default,
+    /// A plugin returned an empty list — suppress the update entirely.
+    Suppress,
+    /// A plugin returned an explicit module list — update exactly those.
+    Modules(Vec<String>),
+}
+
+fn plan_hot_update(result: Option<pledgepack_js_plugin_host::HotUpdateResult>) -> HotUpdatePlan {
+    match result {
+        None => HotUpdatePlan::Default,
+        Some(r) if r.module_ids.is_empty() => HotUpdatePlan::Suppress,
+        Some(r) => HotUpdatePlan::Modules(r.module_ids),
+    }
+}
+
 fn start_native_file_watcher(
     root: PathBuf,
     tx: mpsc::UnboundedSender<HmrUpdate>,
     server_entry: Option<String>,
+    dev_config: &PledgeConfig,
 ) {
+    let mut plugin_host = load_dev_plugin_host(dev_config);
     let config = watcher::WatcherConfig::default();
     let rx = watcher::start_watcher(&root, config);
 
@@ -2769,29 +3216,60 @@ fn start_native_file_watcher(
             continue;
         }
 
-        // Read the new file content for diff computation
-        let new_content = std::fs::read_to_string(&event.path).ok();
-
-        let update = HmrUpdate {
-            update_type: "update".to_string(),
-            path: rel_path.clone(),
-            message: None,
-            file: None,
-            css: if ext == "css" {
-                std::fs::read_to_string(&event.path).ok()
-            } else {
-                None
-            },
-            stack: None,
-            line: None,
-            column: None,
-            deps: Vec::new(),
-            full_reload: None,
-            diff: None,
-            full_code: new_content,
-            module_map: None,
+        // Let plugins' `handleHotUpdate` hooks decide which modules to update.
+        let plan = match plugin_host.as_mut() {
+            Some(host) => {
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                plan_hot_update(host.handle_hot_update(&rel_path, timestamp))
+            }
+            None => HotUpdatePlan::Default,
         };
-        let _ = tx.send(update);
+        let targets: Vec<String> = match plan {
+            HotUpdatePlan::Default => vec![rel_path.clone()],
+            HotUpdatePlan::Suppress => {
+                info!("handleHotUpdate suppressed HMR update for {}", rel_path);
+                continue;
+            }
+            HotUpdatePlan::Modules(ids) => ids,
+        };
+
+        for target in targets {
+            // Read the new file content for diff computation
+            let target_path = if target == rel_path {
+                event.path.clone()
+            } else {
+                root.join(&target)
+            };
+            let target_ext = target_path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or(ext);
+            let new_content = std::fs::read_to_string(&target_path).ok();
+
+            let update = HmrUpdate {
+                update_type: "update".to_string(),
+                path: target,
+                message: None,
+                file: None,
+                css: if target_ext == "css" {
+                    new_content.clone()
+                } else {
+                    None
+                },
+                stack: None,
+                line: None,
+                column: None,
+                deps: Vec::new(),
+                full_reload: None,
+                diff: None,
+                full_code: new_content,
+                module_map: None,
+            };
+            let _ = tx.send(update);
+        }
     }
 }
 
@@ -3244,16 +3722,21 @@ fn extract_imports(code: &str) -> Vec<String> {
             };
 
             if closing_quote == '(' {
-                if let Some(quote_pos) = rest.find(['"', '\'']) {
-                    let quote_char = rest.as_bytes()[quote_pos] as char;
-                    let spec_start = quote_pos + 1;
+                // Only a string literal directly inside the parens counts:
+                // `import(name)` must not pick up an unrelated later string.
+                let trimmed = rest.trim_start();
+                if let Some(quote_char) = trimmed.chars().next().filter(|c| matches!(c, '"' | '\''))
+                {
+                    let spec_start = (rest.len() - trimmed.len()) + 1;
                     let spec_rest = &rest[spec_start..];
                     if let Some(end) = spec_rest.find(quote_char) {
                         let specifier = &spec_rest[..end];
                         imports.push(specifier.to_string());
                     }
                 }
-                search_from = after_pattern + 1;
+                // Resume right after the `(`: `+ 1` could land inside a
+                // multi-byte character and panic on the next slice.
+                search_from = after_pattern;
                 continue;
             }
 
@@ -3302,36 +3785,154 @@ fn collect_dependents(
     }
 }
 
-/// Proxy handler for dev server API proxying.
-/// Forwards requests to a target URL with optional path rewriting.
-/// Supports all HTTP methods (GET, POST, PUT, DELETE, PATCH, etc.)
-async fn proxy_handler(
-    method: axum::http::Method,
-    rest: &str,
-    target: &str,
-    path_prefix: &str,
-    rewrite: bool,
-    _headers: &std::collections::HashMap<String, String>,
-    body: axum::body::Body,
-) -> Response {
-    let target_url = if rewrite {
-        format!("{}/{}", target.trim_end_matches('/'), rest)
+/// Normalize a configured proxy prefix (`"/api"`, `"api/"`, `"/api/"`) to
+/// `"/api"`. Returns `None` for an empty / root-only prefix, which would
+/// shadow every app route.
+fn normalize_proxy_prefix(path: &str) -> Option<String> {
+    let trimmed = path.trim_matches('/');
+    if trimmed.is_empty() {
+        None
     } else {
-        format!("{}{}/{}", target.trim_end_matches('/'), path_prefix, rest)
+        Some(format!("/{trimmed}"))
+    }
+}
+
+/// Build the upstream URL for a proxied request.
+///
+/// `request_path` is the full incoming path (including the prefix) and
+/// `query` the raw query string, if any — the query string must be forwarded
+/// or `/api/users?id=1` silently loses its parameters.
+fn proxy_upstream_url(
+    target: &str,
+    prefix: &str,
+    rewrite: bool,
+    request_path: &str,
+    query: Option<&str>,
+) -> String {
+    let target = target.trim_end_matches('/');
+    let rest = request_path.strip_prefix(prefix).unwrap_or(request_path);
+    let mut url = if rewrite {
+        format!("{target}{rest}")
+    } else {
+        format!("{target}{prefix}{rest}")
+    };
+    if let Some(q) = query
+        && !q.is_empty()
+    {
+        url.push('?');
+        url.push_str(q);
+    }
+    url
+}
+
+fn is_hop_by_hop(name: &str) -> bool {
+    matches!(
+        name,
+        "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "transfer-encoding"
+            | "te"
+            | "trailer"
+            | "upgrade"
+    )
+}
+
+/// Register the configured `proxy` entries on `app`. Each entry serves both
+/// `<prefix>` and `<prefix>/{*rest}` (HTTP and, when `ws` is set, WebSocket
+/// upgrades on the same route — axum forbids two handlers on one path+method).
+fn add_proxy_routes(mut app: Router, proxies: &[pledgepack_core::config::ProxyConfig]) -> Router {
+    for proxy in proxies {
+        let Some(prefix) = normalize_proxy_prefix(&proxy.path) else {
+            warn!(
+                "Ignoring proxy entry with empty path (target {}): it would shadow every route",
+                proxy.target
+            );
+            continue;
+        };
+        info!(
+            "Proxy: {} → {}{}{}",
+            prefix,
+            proxy.target,
+            if proxy.rewrite { " (rewrite)" } else { "" },
+            if proxy.ws { " (ws)" } else { "" }
+        );
+        let ctx = Arc::new((prefix.clone(), proxy.clone()));
+        // `Result<..>` rather than `Option<..>`: `WebSocketUpgrade` has no
+        // `OptionalFromRequestParts` impl, and a plain HTTP request must fall
+        // through to the HTTP proxy instead of being rejected.
+        let handler = move |ws: Result<
+            WebSocketUpgrade,
+            axum::extract::ws::rejection::WebSocketUpgradeRejection,
+        >,
+                            req: axum::extract::Request| {
+            let ctx = ctx.clone();
+            async move { proxy_request(ws.ok(), req, &ctx.0, &ctx.1).await }
+        };
+        app = app
+            .route(&prefix, axum::routing::any(handler.clone()))
+            .route(&format!("{prefix}/{{*rest}}"), axum::routing::any(handler));
+    }
+    app
+}
+
+async fn proxy_request(
+    ws: Option<WebSocketUpgrade>,
+    req: axum::extract::Request,
+    prefix: &str,
+    proxy: &pledgepack_core::config::ProxyConfig,
+) -> Response {
+    let target_url = proxy_upstream_url(
+        &proxy.target,
+        prefix,
+        proxy.rewrite,
+        req.uri().path(),
+        req.uri().query(),
+    );
+
+    if let Some(ws) = ws
+        && proxy.ws
+    {
+        return ws.on_upgrade(move |socket| ws_proxy_handler(socket, target_url));
+    }
+
+    proxy_handler(req, &target_url, &proxy.headers).await
+}
+
+/// Proxy handler for dev server API proxying.
+/// Forwards the request (method, headers, body) to `target_url` and relays
+/// the response. Redirects are NOT followed — they are relayed to the browser.
+async fn proxy_handler(
+    req: axum::extract::Request,
+    target_url: &str,
+    extra_headers: &std::collections::HashMap<String, String>,
+) -> Response {
+    use std::sync::OnceLock;
+    static CLIENT: OnceLock<Option<reqwest::Client>> = OnceLock::new();
+    let Some(client) = CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .build()
+                .ok()
+        })
+        .as_ref()
+    else {
+        return (StatusCode::BAD_GATEWAY, "Proxy client unavailable").into_response();
     };
 
+    let (parts, body) = req.into_parts();
     info!(
-        "Proxy: {} {}{}/{} → {}",
-        method,
-        path_prefix,
-        rest,
-        if rewrite { " (rewrite)" } else { "" },
+        "Proxy: {} {} → {}",
+        parts.method,
+        parts.uri.path(),
         target_url
     );
 
-    let client = reqwest::Client::new();
-    let req_method =
-        reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap_or(reqwest::Method::GET);
+    let req_method = reqwest::Method::from_bytes(parts.method.as_str().as_bytes())
+        .unwrap_or(reqwest::Method::GET);
 
     const MAX_PROXY_BODY: usize = 100 * 1024 * 1024; // 100 MB
     let body_bytes = match axum::body::to_bytes(body, MAX_PROXY_BODY).await {
@@ -3341,43 +3942,50 @@ async fn proxy_handler(
         }
     };
 
-    let request = client.request(req_method, &target_url).body(body_bytes);
+    let mut request = client.request(req_method, target_url);
+    for (name, value) in parts.headers.iter() {
+        let n = name.as_str();
+        // `host` must describe the upstream, `content-length` is recomputed,
+        // and the dev-server access token must not leak to the backend.
+        if is_hop_by_hop(n) || matches!(n, "host" | "content-length" | "x-pledge-token") {
+            continue;
+        }
+        request = request.header(n, value.as_bytes());
+    }
+    for (k, v) in extra_headers {
+        request = request.header(k.as_str(), v.as_str());
+    }
+    let request = request.body(body_bytes);
 
     match request.send().await {
         Ok(resp) => {
             let status = resp.status();
             let headers = resp.headers().clone();
-            let body = resp.bytes().await.unwrap_or_default();
-
-            let mut response_headers = Vec::new();
-            for (key, value) in headers.iter() {
-                // Skip hop-by-hop headers
-                if !matches!(
-                    key.as_str(),
-                    "connection"
-                        | "keep-alive"
-                        | "transfer-encoding"
-                        | "te"
-                        | "trailer"
-                        | "upgrade"
-                ) && let Ok(v) = value.to_str()
-                {
-                    response_headers.push((
-                        axum::http::HeaderName::try_from(key.as_str())
-                            .unwrap_or(axum::http::header::CONTENT_TYPE),
-                        axum::http::HeaderValue::try_from(v)
-                            .unwrap_or(axum::http::HeaderValue::from_static("")),
-                    ));
+            let body = match resp.bytes().await {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!("Proxy body read error: {}", e);
+                    return (StatusCode::BAD_GATEWAY, format!("Proxy error: {}", e))
+                        .into_response();
                 }
-            }
-
-            let axum_status = axum::http::StatusCode::from_u16(status.as_u16())
-                .unwrap_or(StatusCode::BAD_GATEWAY);
+            };
 
             let mut response = axum::response::Response::new(axum::body::Body::from(body));
-            *response.status_mut() = axum_status;
-            for (key, value) in response_headers {
-                response.headers_mut().insert(key, value);
+            *response.status_mut() =
+                StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+            for (key, value) in headers.iter() {
+                let k = key.as_str();
+                if is_hop_by_hop(k) || k == "content-length" {
+                    continue;
+                }
+                if let (Ok(name), Ok(val)) = (
+                    HeaderName::from_bytes(k.as_bytes()),
+                    HeaderValue::from_bytes(value.as_bytes()),
+                ) {
+                    // `append`, not `insert`: repeated headers (Set-Cookie)
+                    // must all survive.
+                    response.headers_mut().append(name, val);
+                }
             }
             response
         }
@@ -3389,19 +3997,7 @@ async fn proxy_handler(
 }
 
 /// WebSocket proxy handler — bridges client WebSocket to target WebSocket
-async fn ws_proxy_handler(
-    client_socket: axum::extract::ws::WebSocket,
-    rest: &str,
-    target: &str,
-    path_prefix: &str,
-    rewrite: bool,
-) {
-    let target_url = if rewrite {
-        format!("{}/{}", target.trim_end_matches('/'), rest)
-    } else {
-        format!("{}{}/{}", target.trim_end_matches('/'), path_prefix, rest)
-    };
-
+async fn ws_proxy_handler(client_socket: axum::extract::ws::WebSocket, target_url: String) {
     // Convert http(s):// to ws(s)://
     let ws_url = target_url
         .replacen("http://", "ws://", 1)
@@ -3471,35 +4067,16 @@ async fn virtual_fs_handler(
     State(state): State<Arc<DevServerState>>,
     Path(path): Path<String>,
 ) -> Response {
-    // /@fs/ serves files from absolute paths on the filesystem
-    let full_path = if path.starts_with('/') {
-        std::path::PathBuf::from(&path)
-    } else {
-        std::path::PathBuf::from(format!("/{}", path))
-    };
-
-    if !full_path.exists() || !full_path.is_file() {
-        return (StatusCode::NOT_FOUND, "Virtual file not found").into_response();
-    }
-
-    // Security: ensure the path is within the project root or node_modules
-    let canonical = match full_path.canonicalize() {
+    // /@fs/ serves files from absolute paths on the filesystem, but only
+    // inside the allowed roots (project root + `PLEDGE_DEV_FS_ALLOW`), never
+    // secrets (deny-list), and only module/asset extensions. The guard
+    // canonicalizes (symlinks, case, 8.3 names) and rejects `::$DATA`
+    // streams and trailing dots/spaces.
+    let full_path = fs_path_from_request(&path);
+    let canonical = match fs_guard::resolve_servable(&state.config.root, &path, &full_path) {
         Ok(c) => c,
-        Err(_) => return (StatusCode::NOT_FOUND, "Cannot resolve path").into_response(),
+        Err(d) => return denied_response(d),
     };
-    let root_canonical = match state.config.root.canonicalize() {
-        Ok(c) => c,
-        Err(_) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, "Cannot resolve root").into_response();
-        }
-    };
-
-    // Allow access to project root and its node_modules
-    let is_allowed = canonical.starts_with(&root_canonical)
-        || canonical.starts_with(root_canonical.join("node_modules"));
-    if !is_allowed {
-        return (StatusCode::FORBIDDEN, "Access denied").into_response();
-    }
 
     if let Ok(content) = tokio::fs::read(&canonical).await {
         if content.len() > MAX_RESPONSE_SIZE {
@@ -3540,11 +4117,49 @@ async fn virtual_id_handler(
     // PRODUCTION-READINESS-100.md goal 77 — found while writing adversarial
     // tests for this handler, not merely confirming an existing guard.
     //
+    // Every branch is additionally gated by `fs_guard::resolve_servable`
+    // (deny-list for secrets, extension allowlist, symlink/short-name
+    // resolution), applied to the file actually read.
+    //
+    // Plugin virtual modules: `resolveId` then `load` (then the chained
+    // `transform`s), before any file-system lookup. Vite escapes the NUL that
+    // prefixes virtual ids as `__x00__` in URLs.
+    if let Some(hooks) = state.plugin_hooks.as_ref() {
+        let requested = path.replace("__x00__", "\0");
+        let id = match hooks.resolve_id(&requested, None).await {
+            Ok(Some(r)) if r.external => None,
+            Ok(Some(r)) => Some(r.id),
+            Ok(None) => Some(requested.clone()),
+            Err(e) => return plugin_hook_error_response(&state, &path, &requested, &e),
+        };
+        if let Some(id) = id {
+            match hooks.load(&id).await {
+                Ok(Some(loaded)) => {
+                    let (code, map) =
+                        match run_plugin_transform(hooks, &id, loaded.code, loaded.map).await {
+                            Ok(v) => v,
+                            Err(e) => return plugin_hook_error_response(&state, &path, &id, &e),
+                        };
+                    if code.len() > MAX_RESPONSE_SIZE {
+                        return (StatusCode::PAYLOAD_TOO_LARGE, "Response too large")
+                            .into_response();
+                    }
+                    let rewritten = rewrite_imports(&code, &path, &state.config.resolve_alias);
+                    return serve_js_module(&path, &rewritten, map.as_deref(), &state).await;
+                }
+                Ok(None) => {}
+                Err(e) => return plugin_hook_error_response(&state, &path, &id, &e),
+            }
+        }
+    }
+
     // First try as a bare specifier in node_modules
     let node_modules_path = state.config.root.join("node_modules").join(&path);
-    if node_modules_path.exists()
+    if node_modules_path.is_file()
         && is_path_within(&node_modules_path, &state.config.root)
-        && let Ok(content) = tokio::fs::read(&node_modules_path).await
+        && let Ok(guarded) =
+            fs_guard::resolve_servable(&state.config.root, &path, &node_modules_path)
+        && let Ok(content) = tokio::fs::read(&guarded).await
     {
         if content.len() > MAX_RESPONSE_SIZE {
             return (StatusCode::PAYLOAD_TOO_LARGE, "Response too large").into_response();
@@ -3565,7 +4180,8 @@ async fn virtual_id_handler(
     if root_path.exists()
         && root_path.is_file()
         && is_path_within(&root_path, &state.config.root)
-        && let Ok(content) = tokio::fs::read(&root_path).await
+        && let Ok(guarded) = fs_guard::resolve_servable(&state.config.root, &path, &root_path)
+        && let Ok(content) = tokio::fs::read(&guarded).await
     {
         if content.len() > MAX_RESPONSE_SIZE {
             return (StatusCode::PAYLOAD_TOO_LARGE, "Response too large").into_response();
@@ -3604,9 +4220,10 @@ async fn virtual_id_handler(
             .join("node_modules")
             .join(&path)
             .join(entry);
-        if entry_path.exists()
+        if entry_path.is_file()
             && is_path_within(&entry_path, &state.config.root)
-            && let Ok(entry_content) = tokio::fs::read(&entry_path).await
+            && let Ok(guarded) = fs_guard::resolve_servable(&state.config.root, &path, &entry_path)
+            && let Ok(entry_content) = tokio::fs::read(&guarded).await
         {
             if entry_content.len() > MAX_RESPONSE_SIZE {
                 return (StatusCode::PAYLOAD_TOO_LARGE, "Response too large").into_response();
@@ -3642,9 +4259,13 @@ async fn public_dir_handler(
         return (StatusCode::FORBIDDEN, "Path traversal denied").into_response();
     }
 
-    if !public_path.exists() || !public_path.is_file() {
+    if !public_path.is_file() {
         return (StatusCode::NOT_FOUND, "Static asset not found").into_response();
     }
+    let public_path = match fs_guard::resolve_servable(&state.config.root, &path, &public_path) {
+        Ok(p) => p,
+        Err(d) => return denied_response(d),
+    };
 
     if let Ok(content) = tokio::fs::read(&public_path).await {
         if content.len() > MAX_RESPONSE_SIZE {
@@ -3743,4 +4364,254 @@ fn generate_self_signed_cert(
     std::fs::write(key_path, key_pair.serialize_pem())?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod hot_update_plan_tests {
+    use super::*;
+    use pledgepack_js_plugin_host::HotUpdateResult;
+
+    #[test]
+    fn no_plugin_claim_means_default_update() {
+        assert_eq!(plan_hot_update(None), HotUpdatePlan::Default);
+    }
+
+    #[test]
+    fn empty_module_list_suppresses_the_update() {
+        let r = HotUpdateResult { module_ids: vec![] };
+        assert_eq!(plan_hot_update(Some(r)), HotUpdatePlan::Suppress);
+    }
+
+    #[test]
+    fn explicit_module_list_replaces_the_default_set() {
+        let r = HotUpdateResult {
+            module_ids: vec!["src/a.ts".into(), "src/b.ts".into()],
+        };
+        assert_eq!(
+            plan_hot_update(Some(r)),
+            HotUpdatePlan::Modules(vec!["src/a.ts".into(), "src/b.ts".into()])
+        );
+    }
+}
+
+#[cfg(test)]
+mod review_regression_tests {
+    use super::*;
+    use tower::ServiceExt;
+
+    #[test]
+    fn constant_time_eq_matches_only_identical_slices() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"abcd"));
+        assert!(!constant_time_eq(b"", b"a"));
+        assert!(constant_time_eq(b"", b""));
+    }
+
+    #[test]
+    fn extract_imports_survives_multibyte_char_after_dynamic_import_paren() {
+        // `search_from = after_pattern + 1` used to land mid-character.
+        let imports = extract_imports("const m = await import(\u{e9}\u{e9}); import x from 'a';");
+        assert!(imports.contains(&"a".to_string()));
+    }
+
+    #[test]
+    fn rewrite_imports_survives_multibyte_char_after_dynamic_import_paren() {
+        let out = rewrite_imports(
+            "import(\u{6a21}\u{5757}); foo('./bar');",
+            "src/main.ts",
+            &[],
+        );
+        // The unrelated string literal must not be treated as the import's
+        // specifier.
+        assert!(out.contains("foo('./bar')"), "got: {out}");
+    }
+
+    #[test]
+    fn transform_error_module_escapes_quotes_and_newlines() {
+        let js = transform_error_module("src/a'b.ts", "it's \"bad\"\n');alert(1);//");
+        // banner line + console.error + throw = exactly 3 lines: the newline
+        // in the message must be escaped, not emitted raw.
+        assert_eq!(js.lines().count(), 3, "got: {js}");
+        assert!(js.contains("\n"));
+        let quoted = serde_json::to_string(
+            "it's \"bad\"
+');alert(1);//",
+        )
+        .unwrap();
+        assert!(js.contains(&quoted), "message not JSON-encoded in: {js}");
+    }
+
+    #[test]
+    fn fs_path_from_request_keeps_windows_drive_paths() {
+        assert_eq!(
+            fs_path_from_request("C:/proj/src/a.js"),
+            std::path::PathBuf::from("C:/proj/src/a.js")
+        );
+        assert_eq!(
+            fs_path_from_request("home/u/a.js"),
+            std::path::PathBuf::from("/home/u/a.js")
+        );
+    }
+
+    #[test]
+    fn proxy_upstream_url_forwards_query_and_honours_rewrite() {
+        assert_eq!(
+            proxy_upstream_url("http://b:1/", "/api", false, "/api/users", Some("id=1&x=2")),
+            "http://b:1/api/users?id=1&x=2"
+        );
+        assert_eq!(
+            proxy_upstream_url("http://b:1", "/api", true, "/api/users", None),
+            "http://b:1/users"
+        );
+        assert_eq!(normalize_proxy_prefix("api/"), Some("/api".to_string()));
+        assert_eq!(normalize_proxy_prefix("/"), None);
+    }
+
+    #[tokio::test]
+    async fn proxy_routes_build_and_forward_query_headers_and_cookies() {
+        ensure_crypto_provider();
+        // Backend echoing what it received, and setting two cookies.
+        let backend = Router::new().route(
+            "/api/echo",
+            axum::routing::post(
+                |headers: HeaderMap, uri: axum::http::Uri, body: String| async move {
+                    let mut resp = Response::new(axum::body::Body::from(format!(
+                        "{}|{}|{}|{}",
+                        uri.query().unwrap_or(""),
+                        headers
+                            .get("x-custom")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or(""),
+                        headers
+                            .get("x-added")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or(""),
+                        body
+                    )));
+                    resp.headers_mut()
+                        .append(header::SET_COOKIE, HeaderValue::from_static("a=1"));
+                    resp.headers_mut()
+                        .append(header::SET_COOKIE, HeaderValue::from_static("b=2"));
+                    resp
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, backend).await.ok();
+        });
+
+        let cfg = pledgepack_core::config::ProxyConfig {
+            path: "/api".into(),
+            target: format!("http://{addr}"),
+            rewrite: false,
+            headers: [("x-added".to_string(), "yes".to_string())].into(),
+            ws: true,
+        };
+        // Panicked at construction with axum 0.8 (`/*rest` syntax, and a
+        // second handler on the same path when `ws` was set).
+        let app = add_proxy_routes(Router::new(), &[cfg]);
+
+        let resp = app
+            .oneshot(
+                axum::http::Request::post("/api/echo?id=7")
+                    .header("x-custom", "hello")
+                    .body(axum::body::Body::from("payload"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get_all(header::SET_COOKIE).iter().count(), 2);
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"id=7|hello|yes|payload");
+    }
+}
+
+#[cfg(test)]
+mod bind_and_banner_tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    fn sa(ip: IpAddr, port: u16) -> SocketAddr {
+        SocketAddr::new(ip, port)
+    }
+
+    #[test]
+    fn network_line_only_for_non_loopback_binds() {
+        let lan: Option<IpAddr> = Some("192.168.1.28".parse().unwrap());
+        // localhost => 127.0.0.1 + ::1: nothing listens on the LAN address.
+        let loop_both = [
+            sa(Ipv4Addr::LOCALHOST.into(), 3000),
+            sa(Ipv6Addr::LOCALHOST.into(), 3000),
+        ];
+        assert!(network_urls("http", &loop_both, lan).is_empty());
+        // 0.0.0.0 => the LAN address is reachable.
+        let any = [sa(Ipv4Addr::UNSPECIFIED.into(), 3000)];
+        assert_eq!(
+            network_urls("http", &any, lan),
+            vec!["http://192.168.1.28:3000".to_string()]
+        );
+        // ...unless no LAN IP is known.
+        assert!(network_urls("http", &any, None).is_empty());
+        // A specific LAN bind advertises exactly that address.
+        let one = [sa("10.0.0.5".parse().unwrap(), 8080)];
+        assert_eq!(
+            network_urls("https", &one, lan),
+            vec!["https://10.0.0.5:8080".to_string()]
+        );
+    }
+
+    #[test]
+    fn urls_bracket_ipv6() {
+        assert_eq!(
+            url_for("http", Ipv6Addr::LOCALHOST.into(), 3000),
+            "http://[::1]:3000"
+        );
+    }
+
+    #[tokio::test]
+    async fn localhost_binds_v4_and_v6_on_the_same_port() {
+        let ls = bind_listeners("localhost", 0).await.unwrap();
+        let addrs: Vec<SocketAddr> = ls.iter().map(|l| l.local_addr().unwrap()).collect();
+        assert!(addrs.iter().any(|a| a.ip() == IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        if std::net::TcpListener::bind("[::1]:0").is_ok() && addrs.len() > 1 {
+            assert_eq!(addrs[0].port(), addrs[1].port());
+            assert!(addrs[1].ip().is_loopback() && addrs[1].is_ipv6());
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_host_binds_only_that_address() {
+        let ls = bind_listeners("127.0.0.1", 0).await.unwrap();
+        assert_eq!(ls.len(), 1);
+        let ls = bind_listeners("[::1]", 0).await;
+        if let Ok(ls) = ls {
+            assert_eq!(ls.len(), 1);
+        }
+    }
+
+    #[test]
+    fn module_requests_are_recognised() {
+        let mut h = HeaderMap::new();
+        assert!(!wants_module(None, &h));
+        assert!(!wants_module(Some("t=1"), &h));
+        assert!(wants_module(Some("import"), &h));
+        assert!(wants_module(Some("t=1&import"), &h));
+        h.insert("sec-fetch-dest", HeaderValue::from_static("script"));
+        assert!(wants_module(None, &h));
+        h.insert("sec-fetch-dest", HeaderValue::from_static("empty"));
+        assert!(!wants_module(None, &h));
+    }
+
+    #[test]
+    fn json_specifiers_are_marked_as_module_imports() {
+        assert_eq!(add_js_extension("./data.json"), "./data.json?import");
+        assert_eq!(add_js_extension("./a.ts"), "./a.ts");
+        assert_eq!(add_js_extension("./a"), "./a.tsx");
+    }
 }

@@ -65,7 +65,28 @@ const child = spawn(binaryPath, process.argv.slice(2), {
   cwd: process.cwd(),
 });
 
-child.on('exit', (code) => {
+// Forward termination signals to the native binary. Without this, `kill <pid>`
+// / `docker stop` / an npm-script teardown ends only this wrapper and leaves
+// the dev server running as an orphan. (SIGINT is not forwarded: a terminal
+// Ctrl+C is already delivered to the whole foreground process group.)
+for (const sig of ['SIGTERM', 'SIGHUP']) {
+  process.on(sig, () => {
+    if (!child.killed) child.kill(sig);
+  });
+}
+
+child.on('exit', (code, signal) => {
+  if (signal) {
+    // Mirror death-by-signal so callers see the real cause (exit status
+    // 128+n on POSIX shells) rather than a generic 1.
+    process.removeAllListeners(signal);
+    try {
+      process.kill(process.pid, signal);
+      return;
+    } catch {
+      /* fall through to a plain exit code */
+    }
+  }
   process.exit(code ?? 1);
 });
 

@@ -196,12 +196,62 @@ impl FunctionCache {
     fn write_to_disk(&self, key: &CacheKey, entry: &CacheEntry) -> Result<()> {
         let path = self.cache_path(key);
         let data = bincode::serde::encode_to_vec(entry, bincode::config::standard())?;
-        // Atomic write: write to temp file, then rename to final path
-        let tmp_path = path.with_extension("tmp");
-        std::fs::write(&tmp_path, &data)?;
-        std::fs::rename(&tmp_path, &path)?;
+        // Atomic write: uniquely named temp file, then rename to final path
+        atomic_write(&path, &data)?;
         Ok(())
     }
+}
+
+/// A collision-free sibling temp path for `target`: unique per process,
+/// per call and per moment, so concurrent writers never share a temp file.
+pub fn unique_temp_path(target: &std::path::Path) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let mut name = target
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    name.push(format!(".{}.{}.{:x}.tmp", std::process::id(), n, nanos));
+    target.with_file_name(name)
+}
+
+/// Atomically write `data` to `path`: write a uniquely named temp file
+/// (created with `create_new`, so an existing file or symlink at that name is
+/// never followed), then rename over `path`. The temp file is removed on error.
+pub fn atomic_write(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let tmp = unique_temp_path(path);
+    let result = (|| {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        f.write_all(data)?;
+        f.flush()?;
+        drop(f);
+        // Windows can transiently refuse a replace-rename while another
+        // writer/reader has the destination open; retry briefly.
+        let mut attempt = 0;
+        loop {
+            match std::fs::rename(&tmp, path) {
+                Ok(()) => break Ok(()),
+                Err(e) if attempt < 50 && e.kind() == std::io::ErrorKind::PermissionDenied => {
+                    attempt += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                Err(e) => break Err(e),
+            }
+        }
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
 /// Aggregate statistics about the cache, returned by
@@ -258,5 +308,61 @@ mod tests {
         cache.set(key.clone(), entry.clone());
         let result = cache.get(&key).unwrap();
         assert_eq!(result.code, entry.code);
+    }
+}
+
+#[cfg(test)]
+mod atomic_tests {
+    use super::*;
+
+    #[test]
+    fn unique_temp_paths_never_collide() {
+        let p = std::path::Path::new("/tmp/x/entry.bin");
+        let a = unique_temp_path(p);
+        let b = unique_temp_path(p);
+        assert_ne!(a, b);
+        assert_eq!(a.parent(), p.parent());
+    }
+
+    #[test]
+    fn concurrent_atomic_writes_to_one_path_all_succeed() {
+        let dir = tempfile_dir("atomic_concurrent");
+        let target = dir.join("entry.bin");
+        let handles: Vec<_> = (0..16u8)
+            .map(|i| {
+                let target = target.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..50 {
+                        atomic_write(&target, &[i; 4096]).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let data = std::fs::read(&target).unwrap();
+        assert_eq!(data.len(), 4096);
+        assert!(data.iter().all(|b| *b == data[0]), "torn write");
+        // no stray temp files
+        let leftovers = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".tmp")
+            })
+            .count();
+        assert_eq!(leftovers, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn tempfile_dir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("pledgepack_{}_{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
     }
 }

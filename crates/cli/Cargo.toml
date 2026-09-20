@@ -58,3 +58,6 @@ jemalloc = ["dep:tikv-jemallocator"]
 
 [target.'cfg(not(target_os = "windows"))'.dependencies]
 tikv-jemallocator = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

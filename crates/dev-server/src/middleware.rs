@@ -236,3 +236,79 @@ impl MiddlewareFn {
 // `tower_http::cors::CorsLayer` in `crates/dev-server/src/lib.rs`'s
 // `serve()` (see Phase 1 goal 16) — keeping both around risked a future
 // reader mistaking the dead one for the active implementation.
+
+/// Parse and validate `dev_server.middleware`.
+///
+/// Only `headers` entries are executable: they add fixed response headers to
+/// every dev-server response. Every other kind is rejected with an error that
+/// names the entry and the supported alternative, instead of being parsed,
+/// logged and silently never run:
+///
+/// * `cors` -> use `dev_server.cors`
+/// * `proxy` -> use the top-level `proxy` config
+/// * `rewrite` -> not supported (axum routes before layers run)
+/// * arbitrary JS source / unknown names -> not supported (the dev server
+///   does not execute JS request middleware; use a JS plugin's
+///   `configureServer` hook)
+pub fn build_chain(sources: &[String]) -> anyhow::Result<Vec<MiddlewareFn>> {
+    let mut out = Vec::with_capacity(sources.len());
+    for (i, src) in sources.iter().enumerate() {
+        let preview: String = src.chars().take(60).collect();
+        let Some(mw) = MiddlewareFn::from_source(src) else {
+            anyhow::bail!(
+                "dev_server.middleware[{i}] ({preview:?}) is not a recognised middleware. \
+                 Supported: {{\"name\":\"headers\",\"headers\":{{...}}}} or \"headers:Name=value,...\""
+            );
+        };
+        match &mw.kind {
+            MiddlewareKind::Headers { headers } => {
+                for (k, v) in headers {
+                    if axum::http::HeaderName::from_bytes(k.as_bytes()).is_err()
+                        || axum::http::HeaderValue::from_str(v).is_err()
+                    {
+                        anyhow::bail!("dev_server.middleware[{i}]: invalid header {k:?}: {v:?}");
+                    }
+                }
+            }
+            MiddlewareKind::Cors { .. } => anyhow::bail!(
+                "dev_server.middleware[{i}]: the \"cors\" middleware is not executed; \
+                 use `dev_server.cors` (\"same-origin\" | \"any\") instead"
+            ),
+            MiddlewareKind::Proxy { .. } => anyhow::bail!(
+                "dev_server.middleware[{i}]: the \"proxy\" middleware is not executed; \
+                 use the top-level `proxy` configuration instead"
+            ),
+            MiddlewareKind::Rewrite { .. } => anyhow::bail!(
+                "dev_server.middleware[{i}]: the \"rewrite\" middleware is not supported \
+                 by the dev server; remove it or use a `proxy` rewrite"
+            ),
+            MiddlewareKind::Custom { .. } => anyhow::bail!(
+                "dev_server.middleware[{i}] ({preview:?}): custom/JS middleware is not \
+                 executed by the dev server; only \"headers\" middleware is supported. \
+                 Use a JS plugin's `configureServer` hook for custom request handling"
+            ),
+        }
+        out.push(mw);
+    }
+    Ok(out)
+}
+
+/// Collect the response headers of all `headers` middleware entries.
+pub fn response_headers(
+    chain: &[MiddlewareFn],
+) -> Vec<(axum::http::HeaderName, axum::http::HeaderValue)> {
+    let mut out = Vec::new();
+    for mw in chain {
+        if let MiddlewareKind::Headers { headers } = &mw.kind {
+            for (k, v) in headers {
+                if let (Ok(k), Ok(v)) = (
+                    axum::http::HeaderName::from_bytes(k.as_bytes()),
+                    axum::http::HeaderValue::from_str(v),
+                ) {
+                    out.push((k, v));
+                }
+            }
+        }
+    }
+    out
+}

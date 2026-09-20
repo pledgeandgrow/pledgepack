@@ -66,7 +66,7 @@ pub fn generate_edge_bundle(
     info!(
         "Generated {} edge bundle: {}",
         target_name(target),
-        output_path.display()
+        crate::display_path(&output_path)
     );
 
     // Generate deployment config files

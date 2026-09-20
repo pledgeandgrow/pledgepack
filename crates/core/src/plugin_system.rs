@@ -8,12 +8,13 @@
 //   42. Plugin parallel execution via rayon
 
 use dashmap::DashMap;
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, VerifyingKey};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
+use subtle::{Choice, ConstantTimeEq};
 
 // ─── Hook capability matrix ────────────────────────────────────────────
 //
@@ -95,7 +96,7 @@ impl PluginHotReloader {
         let mut callbacks = self
             .reload_callbacks
             .entry(plugin_id.to_string())
-            .or_insert_with(Vec::new);
+            .or_default();
         callbacks.push(Arc::new(callback));
     }
 
@@ -195,7 +196,7 @@ impl PluginHotReloader {
         };
 
         if let Err(e) = debouncer.watch(&path, RecursiveMode::NonRecursive) {
-            tracing::warn!("Failed to watch plugin source {}: {}", path.display(), e);
+            tracing::warn!("Failed to watch plugin source {}: {}", crate::display_path(&path), e);
             return;
         }
 
@@ -410,7 +411,10 @@ impl SandboxedFs {
     }
 
     pub fn read(&self, path: &Path) -> Result<Vec<u8>, SandboxError> {
-        let usage = self.usage.lock().unwrap();
+        let usage = self
+            .usage
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         usage.check_path_access(path, &self.limits)?;
         usage.check_fs_read(&self.limits)?;
         drop(usage);
@@ -421,7 +425,10 @@ impl SandboxedFs {
     }
 
     pub fn write(&self, path: &Path, data: &[u8]) -> Result<(), SandboxError> {
-        let usage = self.usage.lock().unwrap();
+        let usage = self
+            .usage
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         usage.check_path_access(path, &self.limits)?;
         usage.check_fs_write(&self.limits)?;
         drop(usage);
@@ -607,7 +614,7 @@ impl LifecycleHookRegistry {
         hook: LifecycleHook,
         handler: impl Fn(&HookContext) + Send + Sync + 'static,
     ) {
-        let mut handlers = self.hooks.entry(hook).or_insert_with(Vec::new);
+        let mut handlers = self.hooks.entry(hook).or_default();
         handlers.push((plugin_id.to_string(), Arc::new(handler)));
     }
 
@@ -1062,6 +1069,19 @@ pub struct PluginSignature {
     pub verified: bool,
 }
 
+/// Constant-time equality for hashes / keys / signatures: the running time
+/// does not depend on the position of the first differing byte (only on the
+/// lengths, which are not secret).
+pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    a.ct_eq(b).into()
+}
+
+/// Decode a hex-encoded 32-byte Ed25519 public key.
+fn decode_public_key(hex_key: &str) -> Option<[u8; 32]> {
+    let bytes = hex::decode(hex_key).ok()?;
+    <[u8; 32]>::try_from(bytes.as_slice()).ok()
+}
+
 /// Plugin signing verifier.
 pub struct PluginSigningVerifier {
     /// Known trusted public keys: (identity, public_key).
@@ -1092,22 +1112,31 @@ impl PluginSigningVerifier {
     /// malformed input, since `sig` comes from a plugin manifest an attacker
     /// could control.
     pub fn verify(&self, sig: &PluginSignature) -> bool {
-        // Check if the signer's key is trusted
-        let is_trusted = self.trusted_keys.iter().any(|(identity, key)| {
-            *identity == sig.signer_identity && *key == sig.signer_public_key
-        });
+        // Decode the claimed key FIRST and compare raw bytes: comparing the
+        // hex strings with `==` was both variable-time (early exit at the
+        // first differing character) and case-sensitive (a trusted key
+        // written in upper-case hex never matched its own signatures).
+        let Some(claimed_key) = decode_public_key(&sig.signer_public_key) else {
+            return false;
+        };
 
-        if !is_trusted {
+        // Constant-time trust check: every trusted entry is compared and the
+        // results are accumulated, so timing reveals neither which entry
+        // matched nor how many leading bytes agreed.
+        let mut trusted = Choice::from(0);
+        for (identity, key) in &self.trusted_keys {
+            let identity_ok = identity.as_bytes().ct_eq(sig.signer_identity.as_bytes());
+            let key_ok = match decode_public_key(key) {
+                Some(k) => k[..].ct_eq(&claimed_key[..]),
+                None => Choice::from(0),
+            };
+            trusted |= identity_ok & key_ok;
+        }
+        if !bool::from(trusted) {
             return false;
         }
 
-        let Ok(pubkey_bytes) = hex::decode(&sig.signer_public_key) else {
-            return false;
-        };
-        let Ok(pubkey_bytes) = <[u8; 32]>::try_from(pubkey_bytes.as_slice()) else {
-            return false;
-        };
-        let Ok(verifying_key) = VerifyingKey::from_bytes(&pubkey_bytes) else {
+        let Ok(verifying_key) = VerifyingKey::from_bytes(&claimed_key) else {
             return false;
         };
 
@@ -1118,8 +1147,11 @@ impl PluginSigningVerifier {
             return false;
         };
 
+        // `verify_strict` (not `verify`): also rejects small-order public
+        // keys and non-canonical signatures, closing the signature
+        // malleability / "weak key verifies anything" cases of plain verify.
         verifying_key
-            .verify(sig.wasm_hash.as_bytes(), &signature)
+            .verify_strict(sig.wasm_hash.as_bytes(), &signature)
             .is_ok()
     }
 
@@ -1191,6 +1223,38 @@ impl PluginCapability {
                 | PluginCapability::ProcessSpawn
         )
     }
+
+    /// Parse a capability from its string form (as used in `sig.json`
+    /// sidecars and `pluginSecurity` config). Unknown strings become
+    /// `Custom`, matching how sidecars declare non-standard capabilities.
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "fs:read" => PluginCapability::FileSystemRead,
+            "fs:write" => PluginCapability::FileSystemWrite,
+            "network" => PluginCapability::Network,
+            "env" => PluginCapability::Environment,
+            "process:spawn" => PluginCapability::ProcessSpawn,
+            "cache" => PluginCapability::CacheAccess,
+            "stdin:read" => PluginCapability::StdinRead,
+            "stdout:write" => PluginCapability::StdoutWrite,
+            other => PluginCapability::Custom(other.to_string()),
+        }
+    }
+}
+
+/// Signature sidecar (`<plugin>.sig.json`) shared by the JS and WASM plugin
+/// hosts. Flattens the signature fields with an optional declared-capability
+/// list — a sidecar written before capabilities existed (bare
+/// `PluginSignature`) still parses, with `capabilities` defaulting to empty.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct PluginTrustSidecar {
+    /// The Ed25519 signature + signer metadata.
+    #[serde(flatten)]
+    pub signature: PluginSignature,
+    /// Capabilities the plugin declares it needs; audited against policy
+    /// when a `CapabilityAuditor` is configured.
+    #[serde(default)]
+    pub capabilities: Vec<PluginCapability>,
 }
 
 /// A capability audit for a plugin.
@@ -1368,6 +1432,78 @@ mod g12_tests {
 
         assert!(verifier.verify(&sig));
         assert_eq!(verifier.trusted_key_count(), 1);
+    }
+
+    #[test]
+    fn signing_trust_check_is_case_insensitive_over_decoded_key_bytes() {
+        use ed25519_dalek::Signer;
+        let (signing_key, verifying_key) = test_keypair();
+        let signature = signing_key.sign(b"hash123");
+
+        // Trusted key configured in UPPER-case hex; the sidecar carries the
+        // same key in lower-case. The bytes are identical, so this must trust.
+        let mut verifier = PluginSigningVerifier::new();
+        verifier.trust_key(
+            "@pledgelabs",
+            &hex::encode(verifying_key.to_bytes()).to_uppercase(),
+        );
+        let sig = PluginSignature {
+            plugin_name: "p".into(),
+            version: "1.0.0".into(),
+            wasm_hash: "hash123".into(),
+            signer_public_key: hex::encode(verifying_key.to_bytes()),
+            signature: hex::encode(signature.to_bytes()),
+            signer_identity: "@pledgelabs".into(),
+            timestamp: 0,
+            verified: false,
+        };
+        assert!(verifier.verify(&sig));
+
+        // Same key, wrong identity: not trusted.
+        let mut wrong_identity = sig.clone();
+        wrong_identity.signer_identity = "@someone-else".into();
+        assert!(!verifier.verify(&wrong_identity));
+
+        // A different (untrusted) key of the same length: not trusted.
+        let other = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let mut other_key = sig.clone();
+        other_key.signer_public_key = hex::encode(other.verifying_key().to_bytes());
+        other_key.signature = hex::encode(other.sign(b"hash123").to_bytes());
+        assert!(!verifier.verify(&other_key));
+    }
+
+    #[test]
+    fn signing_rejects_small_order_key_that_plain_verify_accepts() {
+        // The identity point (small order) with an all-identity signature
+        // R = identity, s = 0 satisfies the *cofactorless* check for every
+        // message, so plain `verify` accepts a "signature" nobody produced.
+        // `verify_strict` must reject it even when the key is trusted.
+        let mut identity_point = [0u8; 32];
+        identity_point[0] = 1;
+        let mut forged = [0u8; 64];
+        forged[0] = 1; // R = identity, s = 0
+
+        let mut verifier = PluginSigningVerifier::new();
+        verifier.trust_key("@weak", &hex::encode(identity_point));
+        let sig = PluginSignature {
+            plugin_name: "p".into(),
+            version: "1.0.0".into(),
+            wasm_hash: "anything".into(),
+            signer_public_key: hex::encode(identity_point),
+            signature: hex::encode(forged),
+            signer_identity: "@weak".into(),
+            timestamp: 0,
+            verified: false,
+        };
+        assert!(!verifier.verify(&sig));
+    }
+
+    #[test]
+    fn ct_eq_matches_slice_equality() {
+        assert!(ct_eq(b"abc", b"abc"));
+        assert!(!ct_eq(b"abc", b"abd"));
+        assert!(!ct_eq(b"abc", b"ab"));
+        assert!(ct_eq(b"", b""));
     }
 
     #[test]

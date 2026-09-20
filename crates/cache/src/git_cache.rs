@@ -38,7 +38,15 @@ impl GitCacheInvalidator {
         match Self::read_git_state(repo_root) {
             Ok((file_hashes, tree_hash)) => {
                 invalidator.file_hashes = file_hashes;
-                invalidator.root_tree_hash = Some(tree_hash);
+                // `HEAD^{tree}` only describes the committed state. With
+                // uncommitted edits to tracked files it would claim "nothing
+                // changed" and let stale cached output be reused, so a dirty
+                // worktree has no usable tree hash (=> "changed").
+                invalidator.root_tree_hash = if Self::worktree_is_dirty(repo_root) {
+                    None
+                } else {
+                    Some(tree_hash)
+                };
                 invalidator.available = true;
                 info!(
                     "Git cache invalidator: {} tracked files, tree hash: {}",
@@ -91,6 +99,19 @@ impl GitCacheInvalidator {
     /// If the tree hash is the same, the entire build can be cached.
     pub fn composite_cache_key(&self) -> Option<String> {
         self.root_tree_hash.clone()
+    }
+
+    /// True when tracked files differ from the index/HEAD (or when git
+    /// cannot tell us — treated as dirty to stay on the safe side).
+    fn worktree_is_dirty(repo_root: &Path) -> bool {
+        match Command::new("git")
+            .args(["status", "--porcelain", "--untracked-files=no"])
+            .current_dir(repo_root)
+            .output()
+        {
+            Ok(out) if out.status.success() => !out.stdout.is_empty(),
+            _ => true,
+        }
     }
 
     /// Read git state: file blob hashes and root tree hash
@@ -230,6 +251,48 @@ fn file_hashes_iter(repo_root: &Path) -> Result<Vec<(PathBuf, String)>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let st = Command::new("git")
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("git available");
+        assert!(st.status.success(), "git {:?} failed", args);
+    }
+
+    #[test]
+    fn dirty_worktree_is_reported_as_changed() {
+        let dir = std::env::temp_dir().join(format!("pledgepack_git_dirty_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q"]);
+        std::fs::write(dir.join("a.ts"), "export const a = 1;").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "init"]);
+
+        let clean = GitCacheInvalidator::new(&dir);
+        let clean_hash = clean.root_tree_hash().map(|s| s.to_string());
+        assert!(clean_hash.is_some());
+        assert!(!clean.has_repo_changed(clean_hash.as_deref()));
+
+        // Uncommitted edit: HEAD^{tree} is unchanged, but the repo has changed.
+        std::fs::write(dir.join("a.ts"), "export const a = 2;").unwrap();
+        let dirty = GitCacheInvalidator::new(&dir);
+        assert!(
+            dirty.has_repo_changed(clean_hash.as_deref()),
+            "uncommitted edits must invalidate the tree-hash fast path"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn test_invalid_without_git() {

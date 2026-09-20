@@ -14,3 +14,6 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 pledgepack-core = { workspace = true }
 oxc = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

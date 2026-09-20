@@ -5,7 +5,7 @@
 ### PledgePack (Bundler / Build Tool)
 - **Role:** Framework-agnostic bundler, dev server, and build tool (like Turbopack/esbuild/SWC)
 - **Repository:** `https://github.com/pledgeandgrow/pledgepack`
-- **npm package:** `pledgepack` (currently `0.3.2`)
+- **npm package:** `pledgepack` (currently `1.0.0-rc.1`)
 - **Binary:** Native Rust binary (`pledge.exe` / `pledge`) distributed via GitHub Releases + postinstall download
 - **Language:** Rust (Oxc parser, Lightning CSS, QuickJS JS runtime for plugin host and tests, wasmtime for WASM plugins)
 - **CLI:** `pledgepack dev`, `pledgepack build`, `pledgepack serve`, `pledgepack test`, `pledgepack analyze`, `pledgepack create`, `pledgepack migrate`, `pledgepack doctor`, `pledgepack bench`, `pledgepack cache`, `pledgepack generate-env-types`, `pledgepack completions`, `pledgepack config`
@@ -267,7 +267,7 @@ pledgepack/
 │   └── postinstall.js     # Downloads binary from GitHub Releases
 ├── pledgepack/
 │   └── index.js           # Programmatic API (runPledgepack, resolveBinary)
-├── package.json           # name: "pledgepack", version: "0.3.2"
+├── package.json           # name: "pledgepack", version: "1.0.0-rc.1"
 ├── README.md
 └── LICENSE
 ```
@@ -454,7 +454,7 @@ Inside each archive: a single binary named `pledge` (Unix) or `pledge.exe` (Wind
 - `crates/core/src/edge.rs` — Edge bundle generation
 - `bin/pledge.js` — JS shim that resolves and spawns native binary
 - `bin/postinstall.js` — Downloads binary from GitHub Releases
-- `package.json` — npm package definition (`pledgepack@0.3.2`)
+- `package.json` — npm package definition (`pledgepack@1.0.0-rc.1`)
 
 ### PledgeStack (pledgeandgrow/pledgestack repo)
 - `packages/cli/` — Main framework package (published as `pledgestack` on npm)
@@ -476,7 +476,7 @@ Inside each archive: a single binary named `pledge` (Unix) or `pledge.exe` (Wind
 - **PledgePack** and **PledgeStack** version independently
 - PledgeStack `package.json` specifies `pledgepack: "^0.3.2"` (caret range)
 - Breaking changes in PledgePack require PledgeStack to update its dependency range
-- PledgeStack can pin PledgePack version for stability: `pledgepack: "0.3.2"` (exact)
+- PledgeStack can pin PledgePack version for stability: `pledgepack: "1.0.0-rc.1"` (exact)
 
 ---
 
@@ -492,7 +492,8 @@ independently verified compatibility.
 
 | PledgePack | `bundler-pledgepack` | PledgeStack (`pledgestack` CLI) | Manifest schema version | Date | Verified together? |
 |---|---|---|---|---|---|
-| 0.3.2 | 0.1.4 | 0.1.12 | 1 (`RouteManifest::SCHEMA_VERSION`, added 2026-09-15) | 2026-09-15 | No — versions recorded, not cross-tested. See goal 87. |
+| 1.0.0-rc.1 | 0.1.4 | 0.1.12 | 1 (`RouteManifest::SCHEMA_VERSION`) | 2026-09-20 | No — companion versions carried over unchanged, not cross-tested. |
+| 0.3.3 | 0.1.4 | 0.1.12 | 1 (`RouteManifest::SCHEMA_VERSION`, added 2026-09-15) | 2026-09-17 | No — versions recorded, not cross-tested. See goal 87. |
 
 **How compatibility is actually checked at runtime** (goal 81, implemented
 2026-09-15): every PledgePack dev-server response carries an
@@ -565,7 +566,7 @@ PRODUCTION-READINESS-100.md (Phase 3-4's verification notes).
 
 ```
 1. Build PledgePack binary:     cargo build --release
-2. Create GitHub Release:       gh release create v0.3.2 pledge-x86_64-pc-windows-msvc.zip
+2. Create GitHub Release:       gh release create v1.0.0-rc.1 pledge-x86_64-pc-windows-msvc.zip
 3. Publish PledgePack to npm:   npm publish (from pledgepack repo)
 4. Update PledgeStack dependency:  pledgestack package.json → pledgepack: "^0.3.2"
 5. Publish PledgeStack to npm:     npm publish (from packages/cli directory)

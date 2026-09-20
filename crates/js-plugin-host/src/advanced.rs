@@ -21,6 +21,8 @@ pub struct IsolatePool {
     pool: Vec<(rquickjs::Runtime, rquickjs::Context)>,
     /// Maximum pool size
     max_size: usize,
+    /// Heap cap applied to every runtime this pool creates (0 = unlimited).
+    memory_limit: usize,
     /// Total contexts created
     created: usize,
     /// Total contexts reused
@@ -28,10 +30,19 @@ pub struct IsolatePool {
 }
 
 impl IsolatePool {
+    /// Pool whose runtimes use the default [`RuntimeConfig`] memory limit.
     pub fn new(max_size: usize) -> Self {
+        Self::with_config(max_size, &RuntimeConfig::default())
+    }
+
+    /// Pool whose runtimes are capped at `config.memory_limit` bytes
+    /// (0 = unlimited). The limit was previously declared on
+    /// [`RuntimeConfig`] but applied to no runtime.
+    pub fn with_config(max_size: usize, config: &RuntimeConfig) -> Self {
         Self {
             pool: Vec::with_capacity(max_size),
             max_size,
+            memory_limit: config.memory_limit,
             created: 0,
             reused: 0,
         }
@@ -45,6 +56,7 @@ impl IsolatePool {
         } else {
             self.created += 1;
             let rt = rquickjs::Runtime::new().expect("Failed to create QuickJS runtime");
+            crate::apply_memory_limit(&rt, self.memory_limit);
             let ctx = rquickjs::Context::full(&rt).expect("Failed to create QuickJS context");
             (rt, ctx)
         }
@@ -763,6 +775,37 @@ mod tests {
         assert_eq!(pool.stats().reused, 1);
         assert_eq!(pool.stats().created, 1);
         pool.release(ctx2);
+    }
+
+    #[test]
+    fn isolate_pool_applies_the_configured_memory_limit() {
+        let config = RuntimeConfig {
+            memory_limit: 8 * 1024 * 1024,
+            ..RuntimeConfig::default()
+        };
+        let mut pool = IsolatePool::with_config(1, &config);
+        let (_rt, ctx) = pool.acquire();
+        // ~64 MiB string build: far above the 8 MiB cap.
+        let res = ctx.with(|ctx| {
+            ctx.eval::<usize, _>("var s = 'x'.repeat(1024); for (var i = 0; i < 16; i++) { s = s + s + s + s; } s.length")
+        });
+        assert!(res.is_err(), "allocation past the limit must fail: {res:?}");
+
+        // A small allocation under the same limit still works.
+        let ok = ctx.with(|ctx| ctx.eval::<usize, _>("'abc'.repeat(10).length"));
+        assert_eq!(ok.unwrap(), 30);
+    }
+
+    #[test]
+    fn unlimited_memory_limit_zero_is_not_a_zero_byte_cap() {
+        let config = RuntimeConfig {
+            memory_limit: 0,
+            ..RuntimeConfig::default()
+        };
+        let mut pool = IsolatePool::with_config(1, &config);
+        let (_rt, ctx) = pool.acquire();
+        let n = ctx.with(|ctx| ctx.eval::<usize, _>("'abc'.repeat(1000).length"));
+        assert_eq!(n.unwrap(), 3000);
     }
 
     #[test]

@@ -142,8 +142,8 @@ pub fn build_route_chunks(
     for (module, routes_using) in &module_routes {
         if routes_using.len() > 1 {
             shared_modules.push(module.clone());
-        } else {
-            let route = routes_using.iter().next().unwrap();
+        } else if let Some(route) = routes_using.iter().next() {
+            // (A module used by zero routes belongs to none — skip, don't panic.)
             route_exclusive
                 .entry(route.clone())
                 .or_default()

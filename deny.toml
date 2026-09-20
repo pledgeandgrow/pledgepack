@@ -5,11 +5,6 @@
 # can't silently become permanent — see PRODUCTION-READINESS-100.md goal 6.
 version = 2
 ignore = [
-    # rkyv 0.7 — OOB reads in archives with Rc/Arc. Transitive via parcel_sourcemap
-    # (lightningcss). Cannot upgrade until parcel_sourcemap releases a new version.
-    # Risk is low: only used for sourcemap encoding, not untrusted input.
-    # review-by: 2026-12-15
-    "RUSTSEC-2026-0235",
     # bincode 2.0.1 — flagged as unmaintained. This is the latest major version
     # and is stable/feature-complete. No viable drop-in replacement with serde support.
     # Will revisit if a maintained fork emerges.
@@ -146,23 +141,9 @@ name = "syn"
 version = "3.0.3"
 
 #
-# (B) lightningcss 1.0.0-alpha.72's own dependency tree (parcel_sourcemap,
-#     rkyv 0.7, lightningcss-derive) pins older majors than the rest of the
-#     workspace. Same root cause already tracked as a documented risk in
-#     [advisories] (RUSTSEC-2026-0235) — will resolve together when
-#     lightningcss leaves alpha (see goal 23).
-[[bans.skip]]
-name = "ahash"
-version = "0.7.8"
-[[bans.skip]]
-name = "hashbrown"
-version = "0.12.3"
-[[bans.skip]]
-name = "dashmap"
-version = "5.5.3"
-[[bans.skip]]
-name = "base64-simd"
-version = "0.7.0"
+# (B) lightningcss 1.0.0-alpha.72 (built with default-features = false, which
+#     drops parcel_sourcemap/rkyv/dashmap 5/ahash 0.7 — see Cargo.toml) still
+#     pulls a legacy syn 1.x via lightningcss-derive.
 [[bans.skip]]
 name = "syn"
 version = "1.0.109"
@@ -238,9 +219,6 @@ version = "0.7.15"
 [[bans.skip]]
 name = "num-bigint"
 version = "0.4.8"
-[[bans.skip]]
-name = "outref"
-version = "0.1.0"
 [[bans.skip]]
 name = "miniz_oxide"
 version = "0.8.9"

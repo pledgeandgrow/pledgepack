@@ -15,13 +15,18 @@
 | Production Readiness — Batch 1 (security/correctness) | 50 | 50 | ✅ Implemented |
 | Production Readiness — Batch 2 (transforms/HMR/resolver/server) | 50 | 50 | ✅ Implemented |
 | Production Readiness — Batch 3 (remaining gaps) | 50 | 50 | ✅ Implemented |
-| **wasmtime v28 API migration** | — | — | 🔴 Blocked (pre-existing) |
+| **wasmtime 28 → 48 bump** | — | — | ✅ Committed 2026-09-17 (`75946ba`) — advisories cleared |
+| **wasm-plugin-host compile break** | — | — | ✅ Resolved 2026-09-17 — crate compiles + all tests pass (40 unit + 20 e2e) on wasmtime 48; exclusion removed from CI |
 
 > **Note:** Feature completeness and production hardening are separate tracks.
 > All 150 production-readiness goals across three audit batches are implemented
 > and compile cleanly under `cargo check --target x86_64-pc-windows-gnu`. The
-> only remaining blocker is the `wasm-plugin-host` crate, which predates the
-> wasmtime 28 API and needs a dedicated migration (see LIMITATIONS.md).
+> only remaining blocker is the `wasm-plugin-host` crate, which doesn't
+> compile as a whole crate and is excluded from workspace checks (see
+> LIMITATIONS.md). Its dep was bumped to wasmtime 48.0.2 on 2026-09-17 but
+> the crate's WASI code still targets the 28-era API and has never been
+> checked on 48. **[Fully resolved later 2026-09-17 — the crate compiles,
+> all its tests pass on wasmtime 48, and it's back in CI.]**
 >
 > **2026-09-15 correction — this "Status" table and the "✅ Implemented" batch
 > summaries below predate a source-level audit and are self-reported, not
@@ -285,7 +290,7 @@ Three audit batches have been implemented. Below is what was completed.
 ## Remaining Work
 
 ### Blocked
-- **wasm-plugin-host wasmtime v28 migration** — `WasiCtxView`, `HasSelf`, `p2::add_to_linker`, `StoreLimitsBuilder`, and `task_transform` module all changed in wasmtime 28. This is a pre-existing issue requiring a dedicated compatibility review across ~17 wasmtime major versions. The crate is excluded from workspace checks until migrated.
+- ~~**wasm-plugin-host doesn't compile**~~ — **resolved 2026-09-17**: `task_transform` + `ast_pool` were wired into `pledgepack-core`'s module tree (they existed on disk but were never declared), the WASI integration was migrated to the wasmtime-48 API (`WasiCtxView`, `p2::add_to_linker_sync`, `HasSelf` bindgen accessor), and the e2e fixture was rebuilt for `wasm32-wasip2`. The crate now compiles clean under `clippy -D warnings` and passes 40 unit + 20 e2e tests on wasmtime 48.0.2; the workspace `--exclude pledgepack-wasm-plugin-host` flags were removed from CI.
 
 ### Future
 - Real-world testing at scale and edge case discovery
@@ -301,7 +306,7 @@ Three audit batches have been implemented. Below is what was completed.
 ### Foundation (Phases 0–5)
 - Phase 0: WIT plugin contract frozen at v0.1.2, WASM validation complete
 - Phase 1: Task graph substrate — `Task<T>`, `DependencyGraph`, `TaskEngine`, Zig `TaskGraph`
-- Phase 2: WASM plugin host — wasmtime, sandboxed, 9 hooks, AOT compilation (currently pinned at wasmtime 28.0.1; needs migration to newer API — see LIMITATIONS.md)
+- Phase 2: WASM plugin host — wasmtime 48.0.2, sandboxed, 9 hooks, AOT compilation (compiles + 40 unit / 20 e2e tests green as of 2026-09-17 — see LIMITATIONS.md)
 - Phase 3: JS plugin shim — QuickJS (rquickjs 0.12.2), content-addressed caching
 - Phase 4: Shared AST — `AstPool` parse-once, dynamic import detection, i18n extraction
 - Phase 5: Async scheduler — `transform_via_task_engine()` with `tokio::task::JoinSet`
@@ -320,7 +325,7 @@ All 106 integration verification goals complete: PSX transform pipeline, dev ser
 
 ## Next Focus
 
-1. **wasmtime migration** — Migrate `wasm-plugin-host` from wasmtime 28.0.1 to a supported version (~17 major versions of API changes)
+1. **wasm-plugin-host** ~~compile break~~ — **resolved 2026-09-17** (see Blocked above); next step for the WASM tier is real-world plugin coverage beyond the test fixture
 2. **Real-world validation** — Production testing at scale, edge case discovery, memory profiling
 3. **PledgeStack integration** — End-to-end framework validation with real applications
 4. **PostCSS ecosystem** — Node.js subprocess for full PostCSS plugin support

@@ -26,7 +26,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
-          targets: wasm32-wasip1
+          targets: wasm32-wasip2
 
       - name: Work around stale rustup directory override
         # Hosted runners occasionally carry a stale rustup directory
@@ -55,20 +55,23 @@ jobs:
         # (not a workspace member — see its Cargo.toml) so it's built with its
         # own `cargo build`, not folded into the workspace build below.
         # See PRODUCTION-READINESS-100.md goals 1-2.
+        # Built for wasm32-wasip2 — the target emits a real component
+        # binary; a wasm32-wasip1 build is only a core module and cannot be
+        # instantiated by wasmtime::component::Component.
         working-directory: crates/wasm-plugin-host/tests/test-plugin-guest
-        run: cargo build --release --target wasm32-wasip1
+        run: cargo build --release --target wasm32-wasip2
 
       - name: Check formatting
         run: cargo fmt --all -- --check
 
       - name: Build
-        run: cargo build --workspace --exclude pledgepack-wasm-plugin-host --all-targets
+        run: cargo build --locked --workspace --all-targets
 
       - name: Clippy (deny warnings)
-        run: cargo clippy --workspace --exclude pledgepack-wasm-plugin-host --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Test
-        run: cargo test --workspace --exclude pledgepack-wasm-plugin-host --all-targets
+        run: cargo test --locked --workspace --all-targets
 
       - name: Binary size budget (release build, Linux only)
         # Goal 61: LIMITATIONS.md's "Binary Size" entry claims a resolved
@@ -94,6 +97,24 @@ jobs:
             exit 1
           fi
 
+      - name: npm pack + install artifact smoke (Linux only)
+        # Exercises what npm consumers actually receive: tarball contents,
+        # bin/pledge.js binary resolution, and a real binary launch. The
+        # postinstall download path is covered by release.yml's
+        # artifact-smoke job against the just-published package.
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          SMOKE_DIR=$(mktemp -d)
+          TARBALL=$(npm pack --pack-destination "$SMOKE_DIR" | tail -1)
+          tar -xzf "$SMOKE_DIR/$TARBALL" -C "$SMOKE_DIR"
+          PLATFORM_KEY="linux-x64"
+          mkdir -p "$SMOKE_DIR/package/bin/$PLATFORM_KEY"
+          cp target/release/pledge "$SMOKE_DIR/package/bin/$PLATFORM_KEY/pledge"
+          chmod +x "$SMOKE_DIR/package/bin/$PLATFORM_KEY/pledge"
+          "$SMOKE_DIR/package/bin/$PLATFORM_KEY/pledge" --version
+          node "$SMOKE_DIR/package/bin/pledge.js" --version
+          echo "Artifact smoke passed: packed tarball launches a real binary"
+
   # ── Security audit ────────────────────────────────────────────────────
   audit:
     name: Security Audit
@@ -118,7 +139,7 @@ jobs:
         run: cargo install cargo-audit --locked
 
       - name: Run cargo-audit
-        run: cargo audit --ignore RUSTSEC-2026-0235 --ignore RUSTSEC-2025-0141 --ignore RUSTSEC-2024-0436
+        run: cargo audit   # ignores come from .cargo/audit.toml
 
       - name: Run cargo-deny (licenses + advisories + bans + sources)
         uses: EmbarkStudios/cargo-deny-action@v2
@@ -265,22 +286,21 @@ jobs:
       - name: Build WASM plugin test fixture
         working-directory: crates/wasm-plugin-host/tests/test-plugin-guest
         run: |
-          rustup target add wasm32-wasip1
-          cargo build --release --target wasm32-wasip1
+          rustup target add wasm32-wasip2
+          cargo build --release --target wasm32-wasip2
 
       - name: Test
-        run: cargo test --workspace --exclude pledgepack-wasm-plugin-host --all-targets
+        run: cargo test --workspace --all-targets
 
   # ── Fuzz target build smoke test ────────────────────────────────────────
-  # Best-effort: builds (does not run — a real fuzzing run is unbounded) the
-  # fuzz targets under fuzz/ so they can't silently bitrot. Non-blocking
-  # (continue-on-error) since this was added without the ability to verify
-  # cargo-fuzz's nightly-toolchain build locally — see fuzz/README.md and
-  # PRODUCTION-READINESS-100.md goal 29.
+  # ENFORCED (blocking): builds — does not run; a real fuzzing run is
+  # unbounded — every target under fuzz/ so they can't silently bitrot, and
+  # then runs each for a short fixed budget as a smoke test. A failure here
+  # fails CI. Actually fuzzing for longer is a manual / scheduled activity —
+  # see fuzz/README.md and PRODUCTION-READINESS-100.md goal 29.
   fuzz-smoke:
-    name: Fuzz targets build
+    name: Fuzz targets build + smoke run
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v5
 
@@ -310,9 +330,13 @@ jobs:
 
       - name: Build fuzz targets
         working-directory: fuzz
+        run: cargo +nightly fuzz build
+
+      - name: Smoke-run each fuzz target (30s)
+        working-directory: fuzz
         run: |
-          cargo +nightly fuzz build resolve_specifier
-          cargo +nightly fuzz build package_json_exports
+          cargo +nightly fuzz run resolve_specifier -- -max_total_time=30
+          cargo +nightly fuzz run package_json_exports -- -max_total_time=30
 
   # ── npm package dry-run (verify package.json is valid) ────────────────
   npm-dry-run:

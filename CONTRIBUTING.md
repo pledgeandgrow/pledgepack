@@ -1,6 +1,6 @@
-# Contributing to Pledge
+# Contributing to PledgePack
 
-Thank you for your interest in contributing to Pledge! This document outlines the process for contributing to the project.
+Thank you for your interest in contributing to PledgePack! This document outlines the process for contributing to the project.
 
 ## Getting Started
 
@@ -17,17 +17,55 @@ Thank you for your interest in contributing to Pledge! This document outlines th
 git clone https://github.com/pledgeandgrow/pledgepack.git
 cd pledgepack
 
-# Build the project
-.\build.ps1        # Windows
-# or
-zig build -Doptimize=ReleaseFast && cargo build --release  # Manual
+# Build the Zig native library first (required by native-sys), then Rust
+zig build -Doptimize=ReleaseFast
+cargo build --release
 
 # Run tests
 cargo test
 
 # Run benchmarks
-.\build.ps1 bench
+zig build bench              # Zig-side micro-benchmarks
+cargo bench -p pledgepack-core  # criterion benchmarks for the transform pipeline
 ```
+
+## Distribution & Publish Policy
+
+PledgePack is **distributed only as an npm package** (`pledgepack`), which
+downloads a prebuilt native `pledge` binary from the matching GitHub Release
+at install time (`bin/postinstall.js`). The Rust crates in this workspace are
+**not published to crates.io**, and `publish = false` in the workspace
+`Cargo.toml` is intentional:
+
+- it prevents an accidental `cargo publish` of internal crates;
+- it lets `cargo deny`'s wildcard check pass without pinning a version on
+  every intra-workspace path dependency;
+- the crates are not a supported public Rust API — the CLI, the config file
+  and the plugin interfaces (JS host, WASM/WIT contract) are.
+
+Do not add a `CARGO_REGISTRY_TOKEN` or a `cargo publish` step to the release
+workflow. If a crate ever needs to be published (for example the plugin SDK),
+that is a deliberate, separately-reviewed decision: remove
+`publish.workspace = true` from that crate only, give its internal
+dependencies real `version` requirements, and document the new public API
+contract first.
+
+### Cutting a release
+
+1. Bump the version everywhere at once: `Cargo.toml` (`[workspace.package]`),
+   `package.json`, `platforms.json` (`version`), and refresh the lockfile
+   (`cargo update -w`). `bash scripts/check-versions.sh [vX.Y.Z]` verifies all
+   of them (and `Cargo.lock`) agree; CI runs it on every PR.
+2. Add a `## [X.Y.Z] - YYYY-MM-DD` section to `docs/CHANGELOG.md`
+   (`scripts/check-changelog-entry.sh` blocks the release without it).
+3. **Rehearse first:** Actions → *Release* → *Run workflow* with the version and
+   `dry_run: true` (the default). This runs the security gate, builds all six
+   platforms, verifies the archive set and runs `npm publish --dry-run` —
+   without signing, tagging, creating a GitHub release or publishing.
+4. Push the tag `vX.Y.Z` to run the real release (signs artifacts with cosign,
+   creates the GitHub Release, publishes to npm with provenance). Prerelease
+   versions (`1.0.0-rc.1`) are published under the matching npm dist-tag
+   (`rc`), never `latest`.
 
 ## Development Workflow
 
@@ -106,19 +144,23 @@ Then create a pull request on GitHub with:
 
 ```
 crates/
-├── cli/              # CLI entry point (pledgepack-cli)
-├── core/             # Core engine, config, transform, pipeline
-├── cache/            # Function-level incremental cache
-├── resolver/         # Module resolution
-├── dev-server/       # Dev server + HMR
-├── optimizer/        # Tree shaking, code splitting
-├── js-plugin-host/   # JS plugin system (QuickJS via rquickjs)
-├── adapter-react/    # React adapter
-├── adapter-solid/    # Solid.js adapter
-├── adapter-next/     # Next.js adapter
-└── adapter-tanstack/ # TanStack Router adapter
-native-sys/           # Zig FFI bindings
-docs/                 # Documentation
+├── cli/                 # CLI entry point (pledgepack-cli; binary: pledge)
+├── core/                # Core engine, config, transform, pipeline
+├── cache/               # Function-level incremental cache
+├── resolver/            # Module resolution
+├── dev-server/          # Dev server + HMR
+├── optimizer/           # Tree shaking, code splitting
+├── js-plugin-host/      # JS plugin system (QuickJS via rquickjs)
+├── wasm-plugin-host/    # WASM plugin host (wasmtime, Component Model)
+├── task-system/         # Parallel task execution engine
+├── task-system-macros/  # #[task] proc macros for task-system
+├── adapter-react/       # React adapter
+├── adapter-solid/       # Solid.js adapter
+├── adapter-next/        # Next.js adapter
+├── adapter-tanstack/    # TanStack Router adapter
+└── adapter-pledgestack/ # PledgeStack adapter (route discovery + manifest)
+native-sys/              # Zig FFI bindings
+docs/                    # Documentation
 ```
 
 ## Testing
@@ -140,7 +182,7 @@ cargo bench
 ## Reporting Issues
 
 When reporting issues, please include:
-- Pledge version (`pledge --version`)
+- PledgePack version (`pledgepack --version`, or `target/release/pledge --version` for a locally-built binary)
 - Operating system
 - Rust version (`rustc --version`)
 - Zig version (`zig version`)

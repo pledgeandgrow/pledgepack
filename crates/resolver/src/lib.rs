@@ -375,6 +375,13 @@ impl Resolver {
             .trim_end_matches("?worker")
             .trim_end_matches("?sharedworker");
 
+        // On Windows, specifiers may use backslashes (`.\foo`, `..\bar`,
+        // `C:\proj\a.ts`); a bare package specifier never contains one.
+        #[cfg(windows)]
+        let normalized_specifier = specifier.replace('\\', "/");
+        #[cfg(windows)]
+        let specifier = normalized_specifier.as_str();
+
         // 1. Check aliases (sorted longest-first to avoid prefix mismatches, e.g.
         //    so that `@/` does not incorrectly match `@components/Button`)
         let mut sorted_aliases: Vec<&Alias> = self.aliases.iter().collect();
@@ -402,7 +409,11 @@ impl Resolver {
         }
 
         // 3. Relative paths
-        if specifier.starts_with("./") || specifier.starts_with("../") {
+        if specifier.starts_with("./")
+            || specifier.starts_with("../")
+            || specifier == "."
+            || specifier == ".."
+        {
             let base = importer.parent().unwrap_or(&self.root);
             let path = base.join(specifier);
             if let Some(resolved) = self.try_resolve_path(&path)? {
@@ -410,8 +421,8 @@ impl Resolver {
             }
         }
 
-        // 4. Absolute paths
-        if specifier.starts_with('/') {
+        // 4. Absolute paths (POSIX `/x`, or a Windows drive path `C:/x`)
+        if specifier.starts_with('/') || Path::new(specifier).is_absolute() {
             let path = PathBuf::from(specifier);
             if let Some(resolved) = self.try_resolve_path(&path)? {
                 return Ok(resolved);
@@ -427,7 +438,7 @@ impl Resolver {
         }
 
         // 6. Bare specifier → node_modules
-        if let Some(resolved) = self.resolve_node_module(specifier)? {
+        if let Some(resolved) = self.resolve_node_module(specifier, importer)? {
             return Ok(resolved);
         }
 
@@ -440,11 +451,33 @@ impl Resolver {
             return Ok(Some(canonicalize_or_warn(path.to_path_buf())));
         }
 
-        // Try with extensions
+        // Try appending each extension: `./foo.config` -> `foo.config.ts`.
+        // (Replacing the extension here used to collapse `./foo.config` and
+        // `./jquery.min` onto an unrelated `foo.ts` / `jquery.ts`.)
         for ext in &self.extensions {
-            let with_ext = path.with_extension(ext.trim_start_matches('.'));
+            let mut s = path.as_os_str().to_os_string();
+            s.push(if ext.starts_with('.') {
+                ext.clone()
+            } else {
+                format!(".{ext}")
+            });
+            let with_ext = PathBuf::from(s);
             if with_ext.is_file() {
                 return Ok(Some(canonicalize_or_warn(with_ext)));
+            }
+        }
+
+        // TypeScript ESM convention: `./util.js` may refer to `util.ts`.
+        if path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| matches!(e, "js" | "jsx" | "mjs" | "cjs"))
+        {
+            for ext in &self.extensions {
+                let with_ext = path.with_extension(ext.trim_start_matches('.'));
+                if with_ext.is_file() {
+                    return Ok(Some(canonicalize_or_warn(with_ext)));
+                }
             }
         }
 
@@ -461,18 +494,20 @@ impl Resolver {
         Ok(None)
     }
 
-    fn resolve_node_module(&self, specifier: &str) -> Result<Option<PathBuf>> {
-        let mut current = self.root.clone();
-
+    fn resolve_node_module(&self, specifier: &str, importer: &Path) -> Result<Option<PathBuf>> {
         // Split package name and subpath (e.g., "react/jsx-runtime" → "react" + "/jsx-runtime")
         let (pkg_name, subpath) = if let Some(rest) = specifier.strip_prefix('@') {
             // Scoped package: @scope/name/subpath
             if let Some(idx) = rest.find('/') {
-                let after_scope = &rest[..idx];
+                // `idx` ends the scope; the package name runs to the next
+                // '/', which starts the subpath. (This used to look for a
+                // '/' inside the scope itself, so scoped subpath imports
+                // like `@scope/pkg/feature` never split and bypassed the
+                // package's `exports` map.)
+                let after_scope = &rest[idx + 1..];
                 if let Some(sub_idx) = after_scope.find('/') {
-                    let pkg = &specifier[..1 + sub_idx + 1];
-                    let sub = &specifier[1 + sub_idx + 1..];
-                    (pkg, Some(sub))
+                    let split = 1 + idx + 1 + sub_idx;
+                    (&specifier[..split], Some(&specifier[split..]))
                 } else {
                     (specifier, None)
                 }
@@ -485,62 +520,130 @@ impl Resolver {
             (specifier, None)
         };
 
-        loop {
-            let node_modules = current.join("node_modules");
-            if node_modules.is_dir() {
-                let module_path = node_modules.join(pkg_name);
+        // A bare specifier must not climb out of its package directory
+        // (`pkg/../../secret.js`), nor name `.`/`..`/backslash paths.
+        if specifier
+            .split('/')
+            .any(|seg| seg == ".." || seg == "." || seg.contains('\\'))
+            || pkg_name.is_empty()
+        {
+            return Ok(None);
+        }
 
-                // If the standard location is a symlink (pnpm layout), resolve it
-                // to the real path inside the virtual store (.pnpm).
-                let module_path = if module_path.exists() {
-                    canonicalize_or_warn(module_path)
-                } else {
-                    module_path
-                };
+        // Node resolution starts at the *importer's* directory and walks up
+        // (so a package's own `node_modules`, a pnpm virtual-store sibling
+        // dependency, or a workspace package's local install wins), then
+        // falls back to walking up from the project root.
+        let mut starts: Vec<PathBuf> = Vec::with_capacity(2);
+        if importer.is_absolute()
+            && let Some(dir) = importer.parent()
+        {
+            starts.push(dir.to_path_buf());
+        }
+        starts.push(self.root.clone());
 
-                // Check package.json for entry point
-                let pkg_json = module_path.join("package.json");
-                if pkg_json.is_file()
-                    && let Ok(content) = std::fs::read_to_string(&pkg_json)
-                    && let Ok(pkg) = serde_json::from_str::<serde_json::Value>(&content)
+        let mut visited = std::collections::HashSet::new();
+        for start in starts {
+            let mut current = start;
+            loop {
+                let is_nm_dir = current
+                    .file_name()
+                    .is_some_and(|n| n.eq_ignore_ascii_case("node_modules"));
+                if !is_nm_dir
+                    && visited.insert(current.clone())
                     && let Some(resolved) =
-                        self.resolve_package_entry(&module_path, &pkg, subpath, specifier)?
+                        self.resolve_in_node_modules(&current, pkg_name, subpath, specifier)?
                 {
                     return Ok(Some(resolved));
                 }
-
-                // Try direct file resolution for subpath
-                if let Some(sub) = subpath {
-                    let sub_path = module_path.join(sub.trim_start_matches('/'));
-                    if let Some(resolved) = self.try_resolve_path(&sub_path)? {
-                        return Ok(Some(resolved));
-                    }
+                // Go up one directory
+                if !current.pop() {
+                    break;
                 }
-
-                // Try direct file resolution
-                if let Some(resolved) = self.try_resolve_path(&module_path)? {
-                    return Ok(Some(resolved));
-                }
-
-                // pnpm fallback: the package may not be symlinked into the top
-                // level of node_modules but still exists in the virtual store
-                // under node_modules/.pnpm/{pkg}@version/node_modules/{pkg}.
-                let pnpm_dir = node_modules.join(".pnpm");
-                if pnpm_dir.is_dir()
-                    && let Some(resolved) =
-                        self.resolve_pnpm_package(&pnpm_dir, pkg_name, subpath, specifier)?
-                {
-                    return Ok(Some(resolved));
-                }
-            }
-
-            // Go up one directory
-            if !current.pop() {
-                break;
             }
         }
 
         Ok(None)
+    }
+
+    /// Look for `pkg_name` in `<dir>/node_modules` (following pnpm symlinks,
+    /// then the `.pnpm` virtual store and its hoisted `.pnpm/node_modules`).
+    fn resolve_in_node_modules(
+        &self,
+        dir: &Path,
+        pkg_name: &str,
+        subpath: Option<&str>,
+        specifier: &str,
+    ) -> Result<Option<PathBuf>> {
+        let node_modules = dir.join("node_modules");
+        if !node_modules.is_dir() {
+            return Ok(None);
+        }
+        let module_path = node_modules.join(pkg_name);
+
+        // If the standard location is a symlink (pnpm layout), resolve it
+        // to the real path inside the virtual store (.pnpm).
+        let module_path = if module_path.exists() {
+            canonicalize_or_warn(module_path)
+        } else {
+            module_path
+        };
+
+        if let Some(resolved) = self.resolve_package_dir(&module_path, subpath, specifier)? {
+            return Ok(Some(resolved));
+        }
+
+        // pnpm fallbacks: the package may not be symlinked into the top
+        // level of node_modules but still exist in the virtual store
+        // under node_modules/.pnpm/{pkg}@version/node_modules/{pkg}, or in
+        // pnpm's hoisted dir node_modules/.pnpm/node_modules/{pkg}.
+        let pnpm_dir = node_modules.join(".pnpm");
+        if pnpm_dir.is_dir() {
+            let hoisted = pnpm_dir.join("node_modules").join(pkg_name);
+            if hoisted.exists()
+                && let Some(resolved) =
+                    self.resolve_package_dir(&canonicalize_or_warn(hoisted), subpath, specifier)?
+            {
+                return Ok(Some(resolved));
+            }
+            if let Some(resolved) =
+                self.resolve_pnpm_package(&pnpm_dir, pkg_name, subpath, specifier)?
+            {
+                return Ok(Some(resolved));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Resolve `subpath` (or the entry point) inside the package directory
+    /// `module_path`: package.json `exports`/`module`/`main`, then plain files.
+    fn resolve_package_dir(
+        &self,
+        module_path: &Path,
+        subpath: Option<&str>,
+        specifier: &str,
+    ) -> Result<Option<PathBuf>> {
+        // Check package.json for entry point
+        let pkg_json = module_path.join("package.json");
+        if pkg_json.is_file()
+            && let Ok(content) = std::fs::read_to_string(&pkg_json)
+            && let Ok(pkg) = serde_json::from_str::<serde_json::Value>(&content)
+            && let Some(resolved) =
+                self.resolve_package_entry(module_path, &pkg, subpath, specifier)?
+        {
+            return Ok(Some(resolved));
+        }
+
+        // Try direct file resolution for subpath
+        if let Some(sub) = subpath {
+            let sub_path = module_path.join(sub.trim_start_matches('/'));
+            if let Some(resolved) = self.try_resolve_path(&sub_path)? {
+                return Ok(Some(resolved));
+            }
+        }
+
+        // Try direct file resolution
+        self.try_resolve_path(module_path)
     }
 
     /// Resolve a package's entry point given its directory and parsed package.json.
@@ -621,7 +724,9 @@ impl Resolver {
         subpath: Option<&str>,
         specifier: &str,
     ) -> Result<Option<PathBuf>> {
-        let prefix = format!("{}@", pkg_name);
+        // pnpm encodes a scoped package's '/' as '+' in virtual-store
+        // directory names (`@scope+name@1.0.0`).
+        let prefix = format!("{}@", pkg_name.replace('/', "+"));
         if let Ok(entries) = std::fs::read_dir(pnpm_dir) {
             for entry in entries.flatten() {
                 let name = entry.file_name().to_string_lossy().to_string();
@@ -657,87 +762,152 @@ impl Resolver {
         Ok(None)
     }
 
-    /// Resolve using package.json "exports" field
+    /// Resolve using package.json "exports" field.
+    ///
+    /// Supports the string/array/conditions sugar forms, exact subpath keys
+    /// (`"./feat"`), and subpath patterns with a single `*` anywhere in the
+    /// key (`"./features/*.js"`), choosing the most specific matching key
+    /// like Node does (longest prefix before the `*`).
     fn resolve_exports(
         &self,
         exports: &serde_json::Value,
         subpath: Option<&str>,
         module_path: &Path,
     ) -> Result<Option<PathBuf>> {
-        // exports can be:
-        //   "./foo.js" → { "import": "...", "require": "..." }
-        //   { ".": { "import": "./esm/index.js" }, "./utils": { "import": "./esm/utils.js" } }
-        //   { "import": "./esm/index.js" } (sugar for ".")
-
-        let target_key = subpath.unwrap_or(".");
-
-        if let Some(obj) = exports.as_object() {
-            // Check if it's a conditional export (top-level keys like "import", "require")
-            if (obj.contains_key("import")
-                || obj.contains_key("require")
-                || obj.contains_key("default"))
-                && target_key == "."
-            {
-                // Sugar form: top-level conditions apply to "."
-                return self.resolve_conditions(obj, module_path);
-            }
-
-            // Subpath exports: look for matching key
-            for (key, value) in obj {
-                if key == target_key {
-                    if let Some(obj2) = value.as_object() {
-                        return self.resolve_conditions(obj2, module_path);
-                    } else if let Some(path) = value.as_str() {
-                        let resolved = module_path.join(path);
-                        if resolved.is_file() {
-                            return Ok(Some(canonicalize_or_warn(resolved)));
-                        }
+        // `subpath` arrives as "/feat" (the tail of `pkg/feat`) but `exports`
+        // keys are "./feat" — without this every subpath export missed its
+        // key and only worked when a same-named file happened to exist.
+        let normalized_subpath = subpath.map(|s| {
+            if s.starts_with("./") {
+                s.to_string()
+            } else {
+                format!(
+                    ".{}",
+                    if s.starts_with('/') {
+                        s.to_string()
+                    } else {
+                        format!("/{s}")
                     }
-                }
+                )
+            }
+        });
+        let target_key = normalized_subpath.as_deref().unwrap_or(".");
 
-                // Pattern matching: "./utils/*" → "./utils/*.js"
-                if key.ends_with('*') && target_key.starts_with(&key[..key.len() - 1]) {
-                    let pattern_prefix = &key[..key.len() - 1];
-                    let rest = &target_key[pattern_prefix.len()..];
-                    if let Some(path) = value.as_str() {
-                        let resolved_path = path.replace('*', rest);
-                        let resolved = module_path.join(&resolved_path);
-                        if resolved.is_file() {
-                            return Ok(Some(canonicalize_or_warn(resolved)));
-                        }
-                    } else if let Some(obj2) = value.as_object()
-                        && let Some(path) = self.resolve_conditions(obj2, module_path)?.as_ref()
-                    {
-                        // Replace pattern in resolved path
-                        let path_str = path.to_string_lossy();
-                        if path_str.contains('*') {
-                            let replaced = path_str.replace('*', rest);
-                            let p = PathBuf::from(replaced);
-                            if p.is_file() {
-                                return Ok(Some(p));
-                            }
-                        }
-                        return Ok(Some(path.clone()));
-                    }
-                }
+        let subpath_map = exports
+            .as_object()
+            .filter(|obj| obj.keys().any(|k| k.starts_with('.')));
+        let Some(obj) = subpath_map else {
+            // String / array / top-level conditions: sugar for the "." export.
+            if target_key != "." {
+                return Ok(None);
             }
-        } else if let Some(path) = exports.as_str() {
-            // Direct string export
-            if target_key == "." {
-                let resolved = module_path.join(path);
-                if resolved.is_file() {
-                    return Ok(Some(canonicalize_or_warn(resolved)));
-                }
-            }
+            return self.resolve_target(exports, module_path, None, false, None);
+        };
+
+        if let Some(value) = obj.get(target_key)
+            && !target_key.contains('*')
+        {
+            return self.resolve_target(value, module_path, None, false, None);
         }
 
-        Ok(None)
+        match best_pattern_match(obj.keys().map(String::as_str), target_key) {
+            Some((key, star)) => {
+                self.resolve_target(&obj[key], module_path, Some(&star), false, None)
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Resolve an `exports`/`imports` target: a string path, an array of
+    /// fallbacks, a conditions object (nested to any depth), or `null`.
+    ///
+    /// * `star` substitutes `*` in pattern targets.
+    /// * `imports` targets (`allow_bare`) may also be bare package specifiers,
+    ///   resolved from `importer`; `probe` lets `imports` targets use
+    ///   extension/index probing like the pre-existing behaviour.
+    fn resolve_target(
+        &self,
+        target: &serde_json::Value,
+        base: &Path,
+        star: Option<&str>,
+        probe: bool,
+        bare_from: Option<&Path>,
+    ) -> Result<Option<PathBuf>> {
+        match target {
+            serde_json::Value::String(s) => {
+                let s = match star {
+                    Some(star) => s.replace('*', star),
+                    None => s.clone(),
+                };
+                if let Some(rel) = s.strip_prefix("./") {
+                    // Targets are package-relative: never `..`, never into a
+                    // nested node_modules.
+                    if rel
+                        .split(['/', '\\'])
+                        .any(|seg| seg == ".." || seg.eq_ignore_ascii_case("node_modules"))
+                    {
+                        return Ok(None);
+                    }
+                    let resolved = base.join(rel);
+                    if probe {
+                        return self.try_resolve_path(&resolved);
+                    }
+                    if resolved.is_file() {
+                        return Ok(Some(canonicalize_or_warn(resolved)));
+                    }
+                    return Ok(None);
+                }
+                if let Some(importer) = bare_from
+                    && !s.starts_with('/')
+                    && !s.starts_with("../")
+                    && !s.is_empty()
+                {
+                    return self.resolve_node_module(&s, importer);
+                }
+                Ok(None)
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    if let Some(p) = self.resolve_target(item, base, star, probe, bare_from)? {
+                        return Ok(Some(p));
+                    }
+                }
+                Ok(None)
+            }
+            serde_json::Value::Object(obj) => {
+                // Custom conditions first, then context-derived conditions.
+                for condition in self.condition_list() {
+                    if let Some(value) = obj.get(&condition)
+                        && let Some(p) = self.resolve_target(value, base, star, probe, bare_from)?
+                    {
+                        return Ok(Some(p));
+                    }
+                }
+                Ok(None)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Condition names in priority order: custom conditions (#119) first,
+    /// then those derived from the runtime/module-type context.
+    fn condition_list(&self) -> Vec<String> {
+        let mut all_conditions: Vec<String> = self.custom_conditions.clone();
+        for c in conditions_for_context(self.runtime, self.module_type) {
+            let s = c.to_string();
+            if !all_conditions.contains(&s) {
+                all_conditions.push(s);
+            }
+        }
+        all_conditions
     }
 
     /// Resolve internal package imports (package.json "imports" field, #subpaths).
     ///
     /// Walks up from the importing file to find the nearest package.json and
-    /// checks its "imports" field for the `#`-prefixed specifier.
+    /// checks its "imports" field for the `#`-prefixed specifier. Supports
+    /// exact keys and `*` patterns (`"#utils/*": "./src/utils/*.js"`), nested
+    /// conditions, and bare-package targets (`"#dep": "dep-pkg"`).
     fn resolve_imports(&self, specifier: &str, importer: &Path) -> Result<Option<PathBuf>> {
         let mut current = importer.parent().unwrap_or(&self.root).to_path_buf();
         loop {
@@ -747,24 +917,22 @@ impl Resolver {
                 && let Ok(pkg) = serde_json::from_str::<serde_json::Value>(&content)
                 && let Some(imports) = pkg.get("imports").and_then(|v| v.as_object())
             {
-                if let Some(mapping) = imports.get(specifier) {
-                    // imports can be a string or a conditional object
-                    if let Some(s) = mapping.as_str() {
-                        return self.try_resolve_path(&current.join(s));
-                    } else if let Some(obj) = mapping.as_object() {
-                        // Conditional imports: resolve using the same
-                        // context-driven condition priority as exports.
-                        for condition in conditions_for_context(self.runtime, self.module_type) {
-                            if let Some(target) = obj.get(condition)
-                                && let Some(t) = target.as_str()
-                            {
-                                let resolved = current.join(t);
-                                if let Some(p) = self.try_resolve_path(&resolved)? {
-                                    return Ok(Some(p));
-                                }
-                            }
-                        }
-                    }
+                let hit = if let Some(mapping) = imports.get(specifier)
+                    && !specifier.contains('*')
+                {
+                    Some((mapping, None))
+                } else {
+                    best_pattern_match(imports.keys().map(String::as_str), specifier)
+                        .map(|(key, star)| (&imports[key], Some(star)))
+                };
+                if let Some((mapping, star)) = hit {
+                    return self.resolve_target(
+                        mapping,
+                        &current,
+                        star.as_deref(),
+                        true,
+                        Some(importer),
+                    );
                 }
                 // imports are package-scoped: once we find a package.json
                 // with an imports field, stop searching upwards.
@@ -776,38 +944,11 @@ impl Resolver {
         }
         Ok(None)
     }
-
-    /// Resolve conditional exports (import/require/default/browser).
-    ///
-    /// Condition priority is derived from the resolver's runtime/module-type
-    /// context rather than a hardcoded order. Custom conditions (#119) always
-    /// take precedence, followed by the context-derived conditions.
-    fn resolve_conditions(
-        &self,
-        obj: &serde_json::Map<String, serde_json::Value>,
-        module_path: &Path,
-    ) -> Result<Option<PathBuf>> {
-        // Custom conditions first, then context-derived conditions.
-        let mut all_conditions: Vec<String> = self.custom_conditions.clone();
-        for c in conditions_for_context(self.runtime, self.module_type) {
-            let s = c.to_string();
-            if !all_conditions.contains(&s) {
-                all_conditions.push(s);
-            }
-        }
-        for condition in &all_conditions {
-            if let Some(value) = obj.get(condition)
-                && let Some(path) = value.as_str()
-            {
-                let resolved = module_path.join(path);
-                if resolved.is_file() {
-                    return Ok(Some(canonicalize_or_warn(resolved)));
-                }
-            }
-        }
-        Ok(None)
-    }
 }
+
+// Pattern-key matching for `exports`/`imports` maps is shared with the build
+// engine: see `pledgepack_core::package_map`.
+use pledgepack_core::package_map::best_pattern_match;
 
 /// Derive export/imports condition priority from a resolution context.
 ///
@@ -908,6 +1049,48 @@ fn strip_json_comments(content: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scoped_package_subpath_honours_exports_map() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let pkg = root.join("node_modules/@scope/pkg");
+        std::fs::create_dir_all(pkg.join("dist")).unwrap();
+        std::fs::write(
+            pkg.join("package.json"),
+            r#"{"name":"@scope/pkg","exports":{".":"./dist/index.js","./feat":"./dist/feature.js"}}"#,
+        )
+        .unwrap();
+        std::fs::write(pkg.join("dist/index.js"), "").unwrap();
+        std::fs::write(pkg.join("dist/feature.js"), "").unwrap();
+        let importer = root.join("src/main.js");
+
+        let resolver = Resolver::new(root.clone(), vec![".js".to_string()], vec![]);
+        let sub = resolver.resolve("@scope/pkg/feat", &importer).unwrap();
+        assert!(sub.ends_with(Path::new("dist/feature.js")), "{sub:?}");
+        let main = resolver.resolve("@scope/pkg", &importer).unwrap();
+        assert!(main.ends_with(Path::new("dist/index.js")), "{main:?}");
+    }
+
+    #[test]
+    fn scoped_package_found_in_pnpm_virtual_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let pkg = root.join("node_modules/.pnpm/@scope+pkg@1.0.0/node_modules/@scope/pkg");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(
+            pkg.join("package.json"),
+            r#"{"name":"@scope/pkg","main":"index.js"}"#,
+        )
+        .unwrap();
+        std::fs::write(pkg.join("index.js"), "").unwrap();
+
+        let resolver = Resolver::new(root.clone(), vec![".js".to_string()], vec![]);
+        let resolved = resolver
+            .resolve("@scope/pkg", &root.join("src/main.js"))
+            .unwrap();
+        assert!(resolved.ends_with("index.js"), "{resolved:?}");
+    }
 
     #[test]
     fn test_resolve_relative() {
@@ -1035,13 +1218,6 @@ mod tests {
     // ─── Goal 54: pnpm nested node_modules edge cases ───────────────────
 
     #[test]
-    #[ignore = "PRODUCTION-READINESS-100.md goal 54/93: deterministically crashes with \
-                STATUS_HEAP_CORRUPTION (0xc0000374) on Windows inside `resolve_pnpm_package` \
-                or something it calls into — root cause not yet found, needs a debugger \
-                session (likely windbg + gflags page-heap). Left in the tree and marked \
-                #[ignore] rather than deleted so the bug stays tracked and the fix, once \
-                found, has a test to un-ignore. Do NOT remove #[ignore] until the crash is \
-                confirmed fixed under a Windows CI run, not just locally."]
     fn pnpm_virtual_store_fallback_resolves_package_not_symlinked_at_top_level() {
         // Mirrors pnpm's real layout: node_modules/some-pkg is normally a
         // symlink into node_modules/.pnpm/some-pkg@1.0.0/node_modules/some-pkg,
@@ -1168,5 +1344,239 @@ mod tests {
 
         assert!(resolver.resolve("./b.js", &a).is_ok());
         assert!(resolver.resolve("./a.js", &b).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod resolution_tests {
+    use super::*;
+
+    fn w(path: &Path, contents: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
+    }
+
+    fn resolver(root: &Path) -> Resolver {
+        Resolver::new(
+            root.to_path_buf(),
+            vec![".ts".into(), ".tsx".into(), ".js".into()],
+            vec![],
+        )
+    }
+
+    fn setup() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        (dir, root)
+    }
+
+    #[test]
+    fn exports_pattern_with_star_in_the_middle_of_the_key() {
+        let (_d, root) = setup();
+        let pkg = root.join("node_modules/pkg");
+        w(
+            &pkg.join("package.json"),
+            r#"{"exports":{"./features/*.js":"./dist/features/*.js"}}"#,
+        );
+        w(&pkg.join("dist/features/a.js"), "");
+        let got = resolver(&root)
+            .resolve("pkg/features/a.js", &root.join("src/m.js"))
+            .unwrap();
+        assert!(got.ends_with(Path::new("dist/features/a.js")), "{got:?}");
+    }
+
+    #[test]
+    fn exports_pattern_with_conditions_object() {
+        let (_d, root) = setup();
+        let pkg = root.join("node_modules/@s/pkg");
+        w(
+            &pkg.join("package.json"),
+            r#"{"exports":{"./utils/*":{"import":"./esm/*.js","default":"./cjs/*.js"}}}"#,
+        );
+        w(&pkg.join("esm/x.js"), "");
+        w(&pkg.join("cjs/x.js"), "");
+        let got = resolver(&root)
+            .resolve("@s/pkg/utils/x", &root.join("src/m.js"))
+            .unwrap();
+        assert!(got.ends_with(Path::new("esm/x.js")), "{got:?}");
+    }
+
+    #[test]
+    fn exports_nested_conditions_and_arrays() {
+        let (_d, root) = setup();
+        let pkg = root.join("node_modules/pkg");
+        w(
+            &pkg.join("package.json"),
+            r#"{"exports":{".":{"import":{"types":"./index.d.ts","default":"./esm/index.js"},"require":"./cjs/index.js"},"./arr":["./missing.js","./arr.js"]}}"#,
+        );
+        w(&pkg.join("esm/index.js"), "");
+        w(&pkg.join("arr.js"), "");
+        let r = resolver(&root);
+        let importer = root.join("src/m.js");
+        assert!(
+            r.resolve("pkg", &importer)
+                .unwrap()
+                .ends_with(Path::new("esm/index.js"))
+        );
+        assert!(r.resolve("pkg/arr", &importer).unwrap().ends_with("arr.js"));
+    }
+
+    #[test]
+    fn exports_target_cannot_escape_the_package() {
+        let (_d, root) = setup();
+        w(&root.join("secret.js"), "");
+        let pkg = root.join("node_modules/pkg");
+        w(
+            &pkg.join("package.json"),
+            r#"{"exports":{"./evil":"../../secret.js"}}"#,
+        );
+        assert!(
+            resolver(&root)
+                .resolve("pkg/evil", &root.join("src/m.js"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn bare_specifier_with_dotdot_subpath_cannot_escape_the_package() {
+        let (_d, root) = setup();
+        w(&root.join("secret.js"), "");
+        w(
+            &root.join("node_modules/pkg/package.json"),
+            r#"{"main":"i.js"}"#,
+        );
+        w(&root.join("node_modules/pkg/i.js"), "");
+        assert!(
+            resolver(&root)
+                .resolve("pkg/../../secret.js", &root.join("src/m.js"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn imports_field_patterns_and_bare_targets() {
+        let (_d, root) = setup();
+        w(
+            &root.join("package.json"),
+            r##"{"imports":{"#utils/*":"./src/utils/*.js","#dep":"dep-pkg","#cond":{"node":"./n.js","default":"./d.js"}}}"##,
+        );
+        w(&root.join("src/utils/fmt.js"), "");
+        w(&root.join("d.js"), "");
+        w(
+            &root.join("node_modules/dep-pkg/package.json"),
+            r#"{"main":"m.js"}"#,
+        );
+        w(&root.join("node_modules/dep-pkg/m.js"), "");
+        let r = resolver(&root);
+        let importer = root.join("src/app.js");
+        assert!(
+            r.resolve("#utils/fmt", &importer)
+                .unwrap()
+                .ends_with(Path::new("src/utils/fmt.js"))
+        );
+        assert!(r.resolve("#dep", &importer).unwrap().ends_with("m.js"));
+        assert!(r.resolve("#cond", &importer).unwrap().ends_with("d.js"));
+    }
+
+    #[test]
+    fn dotted_names_append_extension_instead_of_replacing() {
+        let (_d, root) = setup();
+        w(&root.join("src/foo.ts"), "");
+        w(&root.join("src/foo.config.ts"), "");
+        w(&root.join("src/util.ts"), "");
+        let r = resolver(&root);
+        let importer = root.join("src/main.ts");
+        // `./foo.config` must NOT collapse to foo.ts
+        assert!(
+            r.resolve("./foo.config", &importer)
+                .unwrap()
+                .ends_with("foo.config.ts")
+        );
+        // TS-ESM convention: `./util.js` -> util.ts still works
+        assert!(
+            r.resolve("./util.js", &importer)
+                .unwrap()
+                .ends_with("util.ts")
+        );
+    }
+
+    #[test]
+    fn dependency_of_a_package_in_the_pnpm_store_resolves_from_the_importer() {
+        // .pnpm/a@1/node_modules/{a, b}: `a` imports its sibling dep `b`,
+        // which is NOT under <root>/node_modules at all.
+        let (_d, root) = setup();
+        let store = root.join("node_modules/.pnpm/a@1.0.0/node_modules");
+        w(&store.join("a/package.json"), r#"{"main":"index.js"}"#);
+        w(&store.join("a/index.js"), "");
+        w(&store.join("b/package.json"), r#"{"main":"index.js"}"#);
+        w(&store.join("b/index.js"), "");
+        let got = resolver(&root)
+            .resolve("b", &store.join("a/index.js"))
+            .unwrap();
+        assert!(got.starts_with(&store), "{got:?}");
+        assert!(got.ends_with(Path::new("b/index.js")), "{got:?}");
+    }
+
+    #[test]
+    fn package_local_node_modules_beats_root_node_modules() {
+        let (_d, root) = setup();
+        w(
+            &root.join("node_modules/dep/package.json"),
+            r#"{"main":"i.js"}"#,
+        );
+        w(&root.join("node_modules/dep/i.js"), "root");
+        w(
+            &root.join("packages/app/node_modules/dep/package.json"),
+            r#"{"main":"i.js"}"#,
+        );
+        w(&root.join("packages/app/node_modules/dep/i.js"), "local");
+        let got = resolver(&root)
+            .resolve("dep", &root.join("packages/app/src/x.js"))
+            .unwrap();
+        assert!(got.starts_with(root.join("packages/app")), "{got:?}");
+    }
+
+    #[test]
+    fn symlinked_package_resolves_to_its_real_path() {
+        let (_d, root) = setup();
+        let real = root.join("node_modules/.pnpm/pkg@1.0.0/node_modules/pkg");
+        w(&real.join("package.json"), r#"{"main":"index.js"}"#);
+        w(&real.join("index.js"), "");
+        std::fs::create_dir_all(root.join("node_modules")).unwrap();
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(&real, root.join("node_modules/pkg")).is_ok();
+        #[cfg(windows)]
+        let linked =
+            std::os::windows::fs::symlink_dir(&real, root.join("node_modules/pkg")).is_ok();
+        if !linked {
+            eprintln!("skipping: cannot create symlinks on this runner");
+            return;
+        }
+        let got = resolver(&root)
+            .resolve("pkg", &root.join("src/m.js"))
+            .unwrap();
+        assert_eq!(got, real.join("index.js").canonicalize().unwrap());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_absolute_and_backslash_specifiers() {
+        let (_d, root) = setup();
+        w(&root.join("src/a.ts"), "");
+        w(&root.join("src/b.ts"), "");
+        let r = resolver(&root);
+        let importer = root.join("src/b.ts");
+        // drive-letter absolute path with backslashes
+        let abs = root.join("src/a.ts");
+        let abs_str = abs
+            .to_string_lossy()
+            .trim_start_matches(r"\\?\")
+            .to_string();
+        assert!(r.resolve(&abs_str, &importer).is_ok(), "{abs_str}");
+        // drive-letter absolute path with forward slashes
+        assert!(r.resolve(&abs_str.replace('\\', "/"), &importer).is_ok());
+        // `.\a` and `..\src\a` relative forms
+        assert!(r.resolve(r".\a", &importer).is_ok());
+        assert!(r.resolve(r"..\src\a", &importer).is_ok());
     }
 }

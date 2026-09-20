@@ -17,7 +17,9 @@ use anyhow::Result;
 use rquickjs::prelude::{Func, Opt, Rest};
 use rquickjs::{Context, Ctx, Object, Runtime};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// Coverage data for a single file
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -260,6 +262,57 @@ pub fn generate_html_report(summaries: &[(String, TestSummary)]) -> String {
     )
 }
 
+/// Resource limits applied to the QuickJS runtime that evaluates a test file.
+///
+/// Test files are arbitrary user code, but their runtimes used to be created
+/// with `Runtime::new()` and no limits at all: `while (true) {}` hung the
+/// test run forever and a runaway allocation could exhaust the host.
+#[derive(Debug, Clone, Copy)]
+pub struct SandboxLimits {
+    /// Heap cap in bytes (0 = unlimited).
+    pub memory_limit: usize,
+    /// Wall-clock budget for evaluating the test file (zero = unlimited).
+    pub timeout: Duration,
+}
+
+impl Default for SandboxLimits {
+    fn default() -> Self {
+        Self {
+            memory_limit: 256 * 1024 * 1024,
+            timeout: Duration::from_secs(60),
+        }
+    }
+}
+
+/// Handle used to disarm the wall-clock guard once test evaluation is done
+/// (so collecting results is not interrupted by an already-expired deadline).
+struct DeadlineGuard {
+    armed: Arc<AtomicBool>,
+}
+
+impl DeadlineGuard {
+    fn disarm(&self) {
+        self.armed.store(false, Ordering::Relaxed);
+    }
+}
+
+impl SandboxLimits {
+    /// Create a runtime with these limits applied.
+    fn new_runtime(&self) -> Result<(Runtime, DeadlineGuard)> {
+        let runtime = Runtime::new()?;
+        crate::apply_memory_limit(&runtime, self.memory_limit);
+        let armed = Arc::new(AtomicBool::new(true));
+        if !self.timeout.is_zero() {
+            let deadline = Instant::now() + self.timeout;
+            let armed = armed.clone();
+            runtime.set_interrupt_handler(Some(Box::new(move || {
+                armed.load(Ordering::Relaxed) && Instant::now() >= deadline
+            })));
+        }
+        Ok((runtime, DeadlineGuard { armed }))
+    }
+}
+
 /// Run a test file with full configuration support
 pub fn run_test_file_with_config(
     file_path: &Path,
@@ -267,8 +320,25 @@ pub fn run_test_file_with_config(
     root: &Path,
     project_config: &pledgepack_core::PledgeConfig,
 ) -> Result<TestSummary> {
+    run_test_file_with_config_and_limits(
+        file_path,
+        config,
+        root,
+        project_config,
+        &SandboxLimits::default(),
+    )
+}
+
+/// [`run_test_file_with_config`] with explicit sandbox limits.
+pub fn run_test_file_with_config_and_limits(
+    file_path: &Path,
+    config: &pledgepack_core::TestConfig,
+    root: &Path,
+    project_config: &pledgepack_core::PledgeConfig,
+    limits: &SandboxLimits,
+) -> Result<TestSummary> {
     let source = std::fs::read_to_string(file_path)?;
-    let runtime = Runtime::new()?;
+    let (runtime, guard) = limits.new_runtime()?;
     let context = Context::full(&runtime)?;
 
     let mut results = Vec::new();
@@ -322,6 +392,7 @@ pub fn run_test_file_with_config(
         if let Err(e) = ctx.eval::<(), _>(js_source.as_str()) {
             errors.push(format!("File evaluation error: {}", e));
         }
+        guard.disarm();
 
         // Collect test results from the global __pledge_test_results array
         ctx.eval::<String, _>(
@@ -448,8 +519,13 @@ pub struct TestSummary {
 
 /// Run a test file in the QuickJS runtime (legacy, no config)
 pub fn run_test_file(file_path: &Path) -> Result<TestSummary> {
+    run_test_file_with_limits(file_path, &SandboxLimits::default())
+}
+
+/// [`run_test_file`] with explicit sandbox limits.
+pub fn run_test_file_with_limits(file_path: &Path, limits: &SandboxLimits) -> Result<TestSummary> {
     let source = std::fs::read_to_string(file_path)?;
-    let runtime = Runtime::new()?;
+    let (runtime, guard) = limits.new_runtime()?;
     let context = Context::full(&runtime)?;
 
     let mut results = Vec::new();
@@ -475,6 +551,7 @@ pub fn run_test_file(file_path: &Path) -> Result<TestSummary> {
         if let Err(e) = ctx.eval::<(), _>(js_source.as_str()) {
             errors.push(format!("File evaluation error: {}", e));
         }
+        guard.disarm();
 
         // Collect test results
         ctx.eval::<String, _>(
@@ -1085,4 +1162,69 @@ fn setup_coverage_tracking(ctx: &Ctx, _coverage_data: &CoverageData, file_path: 
         file_str
     );
     let _ = ctx.eval::<(), _>(coverage_code.as_str());
+}
+
+#[cfg(test)]
+mod sandbox_tests {
+    use super::*;
+
+    fn write_test(dir: &tempfile::TempDir, name: &str, body: &str) -> std::path::PathBuf {
+        let p = dir.path().join(name);
+        std::fs::write(&p, body).unwrap();
+        p
+    }
+
+    #[test]
+    fn runaway_test_file_is_interrupted_by_the_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = write_test(&dir, "spin.test.js", "while (true) {}\n");
+        let limits = SandboxLimits {
+            memory_limit: 64 * 1024 * 1024,
+            timeout: Duration::from_millis(300),
+        };
+        let start = Instant::now();
+        let summary = run_test_file_with_limits(&file, &limits).unwrap();
+        assert!(
+            start.elapsed() < Duration::from_secs(20),
+            "hung past the timeout"
+        );
+        assert_eq!(summary.failed, 1, "{summary:?}");
+        assert!(
+            summary.results[0]
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("File evaluation error"),
+            "{summary:?}"
+        );
+    }
+
+    #[test]
+    fn runaway_allocation_hits_the_memory_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = write_test(
+            &dir,
+            "alloc.test.js",
+            "var a = []; for (var i = 0; i < 1e9; i++) { a.push('x'.repeat(1024) + i); }\n",
+        );
+        let limits = SandboxLimits {
+            memory_limit: 16 * 1024 * 1024,
+            timeout: Duration::from_secs(60),
+        };
+        let summary = run_test_file_with_limits(&file, &limits).unwrap();
+        assert_eq!(summary.failed, 1, "{summary:?}");
+    }
+
+    #[test]
+    fn normal_tests_still_pass_under_default_limits() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = write_test(
+            &dir,
+            "ok.test.js",
+            "describe('s', function () { it('adds', function () { expect(1 + 1).toBe(2); }); });\n",
+        );
+        let summary = run_test_file(&file).unwrap();
+        assert_eq!(summary.passed, 1, "{summary:?}");
+        assert_eq!(summary.failed, 0, "{summary:?}");
+    }
 }

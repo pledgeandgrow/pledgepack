@@ -22,8 +22,13 @@ use tracing::info;
 pub struct ModuleAnalysis {
     pub path: String,
     pub kind: String,
+    /// Source size as written on disk ("raw").
     pub original_size: usize,
+    /// Size of the module's emitted (minified) code.
     pub transformed_size: usize,
+    /// Gzip of the emitted (minified) code.
+    #[serde(default)]
+    pub gzip_size: usize,
     pub dependencies: Vec<String>,
     pub is_entry: bool,
     pub is_css: bool,
@@ -34,8 +39,13 @@ pub struct ModuleAnalysis {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BundleAnalysis {
     pub total_modules: usize,
+    /// Sum of raw source sizes.
     pub total_original_size: usize,
+    /// Sum of emitted (minified) code sizes.
     pub total_transformed_size: usize,
+    /// Sum of gzip sizes of the emitted code.
+    #[serde(default)]
+    pub total_gzip_size: usize,
     pub modules: Vec<ModuleAnalysis>,
     pub chunks: Vec<ChunkAnalysis>,
     pub duplicates: Vec<DuplicateModule>,
@@ -68,8 +78,16 @@ pub fn format_analysis_table(analysis: &BundleAnalysis) -> String {
         .set_content_arrangement(comfy_table::ContentArrangement::Dynamic)
         .set_header(vec!["Metric", "Value"])
         .add_row(vec![
-            "Total Size",
+            "Total Size (minified)",
             &format_bytes(analysis.total_transformed_size),
+        ])
+        .add_row(vec![
+            "Total Size (gzip)",
+            &format_bytes(analysis.total_gzip_size),
+        ])
+        .add_row(vec![
+            "Source Size (raw)",
+            &format_bytes(analysis.total_original_size),
         ])
         .add_row(vec!["Total Modules", &analysis.total_modules.to_string()])
         .add_row(vec!["Chunks", &analysis.chunks.len().to_string()])
@@ -80,7 +98,7 @@ pub fn format_analysis_table(analysis: &BundleAnalysis) -> String {
         .load_preset(comfy_table::presets::UTF8_FULL)
         .apply_modifier(comfy_table::modifiers::UTF8_ROUND_CORNERS)
         .set_content_arrangement(comfy_table::ContentArrangement::Dynamic)
-        .set_header(vec!["Path", "Type", "Size", "%"]);
+        .set_header(vec!["Path", "Type", "Minified", "Gzip", "%"]);
 
     let total = analysis.total_transformed_size.max(1) as f64;
     for m in analysis.largest_modules.iter().take(20) {
@@ -89,11 +107,61 @@ pub fn format_analysis_table(analysis: &BundleAnalysis) -> String {
             &m.path,
             &m.kind,
             &format_bytes(m.transformed_size),
+            &format_bytes(m.gzip_size),
             &format!("{:.1}%", pct),
         ]);
     }
 
     format!("{}\n\n{}", summary, modules)
+}
+
+/// Gzip-compressed length of `bytes` (default compression level).
+fn gzip_len(bytes: &[u8]) -> usize {
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    use std::io::Write;
+    let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+    if enc.write_all(bytes).is_err() {
+        return 0;
+    }
+    enc.finish().map(|v| v.len()).unwrap_or(0)
+}
+
+/// Build the project the way `pledge analyze` and `pledge why` both need it
+/// and analyze the result. Always a production build so the reported sizes
+/// are those of the minified output regardless of the configured mode (a
+/// development build is unminified and reports much larger numbers).
+pub async fn build_and_analyze(
+    config: &crate::config::PledgeConfig,
+) -> Result<(BuildEngine, BundleAnalysis)> {
+    let mut config = config.clone();
+    config.mode = crate::config::BuildMode::Production;
+    let mut engine = BuildEngine::new(std::sync::Arc::new(config));
+    let _ = engine.build().await?;
+    let analysis = analyze_build(&engine)?;
+    Ok((engine, analysis))
+}
+
+/// One-line, explicitly labelled size summary shared by `pledge analyze` and
+/// `pledge why` (raw source vs. minified output vs. gzip of the output).
+pub fn format_size_summary(analysis: &BundleAnalysis) -> String {
+    format!(
+        "{} modules - source (raw) {}, minified {}, gzip {}",
+        analysis.total_modules,
+        format_bytes(analysis.total_original_size),
+        format_bytes(analysis.total_transformed_size),
+        format_bytes(analysis.total_gzip_size),
+    )
+}
+
+/// Labelled sizes of one module: raw source, minified output, gzip.
+pub fn format_module_sizes(m: &ModuleAnalysis) -> String {
+    format!(
+        "raw {}, minified {}, gzip {}",
+        format_bytes(m.original_size),
+        format_bytes(m.transformed_size),
+        format_bytes(m.gzip_size),
+    )
 }
 
 /// Analyze the build and generate a bundle analysis
@@ -104,16 +172,23 @@ pub fn analyze_build(engine: &BuildEngine) -> Result<BundleAnalysis> {
     let mut module_analyses: Vec<ModuleAnalysis> = Vec::new();
     let mut total_original = 0usize;
     let mut total_transformed = 0usize;
+    let mut total_gzip = 0usize;
 
     for (id, module) in modules {
         let rel_path = crate::normalize_path(&module.path);
         let original_size = module.source.len();
         let transformed_size = function_cache
-            .get(&module.content_hash)
+            .get(&crate::engine::module_cache_key(
+                module.content_hash,
+                &module.path,
+            ))
             .map(|c| c.code.len())
             .unwrap_or(0);
 
-        let cached = function_cache.get(&module.content_hash);
+        let cached = function_cache.get(&crate::engine::module_cache_key(
+            module.content_hash,
+            &module.path,
+        ));
 
         let kind_str = match module.kind {
             ModuleKind::Tsx => "tsx",
@@ -138,14 +213,21 @@ pub fn analyze_build(engine: &BuildEngine) -> Result<BundleAnalysis> {
         let is_css = cached.as_ref().map(|c| c.is_css).unwrap_or(false);
         let is_worker = cached.as_ref().map(|c| c.is_worker).unwrap_or(false);
 
+        let gzip_size = cached
+            .as_ref()
+            .map(|c| gzip_len(c.code.as_bytes()))
+            .unwrap_or(0);
+
         total_original += original_size;
         total_transformed += transformed_size;
+        total_gzip += gzip_size;
 
         module_analyses.push(ModuleAnalysis {
             path: rel_path,
             kind: kind_str.to_string(),
             original_size,
             transformed_size,
+            gzip_size,
             dependencies: deps,
             is_entry: engine.modules().values().take(1).any(|m| m.id == *id),
             is_css,
@@ -176,6 +258,7 @@ pub fn analyze_build(engine: &BuildEngine) -> Result<BundleAnalysis> {
         total_modules: module_analyses.len(),
         total_original_size: total_original,
         total_transformed_size: total_transformed,
+        total_gzip_size: total_gzip,
         modules: module_analyses,
         chunks,
         duplicates,
@@ -290,11 +373,11 @@ pub fn generate_analysis_html(analysis: &BundleAnalysis) -> String {
     <h1>Pledge Bundle Analysis</h1>
     <div class="stats">
         <div class="stat">
-            <div class="stat-label">Total Size</div>
+            <div class="stat-label">Total Size (minified)</div>
             <div class="stat-value">{:.1}KB</div>
         </div>
         <div class="stat">
-            <div class="stat-label">Original Size</div>
+            <div class="stat-label">Source Size (raw)</div>
             <div class="stat-value">{:.1}KB</div>
         </div>
         <div class="stat">
@@ -312,7 +395,7 @@ pub fn generate_analysis_html(analysis: &BundleAnalysis) -> String {
     </div>
     <h2 style="color:#888;font-size:1rem;margin-bottom:0.5rem;">Largest Modules</h2>
     <table>
-        <thead><tr><th>Path</th><th>Type</th><th style="text-align:right;">Size</th><th style="text-align:right;">%</th></tr></thead>
+        <thead><tr><th>Path</th><th>Type</th><th style="text-align:right;">Minified</th><th style="text-align:right;">%</th></tr></thead>
         <tbody>{}</tbody>
     </table>
 </body>
@@ -809,4 +892,70 @@ fn bfs_path(adj: &HashMap<String, Vec<String>>, source: &str, target: &str) -> O
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{BuildMode, Framework, PledgeConfig};
+
+    #[test]
+    fn gzip_len_is_smaller_than_repetitive_input_and_zero_safe() {
+        let text = "export const a = 1;\n".repeat(200);
+        assert!(gzip_len(text.as_bytes()) < text.len() / 4);
+        assert!(gzip_len(b"") > 0); // gzip header of an empty stream
+    }
+
+    #[test]
+    fn summaries_label_raw_minified_and_gzip() {
+        let a = BundleAnalysis {
+            total_modules: 2,
+            total_original_size: 5825,
+            total_transformed_size: 3277,
+            total_gzip_size: 1500,
+            modules: vec![],
+            chunks: vec![],
+            duplicates: vec![],
+            largest_modules: vec![],
+        };
+        let line = format_size_summary(&a);
+        assert!(line.contains("raw") && line.contains("minified") && line.contains("gzip"));
+        assert!(line.contains("2 modules"));
+    }
+
+    /// `why` and `analyze` share `build_and_analyze`, so the same project
+    /// yields identical (minified) numbers whatever mode the config carries.
+    #[tokio::test]
+    async fn analysis_is_mode_independent_and_minified() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(
+            tmp.path().join("src/index.ts"),
+            "// a long explanatory comment that a minifier drops\nexport function   compute( firstValue: number,   secondValue: number ) {\n    const   result = firstValue + secondValue;\n    return   result;\n}\nconsole.log( compute( 1, 2 ) );\n",
+        )
+        .unwrap();
+        let mk = |mode| PledgeConfig {
+            root: tmp.path().to_path_buf(),
+            entry: vec!["src/index.ts".to_string()],
+            framework: Framework::Auto,
+            mode,
+            cache: crate::config::CacheConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let (_e1, dev) = build_and_analyze(&mk(BuildMode::Development)).await.unwrap();
+        let (_e2, prod) = build_and_analyze(&mk(BuildMode::Production)).await.unwrap();
+        assert_eq!(dev.total_transformed_size, prod.total_transformed_size);
+        assert_eq!(dev.total_gzip_size, prod.total_gzip_size);
+        assert!(prod.total_transformed_size > 0);
+        assert!(
+            prod.total_transformed_size < prod.total_original_size,
+            "minified output ({}) must be smaller than the raw source ({})",
+            prod.total_transformed_size,
+            prod.total_original_size
+        );
+        assert!(prod.total_gzip_size > 0);
+    }
 }

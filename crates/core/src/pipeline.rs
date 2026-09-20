@@ -82,7 +82,7 @@ async fn run_prod_build(
         let _emit_span = tracing::span!(tracing::Level::INFO, "emit").entered();
         engine.emit()?;
     }
-    tracing::info!("Output written to {}", config.out_dir.display());
+    tracing::info!("Output written to {}", crate::display_path(&config.out_dir));
 
     if profile {
         tracing::info!("[profile] Emit: {}ms", emit_start.elapsed().as_millis());

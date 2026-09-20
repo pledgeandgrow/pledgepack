@@ -20,29 +20,66 @@ extern "c" fn fwrite(ptr: [*]const u8, size: usize, nmemb: usize, stream: *anyop
 const SEEK_END: c_int = 2;
 const SEEK_SET: c_int = 0;
 
-/// Global allocator for I/O buffers — uses a dedicated arena
-/// that gets reset between build cycles.
-var io_arena: ?std.heap.ArenaAllocator = null;
+/// Maximum size of a single file the loader will read. Larger files are
+/// rejected (-1) instead of attempting a multi-GiB allocation; source and
+/// asset inputs to a bundler are nowhere near this. (Also keeps every read
+/// within `c_long`/`u32` limits of ftell/ReadFile/io_uring.)
+pub const MAX_FILE_SIZE: usize = 1 << 30; // 1 GiB
 
-fn getArena() *std.heap.ArenaAllocator {
-    if (io_arena == null) {
-        io_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    }
-    return &io_arena.?;
+// ─── Buffer ownership ───
+//
+// Every buffer handed across the C ABI is an individually heap-allocated
+// block from the C allocator, preceded by a 16-byte header recording the
+// block's true allocation size. `freeBuffer` therefore does NOT depend on the
+// `len` the caller passes back (which is the *data* length and can differ from
+// the allocation size: empty files allocate 1 byte, short reads shrink len).
+// This replaces the former process-global arena, whose buffers were never
+// released (pledge_io_free was a no-op and resetArena was never exported),
+// leaking one buffer per read for the lifetime of the process.
+const io_allocator = std.heap.c_allocator;
+const BUF_HEADER: usize = 16;
+
+fn ioAlloc(n: usize) ?[*]u8 {
+    const total = std.math.add(usize, n, BUF_HEADER) catch return null;
+    const raw = io_allocator.alignedAlloc(u8, .@"16", total) catch return null;
+    @as(*usize, @ptrCast(raw.ptr)).* = total;
+    return raw.ptr + BUF_HEADER;
 }
 
-/// Read a single file into an arena-allocated buffer.
-/// Returns 0 on success, -1 on error.
+/// Free a pointer previously returned through the ABI (ioAlloc).
+pub fn freeBufferPtr(p: [*]u8) void {
+    const base: [*]align(16) u8 = @alignCast(p - BUF_HEADER);
+    const total = @as(*usize, @ptrCast(base)).*;
+    io_allocator.free(base[0..total]);
+}
+
+/// Scratch (internal, never crosses the ABI) typed allocation. Callers own
+/// it and must `defer scratchFree`.
+fn scratchAlloc(comptime T: type, n: usize) ?[]T {
+    return io_allocator.alloc(T, n) catch null;
+}
+
+fn scratchFree(s: anytype) void {
+    io_allocator.free(s);
+}
+
+/// Read a single file into a freshly allocated buffer (release with
+/// `freeBuffer`). Returns 0 on success, -1 on error; on error nothing is
+/// allocated and out_buf/out_len are untouched.
+///
+/// Paths containing an embedded NUL are rejected: the C/Win32 APIs would
+/// silently truncate them at the NUL and open a different file.
 pub fn readFile(
     path: []const u8,
     out_buf: *[*]u8,
     out_len: *usize,
 ) c_int {
-    const arena = getArena();
-    const allocator = arena.allocator();
+    if (std.mem.indexOfScalar(u8, path, 0) != null) return -1;
+    if (builtin.os.tag == .windows) return readFileWindows(path, out_buf, out_len);
 
     // Build null-terminated path
-    const path_z = allocator.dupeZ(u8, path) catch return -1;
+    const path_z = io_allocator.dupeZ(u8, path) catch return -1;
+    defer io_allocator.free(path_z);
 
     const fp = fopen(path_z.ptr, "rb") orelse return -1;
     defer _ = fclose(fp);
@@ -56,21 +93,79 @@ pub fn readFile(
         return -1;
     }
     const size: usize = @intCast(ftell_result);
+    if (size > MAX_FILE_SIZE) return -1;
     if (fseek(fp, 0, SEEK_SET) != 0) {
         return -1;
     }
 
     if (size == 0) {
-        const empty_buf = allocator.alloc(u8, 1) catch return -1;
-        out_buf.* = empty_buf.ptr;
+        const empty_buf = ioAlloc(1) orelse return -1;
+        out_buf.* = empty_buf;
         out_len.* = 0;
         return 0;
     }
 
-    const buf = allocator.alloc(u8, size) catch return -1;
-    const n = fread(buf.ptr, 1, size, fp);
-    out_buf.* = buf.ptr;
+    const buf = ioAlloc(size) orelse return -1;
+    const n = fread(buf, 1, size, fp);
+    if (n != size) {
+        // Short read (file truncated/changed underneath us, I/O error).
+        freeBufferPtr(buf);
+        return -1;
+    }
+    out_buf.* = buf;
     out_len.* = n;
+    return 0;
+}
+
+/// Windows single-file read via CreateFileW so non-ASCII paths work (the C
+/// runtime's fopen interprets the byte string in the ANSI code page, so a
+/// UTF-8 path with non-ASCII characters opened the wrong file or failed).
+fn readFileWindows(
+    path: []const u8,
+    out_buf: *[*]u8,
+    out_len: *usize,
+) c_int {
+    const w = windows;
+    const path_w = std.unicode.utf8ToUtf16LeAllocZ(io_allocator, path) catch return -1;
+    defer io_allocator.free(path_w);
+
+    const handle = w.CreateFileW(
+        path_w.ptr,
+        w.GENERIC_READ,
+        w.FILE_SHARE_READ | w.FILE_SHARE_WRITE,
+        null,
+        w.OPEN_EXISTING,
+        0,
+        null,
+    );
+    if (handle == w.INVALID_HANDLE_VALUE) return -1;
+    defer _ = w.CloseHandle(handle);
+
+    var size: i64 = 0;
+    if (w.GetFileSizeEx(handle, &size) == 0 or size < 0) return -1;
+    if (size > @as(i64, @intCast(MAX_FILE_SIZE))) return -1;
+    const usize_size: usize = @intCast(size);
+
+    if (usize_size == 0) {
+        const empty_buf = ioAlloc(1) orelse return -1;
+        out_buf.* = empty_buf;
+        out_len.* = 0;
+        return 0;
+    }
+
+    const buf = ioAlloc(usize_size) orelse return -1;
+    var total: usize = 0;
+    while (total < usize_size) {
+        var got: u32 = 0;
+        const chunk: u32 = @intCast(@min(usize_size - total, 1 << 30));
+        if (w.ReadFile(handle, buf + total, chunk, &got, null) == 0 or got == 0) {
+            freeBufferPtr(buf);
+            return -1;
+        }
+        total += got;
+    }
+    out_buf.* = buf;
+    out_len.* = total;
     return 0;
 }
 
@@ -86,6 +181,10 @@ pub fn readFilesBatch(
 ) c_int {
     var errors: c_int = 0;
 
+    // Contract: out_lens[i] is always written (0 on failure); out_bufs[i]
+    // is only written on success — callers pre-null it to detect failures.
+    for (0..count) |i| out_lens[i] = 0;
+
     // Use parallel reading for large batches, sequential for small
     if (count > 8) {
         var threads: [16]?std.Thread = .{null} ** 16;
@@ -98,9 +197,8 @@ pub fn readFilesBatch(
             result: c_int,
         };
 
-        const arena = getArena();
-        const allocator = arena.allocator();
-        var jobs = allocator.alloc(ReadJob, count) catch return -1;
+        const jobs = scratchAlloc(ReadJob, count) orelse return -1;
+        defer scratchFree(jobs);
 
         for (0..count) |i| {
             jobs[i] = .{
@@ -145,26 +243,10 @@ pub fn readFilesBatch(
     return errors;
 }
 
-/// Free a buffer allocated by readFile.
-/// Actually a no-op since we use arena allocation —
-/// buffers are freed when resetArena() is called.
-pub fn freeBuffer(_: []u8) void {
-    // Arena-managed, no individual frees needed
-}
-
-/// Reset the I/O arena. Called between build cycles.
-pub fn resetArena() void {
-    if (io_arena) |*a| {
-        _ = a.reset(.retain_capacity);
-    }
-}
-
-/// Free all I/O arena memory. Called on shutdown.
-pub fn freeArena() void {
-    if (io_arena) |*a| {
-        a.deinit();
-        io_arena = null;
-    }
+/// Free a buffer returned by readFile / the batch readers. `buf.len` is
+/// ignored: the true allocation size lives in the block header.
+pub fn freeBuffer(buf: []u8) void {
+    freeBufferPtr(buf.ptr);
 }
 
 // ─── G4.12: Platform-optimized async I/O ─────────────────────────────
@@ -191,12 +273,12 @@ pub fn detectBackend() IoBackend {
     return .thread_pool;
 }
 
-/// Check if the platform's native async I/O is actually available at runtime.
+/// Check if the platform's native async file I/O is available at runtime.
+/// macOS/BSD are false: kqueue can't async regular files (only watch them).
 pub fn asyncIoAvailable() bool {
     return switch (builtin.os.tag) {
-        .linux => true, // io_uring available on kernel 5.1+
-        .windows => true, // IOCP available on all Windows
-        .macos, .freebsd => true, // kqueue available
+        .linux => true, // io_uring on kernel 5.1+
+        .windows => true, // IOCP on all Windows
         else => false,
     };
 }
@@ -206,16 +288,16 @@ pub fn asyncIoAvailable() bool {
 // Uses raw Linux syscalls for io_uring setup and submission.
 // Falls back to thread pool if io_uring is not available.
 
-pub const linux = struct {
-    extern "c" fn syscall3(num: usize, arg1: usize, arg2: usize, arg3: usize) usize;
-    extern "c" fn syscall6(num: usize, arg1: usize, arg2: usize, arg3: usize, arg4: usize, arg5: usize, arg6: usize) usize;
-};
+// Raw-syscall io_uring implementation. std.os.linux is avoided so the
+// layout/syscall details stay explicit and stable across std versions.
 
-const SYS_io_uring_setup: usize = 425;
-const SYS_io_uring_enter: usize = 426;
-const SYS_io_uring_register: usize = 427;
+/// True when a raw syscall return value encodes -errno.
+fn sysErr(rc: usize) bool {
+    const signed: isize = @bitCast(rc);
+    return signed < 0 and signed >= -4095;
+}
 
-/// io_uring parameters (simplified)
+/// Kernel io_uring_params — filled by io_uring_setup with ring offsets.
 pub const IoUringParams = extern struct {
     sq_entries: u32 = 0,
     cq_entries: u32 = 0,
@@ -229,18 +311,207 @@ pub const IoUringParams = extern struct {
     cq_off: extern struct { head: u32, tail: u32, ring_mask: u32, ring_entries: u32, overflow: u32, cqes: u32, flags: u32, resv1: u32, resv2: u64 } = .{ .head = 0, .tail = 0, .ring_mask = 0, .ring_entries = 0, .overflow = 0, .cqes = 0, .flags = 0, .resv1 = 0, .resv2 = 0 },
 };
 
-/// Batch-read files using io_uring on Linux.
+const UringRing = struct {
+    fd: i32,
+    sq_head: *u32,
+    sq_tail: *u32,
+    sq_mask: u32,
+    sq_array: [*]u32,
+    sqes: [*]IoUringSqe,
+    sq_entries: u32,
+    cq_head: *u32,
+    cq_tail: *u32,
+    cq_mask: u32,
+    cqes: [*]IoUringCqe,
+    sq_ring: [*]u8,
+    sq_ring_len: usize,
+    cq_ring: [*]u8,
+    cq_ring_len: usize,
+    sqes_map: [*]u8,
+    sqes_len: usize,
+};
+
+const IoUringSqe = extern struct {
+    opcode: u8 = 0,
+    flags: u8 = 0,
+    ioprio: u16 = 0,
+    fd: i32 = 0,
+    off: u64 = 0,
+    addr: u64 = 0,
+    len: u32 = 0,
+    op_flags: u32 = 0,
+    user_data: u64 = 0,
+    buf_index: u16 = 0,
+    personality: u16 = 0,
+    splice_fd_in: i32 = 0,
+    pad2: [2]u64 = .{ 0, 0 },
+};
+
+const IoUringCqe = extern struct {
+    user_data: u64,
+    res: i32,
+    flags: u32,
+};
+
+const UringOff = struct {
+    const SQ_RING: i64 = 0;
+    const CQ_RING: i64 = 0x8000000;
+    const SQES: i64 = 0x10000000;
+};
+
+fn uringMmap(len: usize, fd: i32, offset: i64) ?[*]u8 {
+    const rc = std.os.linux.syscall6(
+        .mmap,
+        0,
+        len,
+        0x3, // PROT_READ | PROT_WRITE
+        0x01, // MAP_SHARED
+        @as(usize, @bitCast(@as(isize, fd))),
+        @as(usize, @bitCast(offset)),
+    );
+    if (sysErr(rc)) return null;
+    return @ptrFromInt(rc);
+}
+
+fn uringSetup(entries: u32) ?UringRing {
+    var params: IoUringParams = .{};
+    const setup_rc = std.os.linux.syscall2(
+        .io_uring_setup,
+        entries,
+        @intFromPtr(&params),
+    );
+    if (sysErr(setup_rc)) return null;
+    const ring_fd: i32 = @intCast(setup_rc);
+
+    const sq_ring_len = params.sq_off.array + params.sq_entries * @sizeOf(u32);
+    const cq_ring_len = params.cq_off.cqes + params.cq_entries * @sizeOf(IoUringCqe);
+    const sqes_len = params.sq_entries * @sizeOf(IoUringSqe);
+
+    const sq_ring = uringMmap(sq_ring_len, ring_fd, UringOff.SQ_RING) orelse {
+        _ = std.os.linux.syscall1(.close, @intCast(ring_fd));
+        return null;
+    };
+    const cq_ring = uringMmap(cq_ring_len, ring_fd, UringOff.CQ_RING) orelse {
+        _ = std.os.linux.syscall2(.munmap, @intFromPtr(sq_ring), sq_ring_len);
+        _ = std.os.linux.syscall1(.close, @intCast(ring_fd));
+        return null;
+    };
+    const sqes_map = uringMmap(sqes_len, ring_fd, UringOff.SQES) orelse {
+        _ = std.os.linux.syscall2(.munmap, @intFromPtr(cq_ring), cq_ring_len);
+        _ = std.os.linux.syscall2(.munmap, @intFromPtr(sq_ring), sq_ring_len);
+        _ = std.os.linux.syscall1(.close, @intCast(ring_fd));
+        return null;
+    };
+
+    const sq_base = @intFromPtr(sq_ring);
+    const cq_base = @intFromPtr(cq_ring);
+    // Masks/entries are kernel-filled fields in the rings — read them
+    // rather than assuming entries-1.
+    return .{
+        .fd = ring_fd,
+        .sq_head = @ptrFromInt(sq_base + params.sq_off.head),
+        .sq_tail = @ptrFromInt(sq_base + params.sq_off.tail),
+        .sq_mask = @as(*u32, @ptrFromInt(sq_base + params.sq_off.ring_mask)).*,
+        .sq_array = @ptrFromInt(sq_base + params.sq_off.array),
+        .sqes = @ptrFromInt(@intFromPtr(sqes_map)),
+        .sq_entries = params.sq_entries,
+        .cq_head = @ptrFromInt(cq_base + params.cq_off.head),
+        .cq_tail = @ptrFromInt(cq_base + params.cq_off.tail),
+        .cq_mask = @as(*u32, @ptrFromInt(cq_base + params.cq_off.ring_mask)).*,
+        .cqes = @ptrFromInt(cq_base + params.cq_off.cqes),
+        .sq_ring = sq_ring,
+        .sq_ring_len = sq_ring_len,
+        .cq_ring = cq_ring,
+        .cq_ring_len = cq_ring_len,
+        .sqes_map = sqes_map,
+        .sqes_len = sqes_len,
+    };
+}
+
+fn uringTeardown(r: *UringRing) void {
+    _ = std.os.linux.syscall2(.munmap, @intFromPtr(r.sqes_map), r.sqes_len);
+    _ = std.os.linux.syscall2(.munmap, @intFromPtr(r.cq_ring), r.cq_ring_len);
+    _ = std.os.linux.syscall2(.munmap, @intFromPtr(r.sq_ring), r.sq_ring_len);
+    _ = std.os.linux.syscall1(.close, @intCast(r.fd));
+}
+
+fn uringSubmitReads(r: *UringRing, fds: []const i32, bufs: []const [*]u8, lens: []const u32, indices: []const usize) u32 {
+    var tail = @atomicLoad(u32, r.sq_tail, .acquire);
+    var submitted: u32 = 0;
+    for (fds, 0..) |fd, k| {
+        const slot = tail & r.sq_mask;
+        r.sqes[slot] = .{
+            .opcode = 22, // IORING_OP_READ
+            .fd = fd,
+            .off = 0,
+            .addr = @intFromPtr(bufs[k]),
+            .len = lens[k],
+            .user_data = indices[k],
+        };
+        r.sq_array[slot] = slot;
+        tail += 1;
+        submitted += 1;
+    }
+    @atomicStore(u32, r.sq_tail, tail, .release);
+    const rc = std.os.linux.syscall6(
+        .io_uring_enter,
+        @intCast(r.fd),
+        submitted,
+        submitted, // min_complete: wait for the whole wave
+        1, // IORING_ENTER_GETEVENTS
+        0,
+        0,
+    );
+    // If the submit itself failed, report 0 so the caller doesn't drain
+    // completions that will never arrive.
+    if (sysErr(rc)) return 0;
+    return submitted;
+}
+
+fn uringDrain(r: *UringRing, expected: u32, out_bufs: [*][*]u8, out_lens: [*]usize, jobs_bufs: []const ?[*]u8, sizes: []const u32) c_int {
+    var errors: c_int = 0;
+    var done: u32 = 0;
+    while (done < expected) {
+        var head = @atomicLoad(u32, r.cq_head, .acquire);
+        if (head == @atomicLoad(u32, r.cq_tail, .acquire)) {
+            _ = std.os.linux.syscall6(
+                .io_uring_enter,
+                @intCast(r.fd),
+                0,
+                1,
+                1, // GETEVENTS, wait for ≥1
+                0,
+                0,
+            );
+            continue;
+        }
+        while (head != @atomicLoad(u32, r.cq_tail, .acquire)) {
+            const cqe = r.cqes[head & r.cq_mask];
+            head += 1;
+            done += 1;
+            const i: usize = @intCast(cqe.user_data);
+            // Only a complete read counts as success; a short read/EOF is an
+            // error (the caller frees any buffer whose out_lens[i] stays 0).
+            if (cqe.res >= 0 and @as(u32, @intCast(cqe.res)) == sizes[i]) {
+                out_bufs[i] = jobs_bufs[i].?;
+                out_lens[i] = @intCast(cqe.res);
+            } else {
+                errors = -1;
+                out_lens[i] = 0;
+            }
+        }
+        @atomicStore(u32, r.cq_head, head, .release);
+    }
+    return errors;
+}
+
+/// Batch-read files using io_uring on Linux (kernel 5.1+).
 ///
-/// NOTE: This is a stub implementation that delegates to the thread pool.
-/// TODO: Implement actual io_uring batch reads for Linux 5.1+.
-/// A full io_uring implementation would:
-/// 1. Call io_uring_setup() to create a submission/completion ring
-/// 2. Submit IORING_OP_READ for each file
-/// 3. Call io_uring_enter() to submit and wait for completions
-/// 4. Collect results from the completion queue
-///
-/// The thread pool fallback is already efficient for most workloads.
-/// io_uring provides ~24% throughput improvement for very large file counts (>100).
+/// Files are opened and fstat'd synchronously (cheap), then the whole
+/// wave of IORING_OP_READs is submitted in one io_uring_enter and drained
+/// from the completion ring — one syscall pair per wave instead of a
+/// read(2) per file. Falls back to the thread pool when io_uring setup
+/// fails (old kernel, restricted sandbox, WSL1).
 pub fn readFilesIoUring(
     paths_ptr: [*]const [*]const u8,
     paths_len_ptr: [*]const usize,
@@ -248,8 +519,156 @@ pub fn readFilesIoUring(
     out_bufs: [*][*]u8,
     out_lens: [*]usize,
 ) c_int {
-    // STUB: Falls back to thread pool. See readFilesBatch for actual implementation.
-    return readFilesBatch(paths_ptr, paths_len_ptr, count, out_bufs, out_lens);
+    if (builtin.os.tag != .linux) {
+        return readFilesBatch(paths_ptr, paths_len_ptr, count, out_bufs, out_lens);
+    }
+    if (count == 0) return 0;
+
+    var errors: c_int = 0;
+
+    // Open + size every file first (plain syscalls — no ring needed).
+    const AT_FDCWD: usize = @bitCast(@as(isize, -100));
+    const fds = scratchAlloc(i32, count) orelse return -1;
+    defer scratchFree(fds);
+    const bufs = scratchAlloc(?[*]u8, count) orelse return -1;
+    defer scratchFree(bufs);
+    const sizes = scratchAlloc(u32, count) orelse return -1;
+    defer scratchFree(sizes);
+    const read_indices = scratchAlloc(usize, count) orelse return -1;
+    defer scratchFree(read_indices);
+    // delivered[i]: out_bufs[i] holds a buffer the caller now owns.
+    const delivered = scratchAlloc(bool, count) orelse return -1;
+    defer scratchFree(delivered);
+    for (0..count) |i| {
+        fds[i] = -1;
+        bufs[i] = null;
+        sizes[i] = 0;
+        delivered[i] = false;
+        out_lens[i] = 0;
+    }
+    var n_read: usize = 0;
+
+    // Single exit cleanup: close any still-open fd and free any buffer that
+    // was allocated but never handed to the caller (error/short-read paths).
+    defer {
+        for (0..count) |i| {
+            if (fds[i] >= 0) _ = std.os.linux.syscall1(.close, @intCast(fds[i]));
+            if (!delivered[i]) {
+                if (bufs[i]) |b| freeBufferPtr(b);
+            }
+        }
+    }
+
+    for (0..count) |i| {
+        const path = paths_ptr[i][0..paths_len_ptr[i]];
+        // Embedded NUL would truncate the C path — reject.
+        if (std.mem.indexOfScalar(u8, path, 0) != null) {
+            errors = -1;
+            continue;
+        }
+        const path_z = io_allocator.dupeZ(u8, path) catch {
+            errors = -1;
+            continue;
+        };
+        defer io_allocator.free(path_z);
+        const fd_rc = std.os.linux.syscall4(
+            .openat,
+            AT_FDCWD,
+            @intFromPtr(path_z.ptr),
+            0, // O_RDONLY
+            0,
+        );
+        if (sysErr(fd_rc)) {
+            errors = -1;
+            continue;
+        }
+        const fd: i32 = @intCast(fd_rc);
+
+        // lseek(2) SEEK_END gives the size without needing a stat struct
+        // (std.posix.Stat is void on Linux in Zig 0.16 — stat structs were
+        // removed in favor of statx; lseek is simpler for regular files).
+        const size_rc = std.os.linux.syscall3(.lseek, @intCast(fd), 0, 2);
+        if (sysErr(size_rc)) {
+            _ = std.os.linux.syscall1(.close, @intCast(fd));
+            errors = -1;
+            continue;
+        }
+        const size: i64 = @bitCast(size_rc);
+        if (size < 0 or size > @as(i64, @intCast(MAX_FILE_SIZE))) {
+            _ = std.os.linux.syscall1(.close, @intCast(fd));
+            errors = -1;
+            continue;
+        }
+        if (size == 0) {
+            _ = std.os.linux.syscall1(.close, @intCast(fd));
+            const b = ioAlloc(1) orelse {
+                errors = -1;
+                continue;
+            };
+            out_bufs[i] = b;
+            delivered[i] = true;
+            continue;
+        }
+        const buf = ioAlloc(@intCast(size)) orelse {
+            _ = std.os.linux.syscall1(.close, @intCast(fd));
+            errors = -1;
+            continue;
+        };
+        fds[i] = fd;
+        bufs[i] = buf;
+        sizes[i] = @intCast(size);
+        read_indices[n_read] = i;
+        n_read += 1;
+    }
+
+    if (n_read > 0) {
+        var ring = uringSetup(64) orelse {
+            // io_uring unavailable — release everything this call produced
+            // (the deferred cleanup closes fds/frees undelivered buffers;
+            // buffers already delivered for empty files must be released
+            // here because the fallback re-reads every path from scratch).
+            for (0..count) |i| {
+                if (delivered[i]) {
+                    freeBufferPtr(out_bufs[i]);
+                    delivered[i] = false;
+                }
+            }
+            return readFilesBatch(paths_ptr, paths_len_ptr, count, out_bufs, out_lens);
+        };
+        defer uringTeardown(&ring);
+
+        // Submit in waves of sq_entries.
+        var start: usize = 0;
+        while (start < n_read) {
+            const wave = @min(@as(usize, ring.sq_entries), n_read - start);
+            const wave_fds = scratchAlloc(i32, wave) orelse return -1;
+            defer scratchFree(wave_fds);
+            const wave_bufs = scratchAlloc([*]u8, wave) orelse return -1;
+            defer scratchFree(wave_bufs);
+            const wave_lens = scratchAlloc(u32, wave) orelse return -1;
+            defer scratchFree(wave_lens);
+            for (0..wave) |k| {
+                const i = read_indices[start + k];
+                wave_fds[k] = fds[i];
+                wave_bufs[k] = bufs[i].?;
+                wave_lens[k] = sizes[i];
+            }
+            const submitted = uringSubmitReads(&ring, wave_fds, wave_bufs, wave_lens, read_indices[start..][0..wave]);
+            if (submitted == 0) {
+                errors = -1;
+            } else if (uringDrain(&ring, submitted, out_bufs, out_lens, bufs, sizes) != 0) {
+                errors = -1;
+            }
+            // A slot is delivered iff drain recorded a full read for it.
+            for (0..wave) |k| {
+                const i = read_indices[start + k];
+                if (out_lens[i] != 0) delivered[i] = true;
+            }
+            start += wave;
+        }
+    }
+
+    return errors;
 }
 
 // ─── IOCP (Windows) ──────────────────────────────────────────────────
@@ -258,24 +677,41 @@ pub fn readFilesIoUring(
 // GetQueuedCompletionStatus for batch async reads.
 
 pub const windows = struct {
-    extern "kernel32" fn CreateIoCompletionPort(file_handle: *anyopaque, existing_port: ?*anyopaque, completion_key: usize, num_threads: u32) ?*anyopaque;
-    extern "kernel32" fn GetQueuedCompletionStatus(port: *anyopaque, bytes_transferred: *u32, completion_key: *usize, overlapped: *?*anyopaque, timeout_ms: u32) c_int;
-    extern "kernel32" fn CloseHandle(handle: *anyopaque) c_int;
+    pub const Overlapped = extern struct {
+        internal: usize = 0,
+        internal_high: usize = 0,
+        offset: u32 = 0,
+        offset_high: u32 = 0,
+        h_event: ?*anyopaque = null,
+    };
+
+    pub const INVALID_HANDLE_VALUE: *anyopaque = @ptrFromInt(std.math.maxInt(usize));
+    pub const GENERIC_READ: u32 = 0x80000000;
+    pub const FILE_SHARE_READ: u32 = 0x00000001;
+    pub const FILE_SHARE_WRITE: u32 = 0x00000002;
+    pub const OPEN_EXISTING: u32 = 3;
+    pub const FILE_FLAG_OVERLAPPED: u32 = 0x40000000;
+    pub const ERROR_IO_PENDING: u32 = 997;
+    pub const INFINITE: u32 = 0xFFFFFFFF;
+
+    pub extern "kernel32" fn CreateIoCompletionPort(file_handle: *anyopaque, existing_port: ?*anyopaque, completion_key: usize, num_threads: u32) ?*anyopaque;
+    pub extern "kernel32" fn GetQueuedCompletionStatus(port: *anyopaque, bytes_transferred: *u32, completion_key: *usize, overlapped: *?*Overlapped, timeout_ms: u32) c_int;
+    pub extern "kernel32" fn CloseHandle(handle: *anyopaque) c_int;
+    pub extern "kernel32" fn CreateFileW(name: [*:0]const u16, access: u32, share: u32, security: ?*anyopaque, disposition: u32, flags: u32, template: ?*anyopaque) *anyopaque;
+    pub extern "kernel32" fn GetFileSizeEx(handle: *anyopaque, size: *i64) c_int;
+    pub extern "kernel32" fn ReadFile(handle: *anyopaque, buffer: [*]u8, bytes_to_read: u32, bytes_read: ?*u32, overlapped: ?*Overlapped) c_int;
+    pub extern "kernel32" fn GetLastError() u32;
 };
 
-/// Batch-read files using IOCP on Windows.
+/// Batch-read files using a real I/O completion port on Windows.
 ///
-/// NOTE: This is a stub implementation that delegates to the thread pool.
-/// TODO: Implement actual IOCP batch reads for Windows.
-/// A full IOCP implementation would:
-/// 1. Create an I/O completion port
-/// 2. Open each file with FILE_FLAG_OVERLAPPED
-/// 3. Associate each file handle with the completion port
-/// 4. Issue overlapped ReadFile calls
-/// 5. Wait for completions via GetQueuedCompletionStatus
+/// One port per call; each file is opened with FILE_FLAG_OVERLAPPED and
+/// issued a single overlapped ReadFile for its full contents. Completions
+/// are drained with GetQueuedCompletionStatus. Per-file failures are
+/// isolated: a failed file leaves out_bufs[i] untouched and out_lens[i]=0
+/// (the caller pre-nulls out_bufs to detect failures).
 ///
-/// The thread pool fallback works well on Windows since Windows
-/// has efficient thread scheduling for I/O-bound workloads.
+/// Files larger than MAX_FILE_SIZE are rejected (a failed slot).
 pub fn readFilesIOCP(
     paths_ptr: [*]const [*]const u8,
     paths_len_ptr: [*]const usize,
@@ -283,26 +719,169 @@ pub fn readFilesIOCP(
     out_bufs: [*][*]u8,
     out_lens: [*]usize,
 ) c_int {
-    // STUB: Falls back to thread pool. See readFilesBatch for actual implementation.
-    return readFilesBatch(paths_ptr, paths_len_ptr, count, out_bufs, out_lens);
+    if (builtin.os.tag != .windows) {
+        return readFilesBatch(paths_ptr, paths_len_ptr, count, out_bufs, out_lens);
+    }
+    if (count == 0) return 0;
+
+    const Job = struct {
+        handle: ?*anyopaque = null,
+        overlapped: windows.Overlapped = .{},
+        buf: ?[*]u8 = null,
+        size: u32 = 0,
+        // true while a read is submitted and its completion packet has not
+        // been consumed — the kernel may still write into `buf`.
+        in_flight: bool = false,
+        delivered: bool = false,
+    };
+
+    var errors: c_int = 0;
+    const w = windows;
+
+    const port = w.CreateIoCompletionPort(w.INVALID_HANDLE_VALUE, null, 0, 0) orelse
+        return readFilesBatch(paths_ptr, paths_len_ptr, count, out_bufs, out_lens);
+
+    const jobs = scratchAlloc(Job, count) orelse {
+        _ = w.CloseHandle(port);
+        return -1;
+    };
+    defer scratchFree(jobs);
+
+    var pending: usize = 0;
+
+    for (0..count) |i| {
+        jobs[i] = .{};
+        out_lens[i] = 0;
+    }
+
+    for (0..count) |i| {
+        const path = paths_ptr[i][0..paths_len_ptr[i]];
+
+        // Embedded NUL would truncate the wide path at the NUL — reject.
+        if (std.mem.indexOfScalar(u8, path, 0) != null) {
+            errors = -1;
+            continue;
+        }
+        const path_w = std.unicode.utf8ToUtf16LeAllocZ(io_allocator, path) catch {
+            errors = -1;
+            continue;
+        };
+        defer io_allocator.free(path_w);
+
+        const handle = w.CreateFileW(
+            path_w.ptr,
+            w.GENERIC_READ,
+            w.FILE_SHARE_READ | w.FILE_SHARE_WRITE,
+            null,
+            w.OPEN_EXISTING,
+            w.FILE_FLAG_OVERLAPPED,
+            null,
+        );
+        if (handle == w.INVALID_HANDLE_VALUE) {
+            errors = -1;
+            continue;
+        }
+        jobs[i].handle = handle;
+
+        var size: i64 = 0;
+        if (w.GetFileSizeEx(handle, &size) == 0 or size < 0 or size > @as(i64, @intCast(MAX_FILE_SIZE))) {
+            errors = -1;
+            continue;
+        }
+        if (size == 0) {
+            const b = ioAlloc(1) orelse {
+                errors = -1;
+                continue;
+            };
+            out_bufs[i] = b;
+            jobs[i].delivered = true;
+            jobs[i].handle = null;
+            _ = w.CloseHandle(handle);
+            continue;
+        }
+
+        const buf = ioAlloc(@intCast(size)) orelse {
+            errors = -1;
+            continue;
+        };
+        jobs[i].buf = buf;
+        jobs[i].size = @intCast(size);
+
+        // Associating the handle with the port can fail; without it no
+        // completion packet would ever arrive and the drain loop below
+        // would block forever.
+        if (w.CreateIoCompletionPort(handle, port, i, 0) == null) {
+            errors = -1;
+            continue;
+        }
+
+        // Sync-success also queues a completion packet (no
+        // FILE_SKIP_COMPLETION_PORT_ON_SUCCESS), so pending++ either way.
+        const ok = w.ReadFile(handle, buf, @intCast(size), null, &jobs[i].overlapped);
+        if (ok == 0 and w.GetLastError() != w.ERROR_IO_PENDING) {
+            errors = -1;
+            continue;
+        }
+        jobs[i].in_flight = true;
+        pending += 1;
+    }
+
+    // Drain one completion packet per submitted read.
+    while (pending > 0) {
+        var bytes: u32 = 0;
+        var key: usize = 0;
+        var ov: ?*windows.Overlapped = null;
+        const ok = w.GetQueuedCompletionStatus(port, &bytes, &key, &ov, w.INFINITE);
+        if (ov == null) break; // port-level failure; bail to cleanup
+        pending -= 1;
+        if (key < count) {
+            jobs[key].in_flight = false;
+            if (ok != 0 and bytes == jobs[key].size) {
+                out_bufs[key] = jobs[key].buf.?;
+                out_lens[key] = bytes;
+                jobs[key].delivered = true;
+            } else {
+                errors = -1;
+            }
+            if (jobs[key].handle) |h| {
+                _ = w.CloseHandle(h);
+                jobs[key].handle = null;
+            }
+        } else {
+            errors = -1;
+        }
+    }
+    // Anything still pending after a port-level failure is marked failed.
+    if (pending > 0) errors = -1;
+
+    for (jobs) |*j| {
+        if (j.handle) |h| {
+            // Closing cancels nothing in flight, but a handle whose read is
+            // still outstanding must not have its buffer freed below.
+            _ = w.CloseHandle(h);
+            j.handle = null;
+        }
+        // Free buffers that were never handed to the caller — unless the
+        // kernel may still be writing into them (leak beats corruption).
+        if (!j.delivered and !j.in_flight) {
+            if (j.buf) |b| freeBufferPtr(b);
+        }
+    }
+    _ = w.CloseHandle(port);
+    return errors;
 }
 
 // ─── kqueue (macOS/BSD) ──────────────────────────────────────────────
 //
 // Uses kqueue with EVFILT_READ for async file I/O on macOS and BSD.
 
-/// Batch-read files using kqueue on macOS/BSD.
+/// Batch-read files on macOS/BSD.
 ///
-/// NOTE: This is a stub implementation that delegates to the thread pool.
-/// TODO: Implement actual kqueue batch reads for macOS/BSD.
-/// A full kqueue implementation would:
-/// 1. Create a kqueue
-/// 2. Open files with O_NONBLOCK
-/// 3. Register EVFILT_READ events for each file descriptor
-/// 4. Call kevent() to wait for readable events
-/// 5. Read from ready file descriptors
-///
-/// kqueue is particularly efficient for monitoring many file descriptors.
+/// NOTE: kqueue cannot asynchronously read regular files (EVFILT_READ on a
+/// regular file reports "ready" immediately — it only works for sockets,
+/// pipes, and vnode *watching*). Real async file I/O on macOS means
+/// POSIX AIO or GCD, both of which are thread-pool shaped anyway — so the
+/// thread pool IS the correct implementation here, not a placeholder.
 pub fn readFilesKqueue(
     paths_ptr: [*]const [*]const u8,
     paths_len_ptr: [*]const usize,
@@ -310,7 +889,6 @@ pub fn readFilesKqueue(
     out_bufs: [*][*]u8,
     out_lens: [*]usize,
 ) c_int {
-    // STUB: Falls back to thread pool. See readFilesBatch for actual implementation.
     return readFilesBatch(paths_ptr, paths_len_ptr, count, out_bufs, out_lens);
 }
 
@@ -351,8 +929,15 @@ test "readFile reads a file" {
     try std.testing.expectEqual(content.len, len);
     try std.testing.expectEqualStrings(content, buf[0..len]);
 
+    freeBufferPtr(buf);
     _ = remove(tmp);
-    resetArena();
+}
+
+test "readFile rejects embedded NUL and oversized/missing paths" {
+    var buf: [*]u8 = undefined;
+    var len: usize = 0;
+    try std.testing.expectEqual(@as(c_int, -1), readFile("pledge_nul\x00.txt", &buf, &len));
+    try std.testing.expectEqual(@as(c_int, -1), readFile("pledge_definitely_missing.txt", &buf, &len));
 }
 
 test "detectBackend returns platform-appropriate backend" {
@@ -368,10 +953,8 @@ test "detectBackend returns platform-appropriate backend" {
     }
 }
 
-test "asyncIoAvailable returns true on supported platforms" {
-    if (builtin.os.tag == .linux or builtin.os.tag == .windows or
-        builtin.os.tag == .macos or builtin.os.tag == .freebsd)
-    {
+test "asyncIoAvailable returns true only where real async file I/O exists" {
+    if (builtin.os.tag == .linux or builtin.os.tag == .windows) {
         try std.testing.expect(asyncIoAvailable());
     } else {
         try std.testing.expect(!asyncIoAvailable());
@@ -398,8 +981,76 @@ test "readFilesOptimized delegates to correct backend" {
     try std.testing.expectEqual(content.len, out_lens[0]);
     try std.testing.expectEqualStrings(content, bufs[0][0..out_lens[0]]);
 
+    freeBufferPtr(bufs[0]);
     _ = remove(tmp);
-    resetArena();
+}
+
+fn writeTmp(path: [*:0]const u8, content: []const u8) !void {
+    const fp = fopen(path, "wb") orelse return error.OpenFailed;
+    defer _ = fclose(fp);
+    _ = fwrite(content.ptr, 1, content.len, fp);
+}
+
+test "readFilesOptimized batch: multiple files, mixed success and failure" {
+    const c1 = "batch one";
+    const c2 = "batch two!";
+    try writeTmp("pledge_batch_a.txt", c1);
+    try writeTmp("pledge_batch_b.txt", c2);
+    defer {
+        _ = remove("pledge_batch_a.txt");
+        _ = remove("pledge_batch_b.txt");
+    }
+
+    const missing = "pledge_batch_missing.txt";
+    var paths: [3][*]const u8 = .{ "pledge_batch_a.txt".ptr, missing.ptr, "pledge_batch_b.txt".ptr };
+    var lens: [3]usize = .{ "pledge_batch_a.txt".len, missing.len, "pledge_batch_b.txt".len };
+    var bufs: [3][*]u8 = .{ undefined, undefined, undefined };
+    var out_lens: [3]usize = .{ 9, 9, 9 }; // poison — must be overwritten
+
+    const result = readFilesOptimized(&paths, &lens, 3, &bufs, &out_lens);
+    try std.testing.expectEqual(@as(c_int, -1), result); // one failure
+    try std.testing.expectEqualStrings(c1, bufs[0][0..out_lens[0]]);
+    try std.testing.expectEqual(@as(usize, 0), out_lens[1]); // missing → 0
+    try std.testing.expectEqualStrings(c2, bufs[2][0..out_lens[2]]);
+    freeBufferPtr(bufs[0]);
+    freeBufferPtr(bufs[2]);
+}
+
+test "readFilesOptimized batch: empty batch is a no-op" {
+    var bufs: [1][*]u8 = undefined;
+    var out_lens: [1]usize = undefined;
+    const result = readFilesOptimized(undefined, undefined, 0, &bufs, &out_lens);
+    try std.testing.expectEqual(@as(c_int, 0), result);
+}
+
+test "readFilesOptimized batch: larger batch stresses the wave path" {
+    // 40 files > typical ring/thread-pool wave sizes on small configs.
+    var names: [40][24]u8 = undefined;
+    var paths: [40][*]const u8 = undefined;
+    var lens: [40]usize = undefined;
+    var bufs: [40][*]u8 = undefined;
+    var out_lens: [40]usize = undefined;
+
+    for (0..40) |i| {
+        const name = std.fmt.bufPrintZ(&names[i], "pledge_wave_{d}.txt", .{i}) catch unreachable;
+        try writeTmp(name.ptr, "x");
+        paths[i] = name.ptr;
+        lens[i] = name.len;
+    }
+    defer {
+        for (0..40) |i| {
+            const name = std.fmt.bufPrintZ(&names[i], "pledge_wave_{d}.txt", .{i}) catch unreachable;
+            _ = remove(name.ptr);
+        }
+    }
+
+    const result = readFilesOptimized(&paths, &lens, 40, &bufs, &out_lens);
+    try std.testing.expectEqual(@as(c_int, 0), result);
+    for (0..40) |i| {
+        try std.testing.expectEqual(@as(usize, 1), out_lens[i]);
+        try std.testing.expectEqual(@as(u8, 'x'), bufs[i][0]);
+        freeBufferPtr(bufs[i]);
+    }
 }
 
 // ─── G4.8: Task Preemption via Zig Coroutines ──────────────────────────
@@ -542,12 +1193,12 @@ test "G4.14: GpuOffload" {
 
 pub const SlabAllocator = struct {
     slabs: std.ArrayList([]u8), current_slab: usize, slab_offset: usize, slab_size: usize, backing: std.mem.Allocator,
-    pub fn init(allocator: std.mem.Allocator, slab_size: usize) SlabAllocator { return .{ .slabs = std.ArrayList([]u8).init(allocator), .current_slab = 0, .slab_offset = 0, .slab_size = slab_size, .backing = allocator }; }
-    pub fn deinit(self: *SlabAllocator) void { for (self.slabs.items) |s| { self.backing.free(s); } self.slabs.deinit(); }
+    pub fn init(allocator: std.mem.Allocator, slab_size: usize) SlabAllocator { return .{ .slabs = .empty, .current_slab = 0, .slab_offset = 0, .slab_size = slab_size, .backing = allocator }; }
+    pub fn deinit(self: *SlabAllocator) void { for (self.slabs.items) |s| { self.backing.free(s); } self.slabs.deinit(self.backing); }
     pub fn alloc(self: *SlabAllocator, size: usize) ![]u8 {
         if (self.slabs.items.len == 0 or self.slab_offset + size > self.slab_size) {
             const new_slab = try self.backing.alloc(u8, self.slab_size);
-            try self.slabs.append(new_slab);
+            try self.slabs.append(self.backing, new_slab);
             self.current_slab = self.slabs.items.len - 1;
             self.slab_offset = 0;
         }

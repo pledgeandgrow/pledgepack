@@ -34,7 +34,7 @@ pub fn compress_directory(dir: &Path, gzip: bool, brotli: bool) -> Result<Compre
                     stats.gzipped_bytes += gz_size;
                 }
                 Err(e) => {
-                    tracing::warn!("Failed to gzip {}: {}", file_path.display(), e);
+                    tracing::warn!("Failed to gzip {}: {}", crate::display_path(&file_path), e);
                 }
             }
         }
@@ -50,7 +50,7 @@ pub fn compress_directory(dir: &Path, gzip: bool, brotli: bool) -> Result<Compre
                     stats.brotli_bytes += br_size;
                 }
                 Err(e) => {
-                    tracing::warn!("Failed to brotli {}: {}", file_path.display(), e);
+                    tracing::warn!("Failed to brotli {}: {}", crate::display_path(&file_path), e);
                 }
             }
         }

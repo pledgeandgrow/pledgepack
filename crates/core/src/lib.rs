@@ -27,6 +27,7 @@ pub mod advanced;
 pub mod analyzer;
 pub mod api;
 pub mod asset_pipeline;
+pub mod ast_pool;
 pub mod bench;
 pub mod budgets;
 pub mod compression;
@@ -58,10 +59,12 @@ pub mod migrate;
 pub mod module;
 pub mod module_graph;
 pub mod output_distribution;
+pub mod package_map;
 pub mod performance;
 pub mod pipeline;
 pub mod playground;
 pub mod plugin_docs;
+pub mod plugin_hooks;
 pub mod plugin_registry;
 pub mod plugin_system;
 pub mod plugin_template;
@@ -74,8 +77,10 @@ pub mod router;
 pub mod rtl;
 pub mod security;
 pub mod service_worker;
+pub mod sourcemap_compose;
 pub mod svg;
 pub mod tailwind_v4;
+pub mod task_transform;
 pub mod telemetry;
 pub mod transform;
 pub mod transform_optimizations;
@@ -116,13 +121,33 @@ use pledgepack_native_sys as native;
 /// Re-export the Zig-backed graph for internal use
 pub use native::Graph;
 
+/// Owns a debounced file watcher. The underlying `notify` watcher (and the
+/// callback feeding the channel) lives exactly as long as this handle: dropping
+/// it stops watching deterministically. Derefs to the event
+/// [`Receiver`](std::sync::mpsc::Receiver), so `handle.recv()`,
+/// `handle.try_recv()`, `handle.iter()` etc. work directly.
+pub struct WatcherHandle {
+    rx: std::sync::mpsc::Receiver<std::path::PathBuf>,
+    _debouncer: notify_debouncer_full::Debouncer<
+        notify::RecommendedWatcher,
+        notify_debouncer_full::RecommendedCache,
+    >,
+}
+
+impl std::ops::Deref for WatcherHandle {
+    type Target = std::sync::mpsc::Receiver<std::path::PathBuf>;
+    fn deref(&self) -> &Self::Target {
+        &self.rx
+    }
+}
+
 /// Create a debounced file watcher using notify-debouncer.
-/// Returns a receiver that yields paths of changed files (debounced).
-/// This replaces manual debounce logic with the crate's built-in debouncing.
+/// Returns a [`WatcherHandle`] that yields paths of changed files (debounced)
+/// and keeps the watcher alive until dropped.
 pub fn create_debounced_watcher(
     root: &std::path::Path,
     debounce_ms: u64,
-) -> anyhow::Result<std::sync::mpsc::Receiver<std::path::PathBuf>> {
+) -> anyhow::Result<WatcherHandle> {
     use notify::RecursiveMode;
     use notify_debouncer_full::new_debouncer;
     use std::time::Duration;
@@ -145,19 +170,10 @@ pub fn create_debounced_watcher(
 
     debouncer.watch(root, RecursiveMode::Recursive)?;
 
-    // Intentionally leaked: the debouncer owns the underlying `notify` watcher
-    // and the callback closure that feeds the channel. It must live for the
-    // process lifetime to keep watching for file changes. There is no
-    // owning struct returned from this function (only the `Receiver`), so the
-    // debouncer has nowhere to be stored.
-    //
-    // This is a known minor memory leak (~1 KB per watcher). The watcher is
-    // typically created once per dev server session, so the impact is negligible.
-    // TODO: Return a `WatcherHandle` struct that owns the debouncer for proper
-    // lifecycle management and deterministic shutdown.
-    std::mem::forget(debouncer);
-
-    Ok(rx)
+    Ok(WatcherHandle {
+        rx,
+        _debouncer: debouncer,
+    })
 }
 
 /// Format a byte count as a human-readable string using humansize.
@@ -185,12 +201,28 @@ pub fn normalize_path_str(path: &str) -> String {
     let path = path
         .strip_prefix(r"\\?\UNC\")
         .map(|rest| format!(r"\\{rest}"))
-        .unwrap_or_else(|| {
-            path.strip_prefix(r"\\?\")
-                .unwrap_or(path)
-                .to_string()
-        });
+        .unwrap_or_else(|| path.strip_prefix(r"\\?\").unwrap_or(path).to_string());
     path.replace('\\', "/")
+}
+
+/// Strip Windows' extended-length ("verbatim") prefix from a path string for
+/// display: `\\?\C:\a` -> `C:\a`, `\\?\UNC\srv\sh` -> `\\srv\sh`.
+/// Other strings are returned unchanged. Backslashes are NOT converted.
+pub fn strip_verbatim_prefix(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else {
+        path.strip_prefix(r"\\?\").unwrap_or(path).to_string()
+    }
+}
+
+/// Render a path for user-facing output (CLI messages, logs, errors). Internal
+/// code keeps canonical paths (`canonicalize` yields `\\?\C:\...` on
+/// Windows, which is right for filesystem APIs); this only drops the verbatim
+/// prefix so users see `C:\...`. Unlike `{:?}` on a `Path` it also does not
+/// double every backslash.
+pub fn display_path(path: &std::path::Path) -> String {
+    strip_verbatim_prefix(&path.to_string_lossy())
 }
 
 /// Generate a JSON Schema for `PledgeConfig`, suitable for IDE autocompletion
@@ -204,4 +236,46 @@ pub fn generate_config_schema() -> anyhow::Result<serde_json::Value> {
         tracing::error!("Failed to serialize config schema: {}", e);
         anyhow::anyhow!("Config schema serialization failed: {}", e)
     })
+}
+
+#[cfg(test)]
+mod watcher_handle_tests {
+    use super::*;
+
+    #[test]
+    fn debounced_watcher_reports_changes_and_stops_on_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let watcher = create_debounced_watcher(dir.path(), 50).unwrap();
+        std::fs::write(dir.path().join("a.txt"), "1").unwrap();
+        let changed = watcher
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("expected a change event");
+        assert!(changed.to_string_lossy().contains("a.txt"), "{changed:?}");
+        // Dropping the handle tears down the watcher (previously leaked via
+        // `mem::forget`); the receiver-side channel is closed with it.
+        drop(watcher);
+    }
+}
+
+#[cfg(test)]
+mod display_path_tests {
+    use super::*;
+
+    #[test]
+    fn verbatim_prefix_is_stripped_for_display_only() {
+        assert_eq!(
+            strip_verbatim_prefix(r"\\?\C:\Users\me\proj"),
+            r"C:\Users\me\proj"
+        );
+        assert_eq!(
+            strip_verbatim_prefix(r"\\?\UNC\srv\share\p"),
+            r"\\srv\share\p"
+        );
+        assert_eq!(strip_verbatim_prefix(r"C:\plain"), r"C:\plain");
+        assert_eq!(strip_verbatim_prefix("/unix/path"), "/unix/path");
+        assert_eq!(
+            display_path(std::path::Path::new(r"\\?\C:\a\dist")),
+            r"C:\a\dist"
+        );
+    }
 }

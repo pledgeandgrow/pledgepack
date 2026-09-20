@@ -249,7 +249,7 @@ pub(super) fn transform_js(
         || source.contains("?worker")
         || source.contains("?sharedworker")
     {
-        code = utils::transform_worker_imports(&code, file_path);
+        code = utils::transform_worker_imports(&code, file_path, &config.root);
     }
 
     let extracted_css =

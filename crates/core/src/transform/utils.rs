@@ -78,7 +78,7 @@ pub(super) fn generate_source_map_mode(
 /// Also handles ?worker and ?sharedworker import suffixes:
 ///   import MyWorker from './worker.ts?worker'
 ///   → const MyWorker = () => new Worker('/src/worker.js')
-pub(super) fn transform_worker_imports(code: &str, file_path: &str) -> String {
+pub(super) fn transform_worker_imports(code: &str, file_path: &str, root: &Path) -> String {
     let mut result = code.to_string();
 
     let worker_patterns = ["new Worker(new URL(", "new SharedWorker(new URL("];
@@ -95,7 +95,7 @@ pub(super) fn transform_worker_imports(code: &str, file_path: &str) -> String {
                     let clean_spec = specifier
                         .trim_end_matches("?worker")
                         .trim_end_matches("?sharedworker");
-                    let url = format!("/{}.js", clean_spec.replace("./", "").replace("../", ""));
+                    let url = worker_url(clean_spec, file_path, root);
                     let full_end = start + worker_pattern.len() + end + 2;
                     if let Some(close) = result[full_end..].find("))") {
                         let abs_end = full_end + close + 2;
@@ -133,7 +133,7 @@ pub(super) fn transform_worker_imports(code: &str, file_path: &str) -> String {
                 let specifier = &after[..end];
                 if specifier.ends_with(suffix) {
                     let clean_spec = specifier.trim_end_matches(suffix);
-                    let url = format!("/{}.js", clean_spec.replace("./", "").replace("../", ""));
+                    let url = worker_url(clean_spec, file_path, root);
                     if let Some(import_start) = result[..abs_pos].rfind("import ") {
                         let import_end = abs_pos + import_pattern.len() + end + 1;
                         let between = &result[import_start + 7..abs_pos];
@@ -154,6 +154,64 @@ pub(super) fn transform_worker_imports(code: &str, file_path: &str) -> String {
         }
     }
 
-    let _ = file_path;
     result
+}
+
+/// Dev-server URL for a worker specifier: resolved relative to the importing
+/// file (not blindly stripped of `./`/`../`), rooted at the project root, with
+/// TypeScript extensions mapped to `.js`.
+fn worker_url(spec: &str, file_path: &str, root: &Path) -> String {
+    use crate::normalize_path_str;
+    let mut segs: Vec<String> = Vec::new();
+    if spec.starts_with("./") || spec.starts_with("../") {
+        let file = normalize_path_str(file_path);
+        let root = normalize_path_str(&root.to_string_lossy());
+        let dir_rel = file
+            .strip_prefix(root.trim_end_matches('/'))
+            .unwrap_or(&file)
+            .trim_start_matches('/');
+        let dir = Path::new(dir_rel)
+            .parent()
+            .map(|p| normalize_path_str(&p.to_string_lossy()));
+        segs.extend(
+            dir.unwrap_or_default()
+                .split('/')
+                .filter(|s| !s.is_empty())
+                .map(String::from),
+        );
+    }
+    for part in spec.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                segs.pop();
+            }
+            other => segs.push(other.to_string()),
+        }
+    }
+    let mut url = segs.join("/");
+    for ext in [".tsx", ".ts", ".jsx", ".mts"] {
+        if let Some(stem) = url.strip_suffix(ext) {
+            url = format!("{stem}.js");
+            break;
+        }
+    }
+    format!("/{url}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn worker_url_is_resolved_relative_to_importer_and_maps_ts_to_js() {
+        let root = Path::new("/proj");
+        let code = r#"const w = new Worker(new URL("./worker.ts", import.meta.url));"#;
+        let out = transform_worker_imports(code, "/proj/src/app.tsx", root);
+        assert!(out.contains(r#"new Worker("/src/worker.js")"#), "{out}");
+
+        let code = r#"const w = new Worker(new URL("../lib/w.js", import.meta.url));"#;
+        let out = transform_worker_imports(code, "/proj/src/app/main.ts", root);
+        assert!(out.contains(r#"new Worker("/src/lib/w.js")"#), "{out}");
+    }
 }

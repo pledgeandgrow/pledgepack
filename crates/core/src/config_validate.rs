@@ -542,7 +542,7 @@ pub fn find_closest_match(input: &str, candidates: &[&str]) -> Option<String> {
 
     for candidate in candidates {
         let dist = levenshtein(&input_lower, &candidate.to_lowercase());
-        if best.is_none() || dist < best.unwrap().0 {
+        if best.is_none_or(|(d, _)| dist < d) {
             best = Some((dist, candidate));
         }
     }

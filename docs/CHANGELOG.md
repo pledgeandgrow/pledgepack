@@ -6,6 +6,93 @@ Development history of the Pledge build system enhancements.
 
 ## [Unreleased]
 
+## [1.0.0-rc.1] - 2026-09-20 — Release Candidate
+
+First release candidate for 1.0.0. Version bumped 0.3.3 → 1.0.0-rc.1 in
+`Cargo.toml`, `package.json`, `platforms.json` and `Cargo.lock`;
+`scripts/check-versions.sh` now also verifies `platforms.json` and the lockfile.
+
+### Fixed
+- **Plugin host:** `buildStart` / `buildEnd` / `generateBundle` now genuinely execute
+  the plugin's JS (async hooks awaited; failures surfaced as errors and abort
+  `pledge build`), and `pledge build` runs them at the right points
+  (`buildStart` previously ran *after* the build). `handleHotUpdate` is executed by the
+  dev server's watcher path (Vite semantics: null / empty list / explicit module list).
+  Hooks of plugins sharing a `name` no longer hit the wrong module.
+- `test_goal62_build_provides_output_structure`: the test called `BuildEngine::build()`
+  (in-memory only) and expected files on disk. It now drives the production pipeline
+  (`pipeline::run_build` = build + emit). Root cause was a test bug, not a build bug.
+- Visual regression (`pledge test --visual`) no longer fabricates screenshots: real
+  headless-Chromium capture + decoded-pixel comparison; errors when no browser exists.
+- Potential panic in route-based code splitting for a module used by no route.
+- `WasmPluginHost::load_plugin` / output-lock retry / task-engine lookup / rayon pool
+  creation: `unwrap`/`expect`/`unreachable!` replaced with error returns; poisoned
+  mutexes in the sandbox, task graph, task trace and environment registry no longer
+  cascade into panics.
+- `.gitignore` had a UTF-16-corrupted trailing line; rewritten (`test_all.txt` ignored).
+
+### Security
+- Plugin signature verification is real Ed25519 over the blake3 content hash, enforced
+  at load time in both plugin hosts and on by default (`plugin_security.requireSigned`).
+  New end-to-end tests: valid / invalid / tampered / untrusted / missing / malformed.
+- rkyv 0.7 (RUSTSEC-2026-0235) removed from the dependency tree by building
+  `lightningcss` with `default-features = false`; the advisory ignore was deleted, and
+  five now-unneeded duplicate-version skips were dropped from `deny.toml`.
+- Release workflow: least-privilege `permissions`, npm publish with `--provenance`
+  (needs `id-token: write`, which was missing) and an explicit dist-tag.
+
+### Changed
+- YAML imports: `noyalib` 0.0.15 → `serde-saphyr` 1.x (stable major).
+- `lightningcss` stays at 1.0.0-alpha.72 (newest published; documented accepted risk).
+- `create_debounced_watcher` returns an owning `WatcherHandle` instead of leaking the
+  debouncer with `mem::forget`.
+- WASM host: `resolve-import` host call delegates to an embedder resolver
+  (`with_import_resolver`); `PluginInstancePool::acquire_or_load` added.
+- `audit.toml` moved to `.cargo/audit.toml` so a plain `cargo audit` honors it; CI no
+  longer repeats `--ignore` flags.
+- All remaining TODO markers in production code resolved or reworded as documented
+  limitations (see docs/LIMITATIONS.md).
+
+### CI / Release
+- Release workflow: single validated version (`prepare` job) shared by all jobs —
+  `workflow_dispatch` runs previously could not pass the npm version check or the
+  smoke test; new `dry_run` input (default true for manual runs) rehearses the whole
+  release without signing, tagging, releasing or publishing; archive set verified
+  against `platforms.json`; prerelease versions publish under an `rc`-style npm tag
+  (never `latest`); post-publish smoke test checks the exact version; `--locked` builds.
+- Fuzz smoke job is now enforced (no `continue-on-error`) and smoke-runs each target.
+- Publish policy documented: npm-only distribution, crates intentionally
+  `publish = false` (CONTRIBUTING.md).
+
+### Earlier unreleased changes (carried forward)
+- wasmtime/wasmtime-wasi 28.0.1 → 48.0.2 (`75946ba`) — clears all 20
+  disclosed RUSTSEC advisories on 28.0.1; `cargo audit`/`cargo deny check`
+  now pass. rustls 0.23.42 → 0.23.45 went along with it.
+- `wasm-plugin-host` compile break fixed — `task_transform` and `ast_pool`
+  (both present on disk but never declared) were wired into
+  `pledgepack-core`'s module tree; `task_transform`'s API drift was fixed
+  (removed `TransformOutput.i18n_keys` reference, replaced the never-
+  implemented `read_file_async` native-sys call with the sync path, added
+  the missing `pledgepack-task-system` dep edge), and the WASI integration
+  was migrated to the wasmtime-48 API (`WasiCtxView`,
+  `p2::add_to_linker_sync`, `HasSelf` bindgen accessor). The crate compiles
+  under `clippy -D warnings` and passes 40 unit + 20 e2e tests on wasmtime
+  48.0.2; the `--exclude pledgepack-wasm-plugin-host` flags were removed
+  from CI. The e2e fixture was rebuilt for `wasm32-wasip2` — the wasip1
+  artifact was a core module, not a component, so the e2e suite had never
+  actually run in this environment.
+- `#[ignore]` removed from the `pnpm_virtual_store_fallback_*` resolver
+  test (goal 54) — the `STATUS_HEAP_CORRUPTION` crash was a symptom of the
+  MSVC/GNU runtime-shim bug fixed in `3e5874b`, not a resolver bug; all 9
+  resolver tests now pass.
+- Workspace clippy `-D warnings` now green for the first time (`6ac4c74`,
+  plus the wasm-plugin-host lints cleaned when the crate was un-excluded) —
+  ~90 pre-existing lints fixed across task-system, core, cache, resolver,
+  adapter-pledgestack, dev-server, cli, native-sys; includes a `#[task]`
+  macro test fix (test fn moved to module scope so the macro's sibling
+  const resolves).
+
+
 ## [0.3.3] - 2026-09-17 — Production Readiness
 
 ### CI

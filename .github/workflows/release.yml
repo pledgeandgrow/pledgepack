@@ -1,5 +1,17 @@
 name: Release
 
+# Two ways to run this workflow:
+#
+#   1. Push a `v<semver>` tag (e.g. `v1.0.0-rc.1`)  → REAL release: signs
+#      artifacts, creates the GitHub Release, publishes to npm.
+#   2. Actions → Release → "Run workflow" (workflow_dispatch) with
+#      `dry_run: true` (the default)  → REHEARSAL: runs the security gate,
+#      builds every platform, verifies the archive set and the npm package
+#      (`npm publish --dry-run`), uploads the artifacts for inspection — but
+#      does NOT sign (cosign keyless signing writes to the public Rekor
+#      transparency log), does NOT create a tag/release and does NOT publish
+#      to npm. Set `dry_run: false` on a workflow_dispatch to do a real
+#      release without pushing a tag.
 on:
   push:
     tags:
@@ -7,14 +19,100 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version to release (e.g. 0.2.9)'
+        description: 'Version to release (e.g. 1.0.0-rc.1). Must equal package.json / Cargo.toml.'
         required: true
         type: string
+      dry_run:
+        description: 'Rehearse only: build + verify, but do not sign, create a GitHub release, or publish to npm'
+        required: false
+        type: boolean
+        default: true
+
+# Least privilege by default; jobs that need more (release creation, OIDC for
+# cosign / npm provenance) request it explicitly below.
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # ── Resolve + validate the version once, for every later job ──────────
+  # Previously each job re-derived the version from GITHUB_REF, which is
+  # `refs/heads/...` (not a tag) under workflow_dispatch — so the npm version
+  # check and the post-publish smoke test could never work for a manual run.
+  prepare:
+    name: Resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      tag: ${{ steps.v.outputs.tag }}
+      dry_run: ${{ steps.v.outputs.dry_run }}
+      npm_tag: ${{ steps.v.outputs.npm_tag }}
+      prerelease: ${{ steps.v.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+
+      - name: Resolve and validate version
+        id: v
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_DRY_RUN: ${{ inputs.dry_run }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            VERSION="$INPUT_VERSION"
+            DRY_RUN="$INPUT_DRY_RUN"
+          else
+            VERSION="$REF_NAME"
+            DRY_RUN="false"
+          fi
+          VERSION="${VERSION#v}"
+
+          if ! echo "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::'$VERSION' is not a valid semver version"
+            exit 1
+          fi
+
+          # npm refuses to publish a prerelease without an explicit dist-tag
+          # (and must never move `latest` to an rc): use the first
+          # prerelease identifier (1.0.0-rc.1 -> rc, 1.0.0-beta.2 -> beta).
+          if [[ "$VERSION" == *-* ]]; then
+            PRE="${VERSION#*-}"
+            NPM_TAG="${PRE%%.*}"
+            PRERELEASE="true"
+          else
+            NPM_TAG="latest"
+            PRERELEASE="false"
+          fi
+
+          {
+            echo "version=$VERSION"
+            echo "tag=v$VERSION"
+            echo "dry_run=$DRY_RUN"
+            echo "npm_tag=$NPM_TAG"
+            echo "prerelease=$PRERELEASE"
+          } >> "$GITHUB_OUTPUT"
+          echo "Releasing v$VERSION (npm tag: $NPM_TAG, dry-run: $DRY_RUN)"
+
+      - name: Verify package.json / Cargo.toml / platforms.json / Cargo.lock agree with the version
+        run: bash scripts/check-versions.sh "v${{ steps.v.outputs.version }}"
+
+      - name: Verify platform lists agree
+        run: node scripts/check-platform-lists.js
+
   # ── Security gate: block the release if a vulnerability is disclosed ──
   # between the last CI run on this commit and the tag push. ci.yml already
   # runs these checks on every push/PR, but a release can be tagged days or
@@ -22,6 +120,7 @@ jobs:
   # that window. See PRODUCTION-READINESS-100.md goal 28.
   security-gate:
     name: Security Gate (audit + deny)
+    needs: prepare
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -37,13 +136,16 @@ jobs:
         run: bash scripts/check-stale-ignores.sh
 
       - name: Check CHANGELOG.md has an entry for this release
+        # check-changelog-entry.sh derives the version from a tag ref, or from
+        # Cargo.toml otherwise (workflow_dispatch) — prepare has already
+        # proven Cargo.toml == the requested version.
         run: bash scripts/check-changelog-entry.sh
 
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
 
       - name: Run cargo-audit
-        run: cargo audit --ignore RUSTSEC-2026-0235 --ignore RUSTSEC-2025-0141 --ignore RUSTSEC-2024-0436
+        run: cargo audit   # ignores come from .cargo/audit.toml
 
       - name: Run cargo-deny (licenses + advisories + bans + sources)
         uses: EmbarkStudios/cargo-deny-action@v2
@@ -51,9 +153,11 @@ jobs:
           command: check advisories licenses bans sources
 
   # ── Build native binaries for all platforms ───────────────────────────
+  # The literal `target:` values below are checked against platforms.json by
+  # scripts/check-platform-lists.js (run in `prepare`).
   build:
     name: Build ${{ matrix.target }}
-    needs: security-gate
+    needs: [prepare, security-gate]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -122,7 +226,7 @@ jobs:
           key: release-${{ matrix.target }}-v2
 
       - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }} -p pledgepack-cli
+        run: cargo build --release --locked --target ${{ matrix.target }} -p pledgepack-cli
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.cross == true && 'aarch64-linux-gnu-gcc' || '' }}
 
@@ -146,9 +250,11 @@ jobs:
           retention-days: 30
 
   # ── Create GitHub Release with all binaries ───────────────────────────
+  # In dry-run mode this job still downloads, verifies and checksums the
+  # artifacts, but stops short of signing and releasing.
   github-release:
     name: GitHub Release
-    needs: build
+    needs: [prepare, build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -163,18 +269,6 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Determine version
-        id: version
-        run: |
-          if [ -n "${{ inputs.version }}" ]; then
-            echo "version=${{ inputs.version }}" >> $GITHUB_OUTPUT
-            echo "tag=v${{ inputs.version }}" >> $GITHUB_OUTPUT
-          else
-            TAG="${GITHUB_REF#refs/tags/}"
-            echo "version=${TAG#v}" >> $GITHUB_OUTPUT
-            echo "tag=$TAG" >> $GITHUB_OUTPUT
-          fi
-
       - name: Download all artifacts
         uses: actions/download-artifact@v5
         with:
@@ -184,6 +278,21 @@ jobs:
       - name: List artifacts
         run: ls -la artifacts/
 
+      - name: Verify every platform in platforms.json has an archive
+        run: |
+          node -e "
+            const fs = require('fs');
+            const { platforms } = JSON.parse(fs.readFileSync('platforms.json', 'utf8'));
+            const missing = platforms
+              .map((p) => 'pledge-' + p.rustTarget + (p.archive === 'zip' ? '.zip' : '.tar.gz'))
+              .filter((f) => !fs.existsSync('artifacts/' + f));
+            if (missing.length) {
+              console.error('Missing release archives: ' + missing.join(', '));
+              process.exit(1);
+            }
+            console.log('All ' + platforms.length + ' platform archives present.');
+          "
+
       - name: Generate checksums
         run: |
           cd artifacts
@@ -192,15 +301,16 @@ jobs:
           done
 
       - name: Install cosign
+        if: needs.prepare.outputs.dry_run != 'true'
         uses: sigstore/cosign-installer@v3
 
       - name: Sign artifacts
+        if: needs.prepare.outputs.dry_run != 'true'
         run: |
           cd artifacts
           for f in *; do
-            [ "$f" = "*.sha256" ] && continue
             case "$f" in
-              *.sha256) continue ;;
+              *.sha256|*.sig|*.pem) continue ;;
             esac
             cosign sign-blob --yes "$f" --output-signature "$f.sig" --output-certificate "$f.pem"
           done
@@ -208,21 +318,25 @@ jobs:
           COSIGN_EXPERIMENTAL: "1"
 
       - name: Create GitHub Release
+        if: needs.prepare.outputs.dry_run != 'true'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.version.outputs.tag }}
-          name: v${{ steps.version.outputs.version }}
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          # When run via workflow_dispatch the tag may not exist yet; create
+          # it on the exact commit that was built (ignored if the tag exists).
+          target_commitish: ${{ github.sha }}
+          name: v${{ needs.prepare.outputs.version }}
           draft: false
-          prerelease: ${{ contains(steps.version.outputs.version, '-') }}
+          prerelease: ${{ needs.prepare.outputs.prerelease == 'true' }}
           generate_release_notes: true
           files: artifacts/*
           body: |
-            ## PledgePack v${{ steps.version.outputs.version }}
+            ## PledgePack v${{ needs.prepare.outputs.version }}
 
             ### Installation
 
             ```bash
-            npm install -g pledgepack
+            npm install -g pledgepack@${{ needs.prepare.outputs.npm_tag }}
             ```
 
             Or download the binary for your platform directly from the assets below.
@@ -236,15 +350,58 @@ jobs:
             - `aarch64-pc-windows-msvc` — Windows ARM64
 
             ### Verify
+            Each archive ships a `.sha256` checksum and a Sigstore/cosign keyless
+            signature (`.sig`) with its signing certificate (`.pem`). The npm
+            installer checks the checksum (and the signature when `cosign` is
+            installed) automatically; to verify a downloaded archive by hand:
             ```bash
-            pledge --version
+            sha256sum -c pledge-<target>.tar.gz.sha256
+            cosign verify-blob \
+              --signature pledge-<target>.tar.gz.sig \
+              --certificate pledge-<target>.tar.gz.pem \
+              --certificate-identity-regexp '^https://github\.com/pledgeandgrow/pledgepack/\.github/workflows/release\.yml@refs/(tags|heads)/.+$' \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              pledge-<target>.tar.gz
             ```
+            Then confirm the install (`pledgepack` when installed from npm,
+            `pledge` when you extracted a standalone binary):
+            ```bash
+            pledgepack --version
+            ```
+
+      - name: Dry-run — keep artifacts for inspection
+        if: needs.prepare.outputs.dry_run == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-dry-run-${{ needs.prepare.outputs.version }}
+          path: artifacts/*
+          retention-days: 7
+
+      - name: Dry-run summary
+        if: needs.prepare.outputs.dry_run == 'true'
+        run: |
+          {
+            echo "### Release dry run — v${{ needs.prepare.outputs.version }}"
+            echo ""
+            echo "Built and checksummed; **nothing was signed, tagged, released or published**."
+            echo ""
+            echo '```'
+            ls -la artifacts/
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # ── Publish to npm ────────────────────────────────────────────────────
   npm-publish:
     name: Publish to npm
-    needs: github-release
+    needs: [prepare, github-release]
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # `npm publish --provenance` signs a provenance statement with the
+      # workflow's OIDC identity; without this it fails with a 4xx from
+      # Fulcio ("Provenance generation in GitHub Actions requires
+      # id-token: write permission").
+      id-token: write
     steps:
       - uses: actions/checkout@v5
 
@@ -254,18 +411,86 @@ jobs:
           node-version: 22
           registry-url: https://registry.npmjs.org
 
-      - name: Verify package.json version matches tag
+      - name: Verify package.json version matches the release version
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
         run: |
-          TAG="${GITHUB_REF#refs/tags/}"
-          TAG_VERSION="${TAG#v}"
           PKG_VERSION=$(node -p "require('./package.json').version")
-          if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
-            echo "ERROR: Tag version ($TAG_VERSION) does not match package.json version ($PKG_VERSION)"
+          if [ "$RELEASE_VERSION" != "$PKG_VERSION" ]; then
+            echo "ERROR: release version ($RELEASE_VERSION) does not match package.json version ($PKG_VERSION)"
             exit 1
           fi
           echo "Version verified: $PKG_VERSION"
 
+      - name: npm publish (dry run)
+        if: needs.prepare.outputs.dry_run == 'true'
+        run: npm publish --dry-run --access public --tag "${{ needs.prepare.outputs.npm_tag }}"
+
       - name: npm publish
-        run: npm publish --access public
+        if: needs.prepare.outputs.dry_run != 'true'
+        # --tag: mandatory for prereleases (npm rejects them without one, and
+        # an rc must never become `latest`). --provenance: attest that the
+        # package was built by this workflow (needs id-token: write above).
+        run: |
+          if [ -z "$NODE_AUTH_TOKEN" ]; then
+            echo "::error::NPM_TOKEN secret is not configured"
+            exit 1
+          fi
+          npm publish --access public --provenance --tag "${{ needs.prepare.outputs.npm_tag }}"
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  # ── Post-publish artifact smoke ─────────────────────────────────────────
+  # Install the JUST-published package into a clean dir on every supported
+  # OS and run the real binary — exercises postinstall's download → checksum
+  # → extract → launch chain end to end, which nothing else in CI covers.
+  # Skipped in dry-run mode (nothing was published to install).
+  artifact-smoke:
+    name: Artifact smoke (${{ matrix.os }})
+    needs: [prepare, npm-publish]
+    if: needs.prepare.outputs.dry_run != 'true'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    env:
+      RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+
+      - name: Wait for npm propagation
+        run: |
+          # `npm view pledgepack@<exact version>` — a bare `npm view pledgepack
+          # version` reports the `latest` dist-tag, which is not the release
+          # candidate that was just published.
+          for i in $(seq 1 30); do
+            if [ "$(npm view "pledgepack@${RELEASE_VERSION}" version 2>/dev/null)" = "${RELEASE_VERSION}" ]; then
+              echo "Published version visible on npm"
+              exit 0
+            fi
+            echo "Waiting for npm propagation ($i/30)..."
+            sleep 10
+          done
+          echo "Timed out waiting for npm propagation"
+          exit 1
+        shell: bash
+
+      - name: Install published package in clean dir
+        run: |
+          SMOKE_DIR="$(mktemp -d)"
+          echo "SMOKE_DIR=$SMOKE_DIR" >> "$GITHUB_ENV"
+          cd "$SMOKE_DIR"
+          npm init -y >/dev/null
+          npm install "pledgepack@${RELEASE_VERSION}" --no-audit --no-fund
+        shell: bash
+
+      - name: Run the installed binary
+        run: |
+          cd "$SMOKE_DIR"
+          node node_modules/pledgepack/bin/pledge.js --version
+          node node_modules/pledgepack/bin/pledge.js --help
+        shell: bash
