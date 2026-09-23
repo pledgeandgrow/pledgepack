@@ -319,7 +319,7 @@ jobs:
 
       - name: Create GitHub Release
         if: needs.prepare.outputs.dry_run != 'true'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.prepare.outputs.tag }}
           # When run via workflow_dispatch the tag may not exist yet; create
