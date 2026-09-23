@@ -243,7 +243,7 @@ jobs:
           Compress-Archive -Path "target/${{ matrix.target }}/release/${{ matrix.binary }}" -DestinationPath "pledge-${{ matrix.target }}.zip"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: pledge-${{ matrix.target }}
           path: pledge-${{ matrix.target }}.${{ matrix.archive }}
@@ -371,7 +371,7 @@ jobs:
 
       - name: Dry-run — keep artifacts for inspection
         if: needs.prepare.outputs.dry_run == 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-dry-run-${{ needs.prepare.outputs.version }}
           path: artifacts/*

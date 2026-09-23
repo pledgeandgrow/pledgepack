@@ -160,7 +160,7 @@ jobs:
         run: cat scorecard.md
 
       - name: Upload scorecard
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: production-readiness-scorecard
           path: scorecard.md
