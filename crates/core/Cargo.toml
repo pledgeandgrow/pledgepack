@@ -29,7 +29,7 @@ subtle = { workspace = true }
 # from SystemTime::now(), see PRODUCTION-READINESS-100.md goal 15). Pinned to
 # "0.8" to match crates/cache's existing pin rather than adding a 4th locked
 # `rand` version (see deny.toml's rand skip-entries).
-rand = "0.8"
+rand = "0.10"
 dashmap = { workspace = true }
 rayon = { workspace = true }
 tokio = { workspace = true }
