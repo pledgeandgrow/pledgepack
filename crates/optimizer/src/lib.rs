@@ -409,9 +409,8 @@ impl Optimizer {
                     // Normalize to forward slashes — on Windows the raw path
                     // uses `\` separators and would never match `/`-style
                     // patterns like `src/util.ts`.
-                    let path_str = pledgepack_core::normalize_path_str(
-                        &module.path.to_string_lossy(),
-                    );
+                    let path_str =
+                        pledgepack_core::normalize_path_str(&module.path.to_string_lossy());
                     if glob_set.is_match(path_str.as_str())
                         || patterns.iter().any(|pattern| {
                             path_str.contains(pattern) || path_str.as_str() == pattern.as_str()

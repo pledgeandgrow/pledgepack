@@ -1011,7 +1011,10 @@ mod tests {
         // The exact real-world shape this bug came from: a source module
         // awaiting a lowered `import()` at its top level.
         let lowered = lower("const { lazy } = await import('./lazy.ts');\nlazy();");
-        assert!(lowered.has_top_level_await, "await at module top level must be detected");
+        assert!(
+            lowered.has_top_level_await,
+            "await at module top level must be detected"
+        );
         let wrapped = wrap_module("entry", &lowered.body, lowered.has_top_level_await);
         assert!(
             wrapped.contains("async function"),
@@ -1034,7 +1037,10 @@ mod tests {
         let lowered = lower("export const x = 1;\nconsole.log(x);");
         assert!(!lowered.has_top_level_await);
         let wrapped = wrap_module("m", &lowered.body, lowered.has_top_level_await);
-        assert!(!wrapped.contains("async function"), "must not gain `async` when there's no top-level await: {wrapped}");
+        assert!(
+            !wrapped.contains("async function"),
+            "must not gain `async` when there's no top-level await: {wrapped}"
+        );
     }
 
     #[test]

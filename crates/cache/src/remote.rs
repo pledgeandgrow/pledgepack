@@ -121,9 +121,7 @@ impl RemoteCache {
         let client = if enabled {
             match reqwest::blocking::Client::builder()
                 .timeout(std::time::Duration::from_secs(config.timeout_secs))
-                .connect_timeout(std::time::Duration::from_secs(
-                    config.timeout_secs.min(10),
-                ))
+                .connect_timeout(std::time::Duration::from_secs(config.timeout_secs.min(10)))
                 // A build cache endpoint is a project-configured, trusted
                 // destination, not general web traffic — it should never be
                 // routed through a corporate/system HTTP proxy. This also
@@ -529,25 +527,36 @@ mod hang_repro {
                     }
                     body.extend_from_slice(&buf[..n]);
                 }
+                // Every response carries `Connection: close`: this server
+                // handles exactly one request per socket and then drops it.
+                // Without the header, a keep-alive client (reqwest) pools the
+                // connection and may dispatch the NEXT request onto the dead
+                // socket before noticing the FIN — a race that lost the GET
+                // on ARM64 CI (`GET returned no entry` right after a
+                // successful PUT).
                 let mut s = store.lock().unwrap();
                 if method == "PUT" {
                     s.insert(path, body);
-                    let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
                 } else if method == "GET" {
                     if let Some(b) = s.get(&path) {
                         let head = format!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\n\r\n",
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                             b.len()
                         );
                         let _ = stream.write_all(head.as_bytes());
                         let _ = stream.write_all(b);
                     } else {
-                        let _ = stream
-                            .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        );
                     }
                 } else {
-                    let _ = stream
-                        .write_all(b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n");
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
                 }
             }
         });

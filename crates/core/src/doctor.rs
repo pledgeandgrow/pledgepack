@@ -774,7 +774,10 @@ fn check_security(root: &Path) -> Vec<DiagnosticCheck> {
                 v.version,
                 v.title,
                 v.severity.label(),
-                v.cve.as_ref().map(|c| format!(" ({c})")).unwrap_or_default()
+                v.cve
+                    .as_ref()
+                    .map(|c| format!(" ({c})"))
+                    .unwrap_or_default()
             ),
             suggestion: v
                 .patch_version
@@ -794,19 +797,14 @@ fn check_security(root: &Path) -> Vec<DiagnosticCheck> {
     {
         // npm exits non-zero when vulns exist — parse stdout regardless.
         if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&out.stdout)
-            && let Some(meta) = json
-                .get("metadata")
-                .and_then(|m| m.get("vulnerabilities"))
+            && let Some(meta) = json.get("metadata").and_then(|m| m.get("vulnerabilities"))
         {
             let total: u64 = ["critical", "high", "moderate", "low"]
                 .iter()
                 .filter_map(|k| meta.get(*k).and_then(|v| v.as_u64()))
                 .sum();
             if total > 0 {
-                let critical_high = meta
-                    .get("critical")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0)
+                let critical_high = meta.get("critical").and_then(|v| v.as_u64()).unwrap_or(0)
                     + meta.get("high").and_then(|v| v.as_u64()).unwrap_or(0);
                 checks.push(DiagnosticCheck {
                     category: DiagnosticCategory::Security,
@@ -822,7 +820,9 @@ fn check_security(root: &Path) -> Vec<DiagnosticCheck> {
                         meta.get("critical").and_then(|v| v.as_u64()).unwrap_or(0),
                         meta.get("high").and_then(|v| v.as_u64()).unwrap_or(0),
                     ),
-                    suggestion: Some("Run `npm audit` for details, `npm audit fix` to remediate".to_string()),
+                    suggestion: Some(
+                        "Run `npm audit` for details, `npm audit fix` to remediate".to_string(),
+                    ),
                 });
             } else {
                 checks.push(DiagnosticCheck {

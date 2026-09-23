@@ -3280,11 +3280,8 @@ document.addEventListener("click", function(e) {
         // collecting them here catches leaks even when some other code path
         // (a plugin, a define, a manual string) smuggled them past
         // `inject_into_code`'s prefix filter.
-        let env = crate::env::EnvVars::load(
-            &self.config.root,
-            self.config.mode,
-            &self.config.env_prefix,
-        );
+        let env =
+            crate::env::EnvVars::load(&self.config.root, self.config.mode, &self.config.env_prefix);
         let leaked_env: Vec<(String, String)> = env
             .all()
             .iter()
@@ -3322,7 +3319,7 @@ document.addEventListener("click", function(e) {
             };
             let name = f
                 .strip_prefix(out_dir)
-                .map(|p| crate::normalize_path(p))
+                .map(crate::normalize_path)
                 .unwrap_or_else(|_| f.to_string_lossy().to_string());
             findings.extend(crate::security::scan_code_for_secrets(
                 &content,
@@ -3468,7 +3465,7 @@ document.addEventListener("click", function(e) {
             };
             let name = js
                 .strip_prefix(out_dir)
-                .map(|p| crate::normalize_path(p))
+                .map(crate::normalize_path)
                 .unwrap_or_else(|_| js.to_string_lossy().to_string());
             for e in crate::bundle::chunk_syntax_errors(&content, &name) {
                 errors.push(format!("Unparseable output: {e}"));

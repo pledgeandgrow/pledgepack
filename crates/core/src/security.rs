@@ -742,15 +742,27 @@ fn redact(secret: &str) -> String {
 /// publicly-known token formats — a match is essentially never a false
 /// positive.
 const SECRET_PATTERNS: &[(&str, &str)] = &[
-    ("private key block", r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY( BLOCK)?-----"),
+    (
+        "private key block",
+        r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY( BLOCK)?-----",
+    ),
     ("AWS access key", r"\b(?:AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16}\b"),
-    ("GitHub token", r"\b(?:ghp|gho|ghu|ghs|ghr|ghv)_[A-Za-z0-9]{36,}\b"),
-    ("GitHub fine-grained PAT", r"\bgithub_pat_[A-Za-z0-9_]{22,}\b"),
+    (
+        "GitHub token",
+        r"\b(?:ghp|gho|ghu|ghs|ghr|ghv)_[A-Za-z0-9]{36,}\b",
+    ),
+    (
+        "GitHub fine-grained PAT",
+        r"\bgithub_pat_[A-Za-z0-9_]{22,}\b",
+    ),
     ("GCP API key", r"\bAIza[0-9A-Za-z_\-]{35}\b"),
     ("Slack token", r"\bxox[baprs]-[0-9A-Za-z\-]{10,}\b"),
     ("Stripe live key", r"\b[sr]k_live_[0-9A-Za-z]{16,}\b"),
     ("npm token", r"\bnpm_[A-Za-z0-9]{36}\b"),
-    ("SendGrid key", r"\bSG\.[A-Za-z0-9_\-]{22}\.[A-Za-z0-9_\-]{43}\b"),
+    (
+        "SendGrid key",
+        r"\bSG\.[A-Za-z0-9_\-]{22}\.[A-Za-z0-9_\-]{43}\b",
+    ),
     (
         "generic bearer assignment",
         r#"(?i)(?:api[_-]?key|api[_-]?secret|access[_-]?token|auth[_-]?token|client[_-]?secret)["']?\s*[:=]\s*["'][A-Za-z0-9_\-/.+=]{24,}["']"#,
@@ -825,8 +837,8 @@ pub fn scan_code_for_secrets(
     // Entropy tier: quoted literals that look random. Skip strings inside
     // sourcemap data URLs and integrity attributes — both are legitimately
     // high-entropy.
-    let lit_re = regex::Regex::new(r#"["'`]([A-Za-z0-9+/=_\-]{24,})["'`]"#)
-        .expect("static literal pattern");
+    let lit_re =
+        regex::Regex::new(r#"["'`]([A-Za-z0-9+/=_\-]{24,})["'`]"#).expect("static literal pattern");
     for cap in lit_re.captures_iter(code) {
         let s = cap.get(1).unwrap().as_str();
         if s.starts_with("sha256-") || s.starts_with("data:") {
@@ -943,12 +955,19 @@ mod tests {
     fn scan_detects_private_key_block() {
         let code = "const pem = \"-----BEGIN RSA PRIVATE KEY-----\\nMIIC...\"";
         let findings = scan_code_for_secrets(code, "chunk.js", &[]);
-        assert!(findings.iter().any(|f| f.hard && f.kind == "private key block"));
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.hard && f.kind == "private key block")
+        );
     }
 
     #[test]
     fn scan_detects_leaked_env_value() {
-        let leaked = vec![("DB_PASSWORD".to_string(), "sup3r-s3cret-p4ssw0rd".to_string())];
+        let leaked = vec![(
+            "DB_PASSWORD".to_string(),
+            "sup3r-s3cret-p4ssw0rd".to_string(),
+        )];
         let code = r#"const cfg = { pass: "sup3r-s3cret-p4ssw0rd" };"#;
         let findings = scan_code_for_secrets(code, "chunk.js", &leaked);
         assert!(

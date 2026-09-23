@@ -320,8 +320,7 @@ mod tests {
             &["PLEDGE_".into()],
         );
         assert_eq!(
-            out,
-            "import.meta.env.PLEDGE_API_KEY; \"short\";",
+            out, "import.meta.env.PLEDGE_API_KEY; \"short\";",
             "got: {out}"
         );
     }

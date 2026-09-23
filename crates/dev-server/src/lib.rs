@@ -491,11 +491,7 @@ pub async fn serve(engine: BuildEngine, config: &PledgeConfig) -> Result<()> {
     // variable to transformed modules. `pledge build` refuses outright; in
     // dev we warn loudly — the served code still leaks, but killing the dev
     // server over a config warning would be worse DX.
-    if config
-        .env_prefix
-        .iter()
-        .any(|p| p.is_empty() || p == "*")
-    {
+    if config.env_prefix.iter().any(|p| p.is_empty() || p == "*") {
         eprintln!(
             "  \x1b[31m⚠ envPrefix contains an empty/\"*\" entry — ALL environment variables,\x1b[0m"
         );
