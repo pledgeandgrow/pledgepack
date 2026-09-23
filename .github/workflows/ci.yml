@@ -6,6 +6,12 @@ on:
   pull_request:
     branches: [main, develop]
 
+# A newer push/PR-sync supersedes a still-running older run — cancel it so
+# stale work doesn't hold the runner queue hostage.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -43,6 +49,15 @@ jobs:
         with:
           version: 0.16.0
 
+      - name: Cache Zig build output
+        uses: actions/cache@v4
+        with:
+          path: |
+            .zig-cache
+            zig-out
+          key: zig-${{ matrix.os }}-${{ hashFiles('build.zig', 'build.zig.zon', 'native-sys/zig/**') }}
+          restore-keys: zig-${{ matrix.os }}-
+
       - name: Build native library (Zig)
         run: zig build -Doptimize=ReleaseFast
 
@@ -64,9 +79,9 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-      - name: Build
-        run: cargo build --locked --workspace --all-targets
-
+      # No standalone `cargo build` step: `cargo test --all-targets` compiles
+      # every target it needs anyway — a separate build just compiles the
+      # dependency graph twice (build vs test artifact fingerprints differ).
       - name: Clippy (deny warnings)
         run: cargo clippy --workspace --all-targets -- -D warnings
 
@@ -136,7 +151,11 @@ jobs:
         run: bash scripts/check-min-test-counts.sh
 
       - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
+        # Prebuilt signed binary — `cargo install` compiles ~200 crates
+        # from source (~10min) every run.
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
 
       - name: Run cargo-audit
         run: cargo audit   # ignores come from .cargo/audit.toml
@@ -226,6 +245,15 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu
 
+      - name: Cache Zig build output
+        uses: actions/cache@v4
+        with:
+          path: |
+            .zig-cache
+            zig-out
+          key: zig-${{ matrix.zig-target }}-${{ hashFiles('build.zig', 'build.zig.zon', 'native-sys/zig/**') }}
+          restore-keys: zig-${{ matrix.zig-target }}-
+
       - name: Build native library (Zig cross-compile)
         run: zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.zig-target }}
 
@@ -275,6 +303,15 @@ jobs:
         with:
           version: 0.16.0
 
+      - name: Cache Zig build output
+        uses: actions/cache@v4
+        with:
+          path: |
+            .zig-cache
+            zig-out
+          key: zig-${{ matrix.os }}-${{ hashFiles('build.zig', 'build.zig.zon', 'native-sys/zig/**') }}
+          restore-keys: zig-${{ matrix.os }}-
+
       - name: Build native library (Zig)
         run: zig build -Doptimize=ReleaseFast
 
@@ -322,11 +359,23 @@ jobs:
         with:
           version: 0.16.0
 
+      - name: Cache Zig build output
+        uses: actions/cache@v4
+        with:
+          path: |
+            .zig-cache
+            zig-out
+          key: zig-${{ runner.os }}-${{ hashFiles('build.zig', 'build.zig.zon', 'native-sys/zig/**') }}
+          restore-keys: zig-${{ runner.os }}-
+
       - name: Build native library (Zig)
         run: zig build -Doptimize=ReleaseFast
 
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
+        # Prebuilt binary — see the audit job for why not `cargo install`.
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
 
       - name: Build fuzz targets
         working-directory: fuzz

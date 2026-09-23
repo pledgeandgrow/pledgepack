@@ -142,7 +142,11 @@ jobs:
         run: bash scripts/check-changelog-entry.sh
 
       - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
+        # Prebuilt signed binary — `cargo install` compiles ~200 crates
+        # from source (~10min) every run.
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
 
       - name: Run cargo-audit
         run: cargo audit   # ignores come from .cargo/audit.toml
@@ -216,6 +220,15 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Cache Zig build output
+        uses: actions/cache@v4
+        with:
+          path: |
+            .zig-cache
+            zig-out
+          key: zig-${{ matrix.zig-target }}-${{ hashFiles('build.zig', 'build.zig.zon', 'native-sys/zig/**') }}
+          restore-keys: zig-${{ matrix.zig-target }}-
 
       - name: Build native library (Zig)
         run: zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.zig-target }}
