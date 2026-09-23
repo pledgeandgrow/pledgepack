@@ -6,7 +6,150 @@ Development history of the Pledge build system enhancements.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-23 — Stable Release
+
+### Added
+- **Static evaluation of JS/TS config files** (`crates/core/src/js_config.rs`).
+  `pledge.config.{ts,js,mjs,cjs}` (and source configs read by `migrate`) are
+  parsed with Oxc and folded into JSON — never executed. Literals become
+  values; anything needing a runtime is preserved as `{"$call": name,
+  "$args": [...]}` / `{"$expr": "..."}` markers so callers can still recover
+  function names and string arguments.
+- **Named/default export checking** (`crates/core/src/export_check.rs`):
+  `import { x } from './mod'` is validated against the resolved module's
+  exports — Rollup-style `"x" is not exported by "…"` diagnostics. A build
+  error in production, a warning in dev. CommonJS targets, `export *`
+  re-exports and non-JS/TS modules are skipped rather than guessed at.
+- **Rendered source diagnostics** (`crates/core/src/diagnostics.rs`):
+  parser/transform errors now print as `error: msg` + `--> file:line:col` +
+  code frame instead of raw `OxcDiagnostic` debug output, and the dev
+  server's HMR error overlay now receives the parsed line/column.
+- **`pledgepack test` bundles test files** (`crates/js-plugin-host/src/test_bundle.rs`)
+  instead of deleting every `import` line: each imported
+  module is transformed by the same Oxc pipeline the build uses, resolved
+  through the real resolver (aliases, tsconfig paths, `node_modules`,
+  extensions) and wrapped in a CommonJS-style module registry. `vitest` /
+  `@jest/globals` imports resolve to the harness globals; Node built-ins
+  resolve to an empty object; an unresolvable import throws only if actually
+  executed. Applies to `test.setup_files` too.
+- **Project-wide test discovery** (`config::discover_test_files`): `pledgepack
+  test` finds files matching `test.include`/`exclude` under the project root
+  (not just `src/`), skipping `node_modules`, `target`, hidden dirs and the
+  build output.
+- **`--strict` global flag and `strict` config field.** Unknown or misspelled
+  config keys (with did-you-mean suggestions computed against the generated
+  JSON schema), invalid values and a missing entry point are warnings by
+  default and errors under `--strict` / `strict: true`. The same checks back
+  `pledgepack config`.
+- **`pledgepack migrate` now performs a real static migration** instead of
+  emitting a skeleton: it reads `vite.config.*`, `webpack.config.*`,
+  `next.config.*` and CRA `package.json` config via the static evaluator and
+  maps settings onto `pledge.config.ts` (entry, `base`, `define`/`DefinePlugin`,
+  aliases, `server.port`/`open`/`https`/`proxy`, build `outDir`/`sourcemaps`,
+  framework plugins like `@vitejs/plugin-react`). Values that can't be
+  evaluated statically and unmappable plugins produce explicit warnings; the
+  migrated field list is printed. `pledgepack init` reuses the same mapping.
+- **`pledgepack doctor` is PledgeStack-aware**: for `framework: 'pledge'` apps
+  it no longer flags the missing `entry`, `index.html` or `src/` that a
+  PledgeStack app legitimately doesn't have.
+- **npm package ships `index.js` + generated `index.d.ts`** so
+  `import { defineConfig } from 'pledgepack'` resolves. `index.d.ts` is
+  generated from `pledgepack schema` by `scripts/generate-config-types.mjs`
+  (`pnpm gen:types`).
+- `plugin search` parses real npm registry responses (`score.detail` nesting,
+  tolerant of missing/unknown fields; fixtures captured under
+  `tests/fixtures/`).
+- **CLI ↔ docs drift gate** (`crates/cli/tests/cli_help_docs.rs`): snapshot
+  tests pin `--help` output for the binary and every subcommand under
+  `crates/cli/tests/snapshots/help/` (regenerate with
+  `PLEDGE_UPDATE_SNAPSHOTS=1 cargo test -p pledgepack-cli --test
+  cli_help_docs`), and a docs check derives the live command tree from
+  `pledge <path> --help` and fails on any backticked "pledgepack …" command
+  reference in `README.md`/`docs/*.md` that doesn't resolve to a real
+  command — no hand-maintained command list to drift.
+- **Resolver conformance suite**
+  (`crates/core/tests/resolver_conformance.rs`): one shared fixture set
+  (relative / extension probing / index / alias / `node_modules` / `exports` /
+  `imports` / missing) runs through `BuildEngine::resolve_specifier` and
+  `pledgepack_resolver::Resolver::resolve` and must produce identical
+  results, pinning the engine→resolver delegation so bespoke engine
+  resolution can't creep back.
+- **Property tests for the import scanner** (`extract_module_specifier`):
+  proptest cases assert it never panics at any byte offset, round-trips
+  well-formed static/dynamic/re-export specifiers, and never treats `from`
+  inside a string value or a mid-statement `import`/`export` as a specifier.
+- **Fuzz targets for parser-adjacent code**: `js_config_eval`,
+  `export_check`, and `migrate_config` join `resolve_specifier` and
+  `package_json_exports` under `fuzz/`; the CI smoke job iterates
+  `cargo fuzz list` so new targets are exercised automatically.
+
+### Changed
+- **Module resolution is unified.** `BuildEngine` no longer carries its own
+  resolver — it delegates to `pledgepack-resolver` built from the same
+  `PledgeConfig` (`engine::module_resolver`), keeping only the
+  `/__pledge_router` virtual module and a root-relative last resort for
+  non-module specifiers. The engine therefore now supports package.json
+  `imports` (`#subpath`) and workspace-aware resolution. `package_map` is
+  re-exported from core so `pledgepack_core::package_map` keeps working.
+  Resolved paths are canonicalized.
+- **Production emit lowers modules into the `__pp` runtime**
+  (`crates/core/src/bundle.rs`): transformed ESM becomes
+  `__pp.def`/`__pp.req` records instead of concatenated modules with raw
+  specifiers, dynamic `import()` goes through `__pp.dyn` +
+  `__pp_manifest.js`, and `manifest.json` is keyed by chunk id.
+- **Config validation is schema-driven.** The generated JSON schema
+  (`pledgepack schema`) is the single source of truth for which fields
+  exist — the hand-maintained field allowlist and `validate_config_json`
+  are gone; `find_unknown_fields` walks the schema recursively (nested
+  sections, arrays, `$ref`, unions) with did-you-mean suggestions, while
+  `validate_config_values` keeps the semantic checks (enum values, port and
+  quality ranges, https cert/key pairing).
+
+### Fixed
+- **`pledgepack create` generated unrunnable projects.** Scripts called `pledge`
+  (the internal native binary name) but the npm bin is `pledgepack`, and the
+  package itself was never declared. Generated `package.json` now uses
+  `pledgepack` for the dev/build/preview scripts and adds `pledgepack` to `devDependencies`;
+  stale `~/.pledge/templates` caches are repaired on reuse (scripts, deps,
+  config rewritten; stale SPA files dropped for `pledge`).
+- **`pledgepack init` now writes `pledgepack` into `devDependencies`** instead of
+  only printing an install hint, and preserves existing `dev` scripts.
+- **`pledge` template is a real PledgeStack app again**: `defineConfig` from
+  `pledgestack`, `framework: 'pledge'`, `pledge dev/build/start` scripts,
+  `pledgestack` in `dependencies` — no more stray `index.html`/`src/index.tsx`
+  SPA entry.
+- **`import { defineConfig } from 'pledgepack'` now resolves**: the package ships
+  `index.js` + generated `index.d.ts` (from `pledgepack schema`) with
+  `main`/`types`/`exports` wired in `package.json`.
+- **`framework: 'pledge'` configs no longer warn** about PledgeStack-level keys
+  (`rsc`, `tailwind`, `cors`, …) — the schema-walking validator and the legacy
+  field list both treat them as legal pass-through keys.
+- **Windows npm-shim spawns fixed**: `pledgepack update` (`npm`), `plugin
+  install` (`npm`/`pnpm`/`yarn`/`bun` — also now uses `add`/`-D` correctly per
+  package manager) and `--type-check`'s `npx`/`tsc` lookup (`.bin/tsc` is a POSIX
+  script on Windows; `tsc.cmd`/`npx.cmd` are used instead).
+- Dependency-free templates (e.g. `vanilla`) no longer emit an empty
+  `"dependencies": {}`.
+- `pledgepack serve` reports the actual `--out-dir` when it is missing instead of
+  always saying ".pledge/".
+- **Path aliases without a trailing slash resolve subpaths correctly** —
+  `"@" → "./src"` with `@/x` no longer lets `Path::join` treat the
+  `/`-prefixed remainder as a root (which dropped the alias target entirely
+  on Unix, or everything after the drive on Windows).
+- **`imports` (`#subpath`) errors are diagnostic again**: an unmapped key
+  reports "not defined in <package.json>", a `./` target that doesn't exist
+  reports the mapping, and a nearest-package.json without `imports` says so —
+  instead of a bare "Cannot resolve" for all three.
+- **Chunk source-map offsets are accurate**: merged-map section offsets now
+  point at each module's first body line (not the `__pp.def` wrapper line),
+  and line accounting no longer drifts for CSS stub modules.
+
 ## [1.0.0-rc.1] - 2026-09-20 — Release Candidate
+
+> In development — the version bump is committed in the repo but
+> `pledgepack@1.0.0-rc.1` is **not yet published to npm** (registry `latest`
+> is still `0.3.3`; the RC will ship under the `rc` dist-tag). Latest
+> published release: **[0.3.3](#033---2026-09-17--production-readiness)**.
 
 First release candidate for 1.0.0. Version bumped 0.3.3 → 1.0.0-rc.1 in
 `Cargo.toml`, `package.json`, `platforms.json` and `Cargo.lock`;

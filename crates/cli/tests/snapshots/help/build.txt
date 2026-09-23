@@ -1,0 +1,18 @@
+Create a production build
+
+Usage: pledgepack build [OPTIONS]
+
+Options:
+  -o, --out-dir <OUT_DIR>  Output directory
+      --root <ROOT>        Project root directory (default: current directory)
+      --config <CONFIG>    Config file path (default: auto-detect pledge.json)
+      --no-sourcemap       Disable source maps
+      --profile            Enable build profiling (timing per phase)
+      --strict             Treat config-file problems (unknown / misspelled keys) as errors
+      --watch              Watch mode — rebuild on file change
+      --verify             Verify build output integrity after emit
+      --type-check         Run TypeScript type checking during build (#71)
+      --check-budgets      Check bundle size budgets and exit non-zero on violations (#102)
+      --env <ENV>          Environment-specific build (#117) Loads .env.{env} and sets process.env.NODE_ENV accordingly
+      --codegen            GraphQL code generation (#116) Generates TypeScript types from .graphql schema files
+  -h, --help               Print help

@@ -7,7 +7,7 @@
 > methodology section claiming "5 runs, median reported" on specific
 > hardware. **These numbers were not produced by any benchmark tooling that
 > exists in this codebase.** The only real benchmark tooling here —
-> `pledge bench` (measures PledgePack's own build time against its own
+> `pledgepack bench` (measures PledgePack's own build time against its own
 > previous runs) and `zig build bench` (Zig-side micro-benchmarks of the
 > native module graph, SIMD scanning, and file I/O) — has no code path that
 > invokes or measures Vite, Turbopack, esbuild, or webpack; nothing in this
@@ -28,7 +28,7 @@
 
 Two genuine, runnable benchmark tools exist in this codebase today:
 
-- **`pledge bench`** — runs the current project's build N times and reports
+- **`pledgepack bench`** — runs the current project's build N times and reports
   min/max/avg/median wall-clock time, optionally against a saved baseline
   (`--baseline <ref>`, `--save`). This measures PledgePack's own build
   performance over time (e.g. did a change regress build speed), not a

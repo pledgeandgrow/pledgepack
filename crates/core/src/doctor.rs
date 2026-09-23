@@ -84,6 +84,9 @@ pub fn run_diagnostics(root: &Path, config: &crate::config::PledgeConfig) -> Dia
     // Security checks
     checks.extend(check_security(root));
 
+    // Toolchain checks (Windows linker shadowing, etc.)
+    checks.extend(check_toolchain());
+
     let passed = checks
         .iter()
         .filter(|c| c.status == DiagnosticStatus::Pass)
@@ -147,53 +150,62 @@ fn check_config(root: &Path, config: &crate::config::PledgeConfig) -> Vec<Diagno
             status: DiagnosticStatus::Warn,
             name: "Config file".to_string(),
             message: "No config file found — using defaults".to_string(),
-            suggestion: Some("Run `pledge init` to generate a config file".to_string()),
+            suggestion: Some("Run `pledgepack init` to generate a config file".to_string()),
         });
     }
 
+    // PledgeStack apps (`framework: 'pledge'`) have no SPA `entry`/`index.html`
+    // — routes under app/ are the entry surface; skip both checks for them.
+    let is_pledgestack = config.framework == crate::config::Framework::Pledge;
+
     // Check entry file exists
-    for entry in &config.entry {
-        let entry_path = root.join(entry);
-        if entry_path.exists() {
+    if !is_pledgestack {
+        for entry in &config.entry {
+            let entry_path = root.join(entry);
+            if entry_path.exists() {
+                checks.push(DiagnosticCheck {
+                    category: DiagnosticCategory::Config,
+                    status: DiagnosticStatus::Pass,
+                    name: "Entry file".to_string(),
+                    message: format!("{} exists", entry),
+                    suggestion: None,
+                });
+            } else {
+                checks.push(DiagnosticCheck {
+                    category: DiagnosticCategory::Config,
+                    status: DiagnosticStatus::Fail,
+                    name: "Entry file".to_string(),
+                    message: format!("{} not found", entry),
+                    suggestion: Some(format!(
+                        "Create {} or update `entry` in pledge.config.ts",
+                        entry
+                    )),
+                });
+            }
+        }
+    }
+
+    // Check HTML entry
+    if !is_pledgestack {
+        let html_path = config.html_entry.as_deref().unwrap_or("index.html");
+        if root.join(html_path).exists() {
             checks.push(DiagnosticCheck {
                 category: DiagnosticCategory::Config,
                 status: DiagnosticStatus::Pass,
-                name: "Entry file".to_string(),
-                message: format!("{} exists", entry),
+                name: "HTML entry".to_string(),
+                message: format!("{} found", html_path),
                 suggestion: None,
             });
         } else {
             checks.push(DiagnosticCheck {
                 category: DiagnosticCategory::Config,
-                status: DiagnosticStatus::Fail,
-                name: "Entry file".to_string(),
-                message: format!("{} not found", entry),
-                suggestion: Some(format!(
-                    "Create {} or update `entry` in pledge.config.ts",
-                    entry
-                )),
+                status: DiagnosticStatus::Warn,
+                name: "HTML entry".to_string(),
+                message: "index.html not found — Pledgepack will generate a default one"
+                    .to_string(),
+                suggestion: None,
             });
         }
-    }
-
-    // Check HTML entry
-    let html_path = config.html_entry.as_deref().unwrap_or("index.html");
-    if root.join(html_path).exists() {
-        checks.push(DiagnosticCheck {
-            category: DiagnosticCategory::Config,
-            status: DiagnosticStatus::Pass,
-            name: "HTML entry".to_string(),
-            message: format!("{} found", html_path),
-            suggestion: None,
-        });
-    } else {
-        checks.push(DiagnosticCheck {
-            category: DiagnosticCategory::Config,
-            status: DiagnosticStatus::Warn,
-            name: "HTML entry".to_string(),
-            message: "index.html not found — Pledgepack will generate a default one".to_string(),
-            suggestion: None,
-        });
     }
 
     // Check for conflicting build tools
@@ -256,7 +268,8 @@ fn validate_config_fields(config: &crate::config::PledgeConfig) -> Vec<Diagnosti
     ];
 
     // Check for known misconfigurations
-    if config.entry.is_empty() {
+    // (`framework: 'pledge'` apps route via app/ and have no `entry`.)
+    if config.entry.is_empty() && config.framework != crate::config::Framework::Pledge {
         checks.push(DiagnosticCheck {
             category: DiagnosticCategory::Config,
             status: DiagnosticStatus::Fail,
@@ -547,7 +560,9 @@ fn check_project_structure(
 ) -> Vec<DiagnosticCheck> {
     let mut checks = Vec::new();
 
-    // Check for src directory
+    // Check for src directory (PledgeStack apps keep sources under app/ and
+    // server/, so a missing src/ is expected, not a warning).
+    let is_pledgestack = config.framework == crate::config::Framework::Pledge;
     if root.join("src").exists() {
         checks.push(DiagnosticCheck {
             category: DiagnosticCategory::Project,
@@ -556,7 +571,7 @@ fn check_project_structure(
             message: "src/ directory found".to_string(),
             suggestion: None,
         });
-    } else {
+    } else if !is_pledgestack {
         checks.push(DiagnosticCheck {
             category: DiagnosticCategory::Project,
             status: DiagnosticStatus::Warn,
@@ -610,7 +625,8 @@ fn check_project_structure(
             name: "TypeScript config".to_string(),
             message: "No tsconfig.json — TypeScript path aliases won't be resolved".to_string(),
             suggestion: Some(
-                "Run `pledge create` to generate tsconfig.json or create one manually".to_string(),
+                "Run `pledgepack create` to generate tsconfig.json or create one manually"
+                    .to_string(),
             ),
         });
     }
@@ -661,6 +677,57 @@ fn check_project_structure(
     checks
 }
 
+/// On Windows, Git Bash's coreutils `link.exe` shadows the MSVC linker when
+/// `Git\usr\bin` precedes it in PATH — `cargo build` then fails with the
+/// cryptic `link: extra operand ...` (the Unix link(1) tool, not the linker).
+/// Only relevant when rustc's host toolchain is the MSVC triple.
+#[cfg(windows)]
+fn check_toolchain() -> Vec<DiagnosticCheck> {
+    let mut checks = Vec::new();
+
+    let host_is_msvc = std::process::Command::new("rustc")
+        .arg("-vV")
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .map(|v| {
+            v.lines()
+                .find(|l| l.starts_with("host:"))
+                .is_some_and(|l| l.contains("msvc"))
+        })
+        .unwrap_or(false);
+    if !host_is_msvc {
+        return checks;
+    }
+
+    if let Ok(out) = std::process::Command::new("where").arg("link.exe").output() {
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        if let Some(first) = stdout.lines().next()
+            && first.to_lowercase().contains("git")
+        {
+            checks.push(DiagnosticCheck {
+                category: DiagnosticCategory::Project,
+                status: DiagnosticStatus::Warn,
+                name: "Linker shadowing".to_string(),
+                message: format!(
+                    "`link.exe` resolves to Git's coreutils tool ({first}), not the MSVC linker"
+                ),
+                suggestion: Some(
+                    "Build with `cargo +stable-x86_64-pc-windows-gnu`, or put MSVC's \
+                     link.exe ahead of Git\\usr\\bin in PATH"
+                        .to_string(),
+                ),
+            });
+        }
+    }
+    checks
+}
+
+#[cfg(not(windows))]
+fn check_toolchain() -> Vec<DiagnosticCheck> {
+    Vec::new()
+}
+
 fn check_security(root: &Path) -> Vec<DiagnosticCheck> {
     let mut checks = Vec::new();
 
@@ -687,6 +754,86 @@ fn check_security(root: &Path) -> Vec<DiagnosticCheck> {
             message: ".env.local exists but is not gitignored".to_string(),
             suggestion: Some("Add .env.local to .gitignore".to_string()),
         });
+    }
+
+    // Supply-chain pass: known-vulnerable dependencies.
+    // 1. Offline advisory database — always runs, no network needed.
+    let vulns = crate::security::scan_vulnerabilities(root);
+    for v in &vulns {
+        checks.push(DiagnosticCheck {
+            category: DiagnosticCategory::Security,
+            status: match v.severity {
+                crate::security::VulnerabilitySeverity::Critical
+                | crate::security::VulnerabilitySeverity::High => DiagnosticStatus::Fail,
+                _ => DiagnosticStatus::Warn,
+            },
+            name: format!("Vulnerable dep: {}", v.package),
+            message: format!(
+                "{}@{} — {} [{}]{}",
+                v.package,
+                v.version,
+                v.title,
+                v.severity.label(),
+                v.cve.as_ref().map(|c| format!(" ({c})")).unwrap_or_default()
+            ),
+            suggestion: v
+                .patch_version
+                .as_ref()
+                .map(|p| format!("Upgrade to {}@{}", v.package, p)),
+        });
+    }
+
+    // 2. `npm audit --json` — live registry data, best-effort. Skipped
+    //    silently when npm or a lockfile is absent; audit failures degrade
+    //    to Info rather than failing a diagnostics pass over a network blip.
+    if root.join("package-lock.json").exists()
+        && let Ok(out) = std::process::Command::new("npm")
+            .args(["audit", "--json", "--omit=dev"])
+            .current_dir(root)
+            .output()
+    {
+        // npm exits non-zero when vulns exist — parse stdout regardless.
+        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&out.stdout)
+            && let Some(meta) = json
+                .get("metadata")
+                .and_then(|m| m.get("vulnerabilities"))
+        {
+            let total: u64 = ["critical", "high", "moderate", "low"]
+                .iter()
+                .filter_map(|k| meta.get(*k).and_then(|v| v.as_u64()))
+                .sum();
+            if total > 0 {
+                let critical_high = meta
+                    .get("critical")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0)
+                    + meta.get("high").and_then(|v| v.as_u64()).unwrap_or(0);
+                checks.push(DiagnosticCheck {
+                    category: DiagnosticCategory::Security,
+                    status: if critical_high > 0 {
+                        DiagnosticStatus::Fail
+                    } else {
+                        DiagnosticStatus::Warn
+                    },
+                    name: "npm audit".to_string(),
+                    message: format!(
+                        "npm audit: {} vulnerabilities ({} critical, {} high)",
+                        total,
+                        meta.get("critical").and_then(|v| v.as_u64()).unwrap_or(0),
+                        meta.get("high").and_then(|v| v.as_u64()).unwrap_or(0),
+                    ),
+                    suggestion: Some("Run `npm audit` for details, `npm audit fix` to remediate".to_string()),
+                });
+            } else {
+                checks.push(DiagnosticCheck {
+                    category: DiagnosticCategory::Security,
+                    status: DiagnosticStatus::Pass,
+                    name: "npm audit".to_string(),
+                    message: "npm audit: no known vulnerabilities".to_string(),
+                    suggestion: None,
+                });
+            }
+        }
     }
 
     // Check for sensitive patterns in config

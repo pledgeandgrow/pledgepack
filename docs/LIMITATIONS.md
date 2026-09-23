@@ -108,7 +108,7 @@ by a test that asserts on the plugin's observable side effects
   function in order across plugins. Promise-returning (`async`) hooks are awaited
   by draining the QuickJS microtask queue. A hook that throws or rejects does not
   stop later plugins from running, but the failures are returned as an `Err` and
-  `pledge build` aborts (matching Rollup/Vite). `pledge build` runs `buildStart`
+  `pledgepack build` aborts (matching Rollup/Vite). `pledgepack build` runs `buildStart`
   before the build and `generateBundle` + `buildEnd` after the output is emitted.
   `generateBundle` receives `({}, {})` — the emitted files are already on disk;
   the Rollup `bundle` object is not populated yet.
@@ -122,19 +122,19 @@ by a test that asserts on the plugin's observable side effects
   plugin's blake3 content hash. Both plugin hosts read a `<plugin>.sig.json` sidecar,
   recompute the hash of the file on disk (so tampering is detected), verify, and
   then audit any declared capabilities before loading. It is wired into
-  `pledge build` (`config.plugins`) and the dev server (`plugins/`). Tests cover
+  `pledgepack build` (`config.plugins`) and the dev server (`plugins/`). Tests cover
   valid, invalid-signature, tampered-source, untrusted-signer, missing-sidecar and
   malformed-sidecar cases for the JS host end to end.
 - **Design decision — secure by default.** `plugin_security.requireSigned` defaults
   to **true**: with no `trustedKeys` configured every plugin is refused. Opt out
   explicitly with `plugin_security.requireSigned = false` (documented as insecure,
-  intended for local plugin development). `pledge plugin keygen` / `pledge plugin
+  intended for local plugin development). `pledgepack plugin keygen` / `pledgepack plugin
   sign <file>` produce keys and sidecars.
 - **Fixed:** hook dispatch used to locate a plugin's JS global by *name*, so two
   plugins with the same `name` shared one module; it now uses the plugin's index.
 
 **Remaining gaps (honest list)**
-- **Per-module hooks are wired into `pledge build` (2026-09-20)** through the
+- **Per-module hooks are wired into `pledgepack build` (2026-09-20)** through the
   `pledgepack_core::plugin_hooks::PluginHooks` trait (core cannot depend on the host
   crate; the CLI passes its `JsPluginHost` as `&dyn PluginHooks` to
   `BuildEngine::build_with_hooks` / `emit_with_chunks_hooks`). Semantics are Rollup/Vite's:
@@ -143,7 +143,7 @@ by a test that asserts on the plugin's observable side effects
   run **before** content hashing, so chunk hashes reflect the final code. A plugin
   that throws or rejects aborts the build with the plugin name, hook and file. Covered by
   unit tests with a fake host (`plugin_hooks.rs`, `engine.rs`) and an end-to-end
-  `pledge build` test with a real JS plugin (`crates/cli/tests/build_plugins_e2e.rs`).
+  `pledgepack build` test with a real JS plugin (`crates/cli/tests/build_plugins_e2e.rs`).
   Limits of the wiring:
   - `transform` hooks run over the *loaded source before* PledgePack's built-in
     TS/JSX/CSS transform (so dependency discovery, the content hash and every cache see
@@ -155,7 +155,7 @@ by a test that asserts on the plugin's observable side effects
     cache — they re-run every build. Source maps returned by `transform` are ignored;
     `renderChunk` maps are used only when the plugin supplies one.
   - The dev server still does not run per-module hooks (see next item).
-  - Fixed on the way: `pledge build` resolved `plugins` paths against the working
+  - Fixed on the way: `pledgepack build` resolved `plugins` paths against the working
     directory (not `--root`) and silently skipped missing / failing plugins; it now
     resolves them against the project root and refuses to build if a configured plugin
     is missing or fails to load.
@@ -171,7 +171,8 @@ by a test that asserts on the plugin's observable side effects
 - The WASM host's `resolve-import` host call is now delegated to an
   embedder-supplied resolver (`WasmPluginHost::with_import_resolver`); the CLI does
   not install one yet, so plugins still see "unresolved" by default.
-- `plugin migrate` emits a signature scaffold, not a ported plugin.
+- `generate_wasm_skeleton()` (the would-be `plugin migrate`, not yet wired to
+  a CLI subcommand) emits a signature scaffold, not a ported plugin.
 
 ---
 
@@ -245,7 +246,7 @@ Not compiled (passed through / relies on a runtime shim): `$:` reactive statemen
 
 ---
 
-## Visual Regression (`pledge test --visual`)
+## Visual Regression (`pledgepack test --visual`)
 
 ### Status: ✅ Implemented (updated 2026-09-20) — needs a browser
 Previously this fabricated a 1×1 placeholder PNG and compared raw bytes, so it could
@@ -321,12 +322,22 @@ Fixed in this pass (each with a regression test in `crates/core/src/engine.rs`):
 
 Still open:
 
-- The engine has its own module resolver (`BuildEngine::resolve`: aliases, relative
+- ~~The engine has its own module resolver (`BuildEngine::resolve`: aliases, relative
   paths, `node_modules`, package `exports`) that duplicates `crates/resolver`.
   `pledgepack-resolver` depends on `pledgepack-core`, so core cannot depend on it
   without a cycle; unifying them means moving the resolver below core (a larger
   refactor). Consequences: the engine does not support `package.json` `imports`
-  (`#subpath`) or the workspace-aware resolution that `pledgepack-resolver` implements.
+  (`#subpath`) or the workspace-aware resolution that `pledgepack-resolver`
+  implements.~~ — **resolved**: the dependency direction was inverted
+  (`pledgepack-core` now depends on `pledgepack-resolver`) and
+  `BuildEngine::resolve` delegates to the shared `Resolver` built from the same
+  `PledgeConfig` via `module_resolver`, adding only the `/__pledge_router`
+  virtual module and a root-relative fallback for non-module specifiers. The
+  engine now honours `imports`/`#subpath` and workspace packages. A conformance
+  suite (`crates/core/tests/resolver_conformance.rs`) runs identical fixtures
+  through both surfaces so the delegation cannot silently diverge. Resolved
+  paths are canonicalized (verbatim `\\?\` on Windows), which can surface in
+  emitted code and diagnostics.
 - `adapter-react` / `adapter-solid` now return a source map from their standalone
   `transform` (`ReactTransformResult::source_map`, `SolidAdapter::transform_with_source_map`),
   but the production build does not call the adapters — JSX/TSX is compiled by

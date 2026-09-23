@@ -190,7 +190,7 @@ export default defineConfig({{
 
 ```bash
 pledge dev    # Start dev server with plugin
-pledge test   # Run plugin tests
+pledgepack test   # Run plugin tests
 ```
 
 ## License

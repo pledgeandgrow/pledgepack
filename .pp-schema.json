@@ -1,0 +1,1656 @@
+{
+  "$defs": {
+    "A11yConfig": {
+      "description": "Accessibility linting configuration (#108)",
+      "properties": {
+        "checkAlt": {
+          "default": true,
+          "description": "Check for missing alt attributes on images",
+          "type": "boolean"
+        },
+        "checkAria": {
+          "default": true,
+          "description": "Check for ARIA labels on interactive elements",
+          "type": "boolean"
+        },
+        "checkContrast": {
+          "default": false,
+          "description": "Check for sufficient color contrast",
+          "type": "boolean"
+        },
+        "enabled": {
+          "default": false,
+          "description": "Enable a11y linting during build (default: false)",
+          "type": "boolean"
+        },
+        "failOnError": {
+          "default": true,
+          "description": "Fail build on a11y errors (default: true)",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "BudgetConfig": {
+      "description": "Bundle size budget configuration (#102)",
+      "properties": {
+        "enabled": {
+          "default": false,
+          "description": "Enable budget checking (default: false)",
+          "type": "boolean"
+        },
+        "entryBudgets": {
+          "additionalProperties": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "default": {},
+          "description": "Per-entry-point budgets (entry name → max bytes)",
+          "type": "object"
+        },
+        "maxBundleSize": {
+          "default": 0,
+          "description": "Maximum total bundle size in bytes (0 = no limit)",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "maxChunkCount": {
+          "default": 0,
+          "description": "Maximum number of chunks (0 = no limit)",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "maxChunkSize": {
+          "default": 0,
+          "description": "Maximum per-chunk size in bytes (0 = no limit)",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "BuildConfig": {
+      "description": "Build configuration for production builds",
+      "properties": {
+        "assetsInlineLimit": {
+          "default": 4096,
+          "description": "Asset inlining threshold in bytes (default: 4096)\nAssets smaller than this are inlined as base64 data URIs",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "emitDecoratorMetadata": {
+          "default": false,
+          "description": "Emit decorator metadata for legacy decorators (default: false)\nMirrors tsconfig `compilerOptions.emitDecoratorMetadata`.\nOnly takes effect when legacy decorators are enabled.",
+          "type": "boolean"
+        },
+        "envInline": {
+          "default": true,
+          "description": "Inline process.env.* variables at build time (default: true in production)\nReplaces process.env.NODE_ENV with \"production\" / \"development\" and\ntree-shakes unreachable branches (if (DEV) { ... } eliminated)",
+          "type": "boolean"
+        },
+        "experimentalDecorators": {
+          "default": false,
+          "description": "Enable TypeScript legacy (\"experimental\") decorators (default: false)\nMirrors tsconfig `compilerOptions.experimentalDecorators`; also\nauto-detected from tsconfig.json when not enabled here.",
+          "type": "boolean"
+        },
+        "fontSubsetting": {
+          "default": false,
+          "description": "Enable font subsetting for production builds (default: false)",
+          "type": "boolean"
+        },
+        "incrementalOutput": {
+          "default": true,
+          "description": "Incremental output: skip writing unchanged chunks in watch mode (default: true)\nCompares content hashes and only writes files that changed",
+          "type": "boolean"
+        },
+        "inlineDynamicImports": {
+          "default": false,
+          "description": "Inline dynamic imports into parent chunk instead of creating async chunks",
+          "type": "boolean"
+        },
+        "jsonMinify": {
+          "default": true,
+          "description": "Minify JSON modules in production (default: true)",
+          "type": "boolean"
+        },
+        "manualChunks": {
+          "additionalProperties": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "default": {},
+          "description": "Manual chunk splitting configuration\nMaps chunk name to list of module paths/globs to include",
+          "type": "object"
+        },
+        "modulePreload": {
+          "default": true,
+          "description": "Generate modulepreload link tags for async chunks (default: true)",
+          "type": "boolean"
+        },
+        "modulePreloadPolyfill": {
+          "default": false,
+          "description": "Polyfill modulepreload for older browsers (default: false)",
+          "type": "boolean"
+        },
+        "parallel": {
+          "default": null,
+          "description": "Build concurrency: max parallel module transforms (default: auto-detect CPU cores)\nSet to a specific number to limit concurrency and prevent OOM on large projects (#120)",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "prefetch": {
+          "default": false,
+          "description": "Generate prefetch link tags for assets (default: false)",
+          "type": "boolean"
+        },
+        "preload": {
+          "default": false,
+          "description": "Generate preload link tags for critical assets (default: false)",
+          "type": "boolean"
+        },
+        "preloadStrategy": {
+          "default": "lazy",
+          "description": "Module preloading strategy for entry chunks (default: \"lazy\")\n\"eager\" — preload all entry + async chunks via <link rel=\"modulepreload\">\n\"lazy\" — only preload entry chunks, async chunks loaded on demand\n\"manual\" — don't auto-generate preload tags, user controls via HTML",
+          "type": "string"
+        },
+        "sourceMapMode": {
+          "default": "external",
+          "description": "Source map mode: \"external\" (default), \"hidden\", \"inline\", \"nosources\"",
+          "type": "string"
+        },
+        "svgSprite": {
+          "default": false,
+          "description": "Enable SVG sprite generation (default: false)",
+          "type": "boolean"
+        },
+        "target": {
+          "default": null,
+          "description": "JavaScript compilation target for syntax lowering (default: none — modern ES output)\nAccepts esbuild-style targets (\"es2020\", \"chrome90\", \"node18\", \"esnext\")\nor a browserslist query (\"last 2 versions\", \"> 0.5%, not dead\").\nFalls back to the project's .browserslistrc / package.json browserslist\nfor browser builds when unset.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "typeCheck": {
+          "default": false,
+          "description": "Run TypeScript type checking during build (default: false)\nIntegrates `tsc --noEmit` into the build pipeline\nFails build on type errors with formatted output",
+          "type": "boolean"
+        },
+        "verifyOutput": {
+          "default": false,
+          "description": "Verify build output integrity after emit (default: false)\nChecks all chunks exist, no broken import references, all assets resolved",
+          "type": "boolean"
+        },
+        "wasmSimd": {
+          "default": "auto",
+          "description": "WASM SIMD optimization (default: \"auto\")\n\"auto\" — detect SIMD support from build target, generate optimized WASM\n\"always\" — always generate SIMD-optimized WASM instantiation\n\"never\" — always use non-SIMD fallback",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "BuildMode": {
+      "enum": [
+        "development",
+        "production"
+      ],
+      "type": "string"
+    },
+    "CacheConfig": {
+      "properties": {
+        "dir": {
+          "default": "node_modules/.pledge-cache",
+          "description": "Cache directory (default: \"node_modules/.pledge-cache\")",
+          "type": "string"
+        },
+        "enabled": {
+          "default": true,
+          "description": "Enable filesystem cache (default: true)",
+          "type": "boolean"
+        },
+        "remote": {
+          "$ref": "#/$defs/RemoteCacheSettings",
+          "default": {
+            "backend": "",
+            "bucket": null,
+            "enabled": false,
+            "endpoint": "",
+            "namespace": null,
+            "region": null
+          },
+          "description": "Remote cache configuration (optional, for CI/team cache sharing)"
+        }
+      },
+      "type": "object"
+    },
+    "CssConfig": {
+      "description": "CSS configuration for RTL auto-generation (#107), dark mode (#67),\ncustom property optimization (#68), scoped CSS (#69)",
+      "properties": {
+        "darkMode": {
+          "default": "off",
+          "description": "Dark mode generation strategy: \"auto\", \"extract\", \"off\" (default: \"off\")\n#67 — auto-generate dark mode variants from prefers-color-scheme",
+          "type": "string"
+        },
+        "minifyCustomPropertyNames": {
+          "default": false,
+          "description": "Minify CSS custom property names in production (default: false)\n#68 — shortens --my-color to --a etc.",
+          "type": "boolean"
+        },
+        "optimizeCustomProperties": {
+          "default": false,
+          "description": "Optimize CSS custom properties: inline static vars, remove unused (default: true in production)\n#68 — detect and inline static custom properties, remove unused :root variables",
+          "type": "boolean"
+        },
+        "rtl": {
+          "default": "off",
+          "description": "RTL CSS generation mode: \"auto\", \"manual\", \"off\" (default: \"off\")",
+          "type": "string"
+        },
+        "scoped": {
+          "default": "off",
+          "description": "Scoped CSS strategy: \"attribute\", \"modules\", \"off\" (default: \"off\")\n#69 — data-v-xxxxx attribute-based scoping like Vue for React components",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "CssPreprocessorConfig": {
+      "description": "CSS preprocessor configuration for multi-preprocessor support",
+      "properties": {
+        "less": {
+          "default": false,
+          "description": "Enable Less support (default: true if .less files detected)",
+          "type": "boolean"
+        },
+        "plugins": {
+          "default": [],
+          "description": "Additional CSS plugin paths",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "sass": {
+          "default": false,
+          "description": "Enable Sass/SCSS support (default: true, built-in via grass crate)",
+          "type": "boolean"
+        },
+        "stylus": {
+          "default": false,
+          "description": "Enable Stylus support (default: true if .styl files detected)",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "DevServerConfig": {
+      "properties": {
+        "accessToken": {
+          "default": null,
+          "description": "Access token required (as `?token=` or an `X-Pledge-Token` header) to\nreach any dev-server route. If unset and `host` is bound to a\nnon-loopback address, one is auto-generated and printed at startup —\nmirroring how e.g. Jupyter protects LAN-exposed sessions. Set to an\nempty string to explicitly disable (loopback binds never require a\ntoken regardless of this setting). See goal 18.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cors": {
+          "$ref": "#/$defs/DevServerCors",
+          "default": "same-origin",
+          "description": "CORS policy (default: same-origin). Previously the dev server sent\n`Access-Control-Allow-Origin: *` unconditionally on every route,\nincluding the raw-filesystem `/@fs/*` handler — any webpage open in\nthe same browser could read project files cross-origin. See\nPRODUCTION-READINESS-100.md goal 16."
+        },
+        "hmr": {
+          "default": true,
+          "description": "Enable HMR (default: true)",
+          "type": "boolean"
+        },
+        "host": {
+          "default": "localhost",
+          "description": "Host (default: \"localhost\")",
+          "type": "string"
+        },
+        "https": {
+          "default": false,
+          "description": "HTTPS support (default: false)",
+          "type": "boolean"
+        },
+        "middleware": {
+          "default": [],
+          "description": "Middleware functions to apply to the dev server (JS source code)",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "open": {
+          "default": false,
+          "description": "Open browser on start (default: false)",
+          "type": "boolean"
+        },
+        "port": {
+          "default": 3000,
+          "description": "Port (default: 3000)",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "publicDir": {
+          "default": "public",
+          "description": "Public directory for static assets (default: \"public\")",
+          "type": "string"
+        },
+        "unixSocket": {
+          "default": null,
+          "description": "Unix domain socket path to listen on instead of TCP host:port\n(Unix platforms only, default: none)",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "DevServerCors": {
+      "description": "CORS policy for the dev server. See [`DevServerConfig::cors`].",
+      "oneOf": [
+        {
+          "const": "same-origin",
+          "description": "No `Access-Control-*` headers beyond the browser's own same-origin\ndefault. Safe default — nothing outside the dev server's own origin\ncan read its responses.",
+          "type": "string"
+        },
+        {
+          "const": "any",
+          "description": "Allow any origin to read any response (the previous, unconditional\nbehavior). Opt in only if something outside the dev server's own\norigin genuinely needs to fetch it (e.g. a separately-hosted devtools\npage).",
+          "type": "string"
+        }
+      ]
+    },
+    "EncryptConfig": {
+      "description": "Build-time string encryption configuration (#109)",
+      "properties": {
+        "enabled": {
+          "default": false,
+          "description": "Enable string encryption (default: false)",
+          "type": "boolean"
+        },
+        "key": {
+          "default": null,
+          "description": "Encryption key (32-byte hex string). If not set, generated at build time.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "keys": {
+          "default": [],
+          "description": "Keys to encrypt (from process.env or define)",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "ExportsConfig": {
+      "description": "Conditional exports resolution configuration (#119)",
+      "properties": {
+        "conditions": {
+          "default": [],
+          "description": "Additional conditions for package.json exports resolution\ne.g., [\"production\", \"browser\"] to prefer production/browser entry points",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "Framework": {
+      "enum": [
+        "pledge",
+        "react",
+        "vue",
+        "svelte",
+        "solid",
+        "next",
+        "tanstack",
+        "astro",
+        "auto"
+      ],
+      "type": "string"
+    },
+    "GraphqlConfig": {
+      "description": "GraphQL code generation configuration (#116)",
+      "properties": {
+        "output": {
+          "default": "src/generated",
+          "description": "Output directory for generated types (default: \"src/generated\")",
+          "type": "string"
+        },
+        "reactHooks": {
+          "default": false,
+          "description": "Generate React hooks for queries (default: false)",
+          "type": "boolean"
+        },
+        "schema": {
+          "default": "",
+          "description": "Path to schema file (e.g., \"schema.graphql\")",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "HttpsConfig": {
+      "description": "HTTPS configuration for dev server",
+      "properties": {
+        "cert": {
+          "description": "Path to SSL certificate file",
+          "type": "string"
+        },
+        "key": {
+          "description": "Path to SSL key file",
+          "type": "string"
+        }
+      },
+      "required": [
+        "cert",
+        "key"
+      ],
+      "type": "object"
+    },
+    "I18nConfig": {
+      "description": "i18n configuration for locale-aware bundling (#106)",
+      "properties": {
+        "defaultLocale": {
+          "default": "en",
+          "description": "Default locale (default: \"en\")",
+          "type": "string"
+        },
+        "enabled": {
+          "default": false,
+          "description": "Enable i18n-aware bundling (default: false)",
+          "type": "boolean"
+        },
+        "extract": {
+          "default": false,
+          "description": "Enable compile-time i18n key extraction from t('key') calls (#13)",
+          "type": "boolean"
+        },
+        "locales": {
+          "default": [],
+          "description": "Supported locales (e.g., [\"en\", \"fr\", \"ja\"])",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "messagePattern": {
+          "default": "./messages.${locale}.json",
+          "description": "Message file pattern (default: \"./messages.${locale}.json\")",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "ImageConfig": {
+      "description": "Image optimization configuration",
+      "properties": {
+        "avif": {
+          "default": false,
+          "description": "Enable AVIF conversion (default: false)",
+          "type": "boolean"
+        },
+        "enabled": {
+          "default": false,
+          "description": "Enable image optimization (default: false)",
+          "type": "boolean"
+        },
+        "maxHeight": {
+          "default": 1080,
+          "description": "Max height in pixels (default: 1080)",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "maxWidth": {
+          "default": 1920,
+          "description": "Max width in pixels (default: 1920)",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "quality": {
+          "default": 80,
+          "description": "Default quality (1-100, default: 80)",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "responsiveWidths": {
+          "default": [],
+          "description": "Responsive srcset widths (#79) — e.g., [400, 800, 1200]\nWhen set, auto-generates srcset with multiple resolutions",
+          "items": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "array"
+        },
+        "webp": {
+          "default": true,
+          "description": "Enable WebP conversion (default: true when enabled)",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "LanguageConfig": {
+      "description": "Compiled-to-JS language configuration",
+      "properties": {
+        "coffeescript": {
+          "default": false,
+          "description": "Enable CoffeeScript compilation (default: false)",
+          "type": "boolean"
+        },
+        "livescript": {
+          "default": false,
+          "description": "Enable LiveScript compilation (default: false)",
+          "type": "boolean"
+        },
+        "transformers": {
+          "default": [],
+          "description": "Additional language transformers (plugin paths)",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "LibraryConfig": {
+      "description": "Library mode configuration for building npm packages",
+      "properties": {
+        "declarations": {
+          "description": "Generate TypeScript declaration files",
+          "type": "boolean"
+        },
+        "entry": {
+          "description": "Entry point for the library",
+          "type": "string"
+        },
+        "external": {
+          "description": "External dependencies (not bundled)",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "formats": {
+          "description": "Output formats (esm, cjs, umd)",
+          "items": {
+            "$ref": "#/$defs/OutputFormat"
+          },
+          "type": "array"
+        },
+        "name": {
+          "description": "Global variable name for UMD/IIFE",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "entry",
+        "formats",
+        "external",
+        "declarations"
+      ],
+      "type": "object"
+    },
+    "OptimizeConfig": {
+      "description": "Nested optimization configuration (matches pledge.json format)",
+      "properties": {
+        "minify": {
+          "default": null,
+          "description": "Enable minification (default: true in production)",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "splitChunks": {
+          "default": null,
+          "description": "Enable code splitting (default: true in production)",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "treeShake": {
+          "default": null,
+          "description": "Enable tree shaking (default: true in production)",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "OutputFormat": {
+      "enum": [
+        "esm",
+        "cjs",
+        "iife"
+      ],
+      "type": "string"
+    },
+    "PathAlias": {
+      "properties": {
+        "from": {
+          "type": "string"
+        },
+        "to": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "from",
+        "to"
+      ],
+      "type": "object"
+    },
+    "PluginSecurityConfig": {
+      "description": "Plugin trust policy (`plugin_security` / `pluginSecurity` in config).\n\nDefaults to **signed plugins required**: every plugin in `plugins` must\ncarry a `<path>.sig.json` sidecar whose Ed25519 signature verifies\nagainst one of `trusted_keys` and whose declared capabilities pass the\n`CapabilityAuditor` policy. Set `require_signed = false` to opt out\nentirely (unsigned plugins load, no capability audit — documented as\ninsecure, useful for local plugin development).",
+      "properties": {
+        "allowCapabilities": {
+          "default": [],
+          "description": "Extra capabilities to approve beyond the default policy\n(e.g. \"fs:write\", \"network\", or custom strings).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "denyCapabilities": {
+          "default": [],
+          "description": "Extra capabilities to deny beyond the default policy.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "requireSigned": {
+          "default": true,
+          "description": "Require a valid `.sig.json` sidecar from a trusted signer on every\nplugin (default: true — unsigned plugins are refused).",
+          "type": "boolean"
+        },
+        "trustedKeys": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "description": "Trusted signer identities → hex-encoded Ed25519 public keys. A\nsignature only verifies if its `(identity, public_key)` pair is\nlisted here — with no trusted keys configured and\n`require_signed` on, every plugin is refused.",
+          "type": "object"
+        }
+      },
+      "type": "object"
+    },
+    "ProxyConfig": {
+      "properties": {
+        "headers": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "description": "Additional headers to add to proxied requests",
+          "type": "object"
+        },
+        "path": {
+          "description": "Path prefix to match (e.g., \"/api\")",
+          "type": "string"
+        },
+        "rewrite": {
+          "default": false,
+          "description": "Whether to rewrite the path (remove prefix)",
+          "type": "boolean"
+        },
+        "target": {
+          "description": "Target URL to proxy to (e.g., \"http://localhost:8080\")",
+          "type": "string"
+        },
+        "ws": {
+          "default": false,
+          "description": "Enable WebSocket proxying (default: false)",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "path",
+        "target"
+      ],
+      "type": "object"
+    },
+    "RemoteCacheSettings": {
+      "description": "Settings for remote cache (S3/GCS/HTTP)",
+      "properties": {
+        "backend": {
+          "description": "Backend: \"http\", \"s3\", \"gcs\"",
+          "type": "string"
+        },
+        "bucket": {
+          "description": "Bucket name (for S3/GCS)",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "enabled": {
+          "description": "Enable remote cache (default: false)",
+          "type": "boolean"
+        },
+        "endpoint": {
+          "description": "Endpoint URL",
+          "type": "string"
+        },
+        "namespace": {
+          "description": "Namespace prefix for cache keys",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "region": {
+          "description": "Region (for S3)",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "enabled",
+        "backend",
+        "endpoint"
+      ],
+      "type": "object"
+    },
+    "ResolveConfig": {
+      "description": "Nested resolve configuration (matches pledge.json format)",
+      "properties": {
+        "alias": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "description": "Path aliases as a map (e.g., { \"@\": \"./src\" })",
+          "type": "object"
+        },
+        "conditions": {
+          "default": [],
+          "description": "Conditions for package.json exports resolution",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "extensions": {
+          "default": [],
+          "description": "File extensions to resolve",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "SecurityConfig": {
+      "description": "Security configuration for SRI (#81) and CSP (#82)",
+      "properties": {
+        "csp": {
+          "default": "off",
+          "description": "Content Security Policy generation mode: \"auto\", \"off\" (default: \"off\")\n#82 — auto-generate CSP headers from build output, writes _headers file",
+          "type": "string"
+        },
+        "secretScan": {
+          "default": true,
+          "description": "Scan emitted client bundles for embedded secrets (private keys,\nprovider tokens, non-public `.env` values, high-entropy literals).\nDefault: on — recognized credentials fail the build, entropy-only\nfindings warn. Set `secretScan: false` to disable.",
+          "type": "boolean"
+        },
+        "sri": {
+          "default": false,
+          "description": "Generate Subresource Integrity hashes for script/link tags (default: false)\n#81 — SHA-256 integrity attributes",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "SwCacheRule": {
+      "description": "A single service worker caching rule",
+      "properties": {
+        "pattern": {
+          "default": "",
+          "description": "URL pattern to match (e.g., \"/api/*\")",
+          "type": "string"
+        },
+        "strategy": {
+          "default": "",
+          "description": "Caching strategy: \"cache-first\", \"network-first\", \"stale-while-revalidate\"",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "SwCachingConfig": {
+      "description": "Service worker caching configuration (#113)",
+      "properties": {
+        "cacheName": {
+          "default": "pledge-sw",
+          "description": "Cache name prefix (default: \"pledge-sw\")",
+          "type": "string"
+        },
+        "caching": {
+          "default": [],
+          "description": "Per-route caching rules",
+          "items": {
+            "$ref": "#/$defs/SwCacheRule"
+          },
+          "type": "array"
+        },
+        "offlineFallback": {
+          "default": null,
+          "description": "Offline fallback page",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "Target": {
+      "enum": [
+        "browser",
+        "node",
+        "worker",
+        "edge"
+      ],
+      "type": "string"
+    },
+    "TargetConfig": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Target",
+          "description": "Single target (default: browser)"
+        },
+        {
+          "description": "Multiple targets for multi-platform builds",
+          "items": {
+            "$ref": "#/$defs/Target"
+          },
+          "type": "array"
+        }
+      ],
+      "description": "Build target configuration for multi-platform output"
+    },
+    "TemplateConfig": {
+      "description": "Template language configuration for server-side rendering",
+      "properties": {
+        "ejs": {
+          "default": false,
+          "description": "Enable EJS template compilation (default: false)",
+          "type": "boolean"
+        },
+        "extensions": {
+          "default": [],
+          "description": "Template file extensions to process (default: auto-detect)",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "handlebars": {
+          "default": false,
+          "description": "Enable Handlebars template compilation (default: false)",
+          "type": "boolean"
+        },
+        "pug": {
+          "default": false,
+          "description": "Enable Pug template compilation (default: false)",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "TestConfig": {
+      "description": "Test configuration (Vitest-compatible)",
+      "properties": {
+        "coverage": {
+          "default": false,
+          "description": "Whether to collect code coverage",
+          "type": "boolean"
+        },
+        "coverageReporter": {
+          "default": "text",
+          "description": "Coverage report format: \"text\", \"json\", \"html\", \"lcov\"",
+          "type": "string"
+        },
+        "environment": {
+          "default": "node",
+          "description": "Test environment: \"node\" (default), \"jsdom\", \"happy-dom\"",
+          "type": "string"
+        },
+        "exclude": {
+          "default": [
+            "**/node_modules/**",
+            "**/target/**",
+            "**/.pledge/**"
+          ],
+          "description": "Test file patterns to exclude",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "globals": {
+          "default": false,
+          "description": "Whether to run tests with globals (describe, it, expect) instead of imports",
+          "type": "boolean"
+        },
+        "include": {
+          "default": [
+            "**/*.{test,spec}.{js,ts,jsx,tsx}"
+          ],
+          "description": "Test file patterns (default: [\"**/*.{test,spec}.{js,ts,jsx,tsx}\"])",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "isolation": {
+          "default": "file",
+          "description": "Test isolation mode: \"file\" (each file in own context), \"pool\" (shared pool), \"none\" (no isolation)",
+          "type": "string"
+        },
+        "setupFiles": {
+          "default": [],
+          "description": "Setup files to run before each test file",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "snapshot": {
+          "default": true,
+          "description": "Whether to enable snapshot testing",
+          "type": "boolean"
+        },
+        "snapshotDir": {
+          "default": "__snapshots__",
+          "description": "Directory for snapshot files (default: \"__snapshots__\")",
+          "type": "string"
+        },
+        "updateSnapshots": {
+          "default": false,
+          "description": "Whether to update snapshots automatically",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "TransformPipelineConfig": {
+      "description": "Custom transformer pipeline configuration (#97)\nAllows inserting custom transform steps at any point in the pipeline",
+      "properties": {
+        "pipeline": {
+          "default": [],
+          "description": "Ordered list of transform steps\nBuilt-in steps: \"oxc\", \"minify\", \"tree-shake\"\nCustom steps: plugin name or path to WASM/JS transformer",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "replaceDefault": {
+          "default": false,
+          "description": "Whether to replace the default pipeline entirely (true) or insert into it (false)",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "WatchConfig": {
+      "description": "Watch mode configuration",
+      "properties": {
+        "debounceMs": {
+          "default": 100,
+          "description": "Debounce interval in milliseconds",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "enabled": {
+          "default": false,
+          "description": "Enable watch mode",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "WebhookConfig": {
+      "description": "Webhook configuration for build events (#105)",
+      "properties": {
+        "enabled": {
+          "default": false,
+          "description": "Enable webhooks (default: false)",
+          "type": "boolean"
+        },
+        "headers": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "description": "Additional headers to send",
+          "type": "object"
+        },
+        "onBuild": {
+          "default": null,
+          "description": "URL to POST build results to on completion",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "onError": {
+          "default": null,
+          "description": "URL to POST build errors to",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "secret": {
+          "default": null,
+          "description": "Optional HMAC-SHA256 secret for signing webhook payloads",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "WorkspaceConfig": {
+      "description": "Workspace configuration for monorepo support (#98, #99, #100)",
+      "properties": {
+        "crossPackageHmr": {
+          "default": true,
+          "description": "Enable cross-package HMR (#99) — propagate HMR across workspace packages",
+          "type": "boolean"
+        },
+        "enabled": {
+          "default": true,
+          "description": "Enable workspace-aware resolution (default: true when workspaces is set)",
+          "type": "boolean"
+        },
+        "root": {
+          "default": null,
+          "description": "Custom workspace root path (default: auto-detect from package.json)",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sharedCache": {
+          "default": true,
+          "description": "Share build cache at workspace root (#100)\nCache directory will be placed at workspace root .pledge/ instead of per-package",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Top-level configuration for the Pledge bundler.",
+  "properties": {
+    "a11y": {
+      "$ref": "#/$defs/A11yConfig",
+      "default": {
+        "checkAlt": true,
+        "checkAria": true,
+        "checkContrast": false,
+        "enabled": false,
+        "failOnError": true
+      },
+      "description": "Accessibility linting during build (#108)"
+    },
+    "alias": {
+      "default": [],
+      "description": "Path aliases from tsconfig/jsconfig",
+      "items": {
+        "$ref": "#/$defs/PathAlias"
+      },
+      "type": "array"
+    },
+    "appDir": {
+      "default": null,
+      "description": "App directory for file-based routing (e.g., \"app\" or \"src/app\")\nWhen set, enables Next.js/Expo-style file-based routing:\n  app/page.tsx          → /\n  app/about/page.tsx    → /about\n  app/blog/[slug]/page.tsx → /blog/:slug\n  app/layout.tsx        → shared layout wrapper\n\nAuto-detection order (when not explicitly set):\n  1. src/app/  — if src/ exists, colocate routes with source\n  2. app/      — flat structure at project root",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "base": {
+      "default": "/",
+      "description": "Base path for deployment under a subpath (#84)\ne.g., base: '/my-app/' — all asset URLs and import paths adjusted automatically\nDefault: \"/\" (root deployment)",
+      "type": "string"
+    },
+    "budgets": {
+      "$ref": "#/$defs/BudgetConfig",
+      "default": {
+        "enabled": false,
+        "entryBudgets": {},
+        "maxBundleSize": 0,
+        "maxChunkCount": 0,
+        "maxChunkSize": 0
+      },
+      "description": "Bundle size budgets (#102)\nExit non-zero on budget violations in CI"
+    },
+    "build": {
+      "$ref": "#/$defs/BuildConfig",
+      "default": {
+        "assetsInlineLimit": 4096,
+        "emitDecoratorMetadata": false,
+        "envInline": true,
+        "experimentalDecorators": false,
+        "fontSubsetting": false,
+        "incrementalOutput": true,
+        "inlineDynamicImports": false,
+        "jsonMinify": true,
+        "manualChunks": {},
+        "modulePreload": true,
+        "modulePreloadPolyfill": false,
+        "parallel": null,
+        "prefetch": false,
+        "preload": false,
+        "preloadStrategy": "lazy",
+        "sourceMapMode": "external",
+        "svgSprite": false,
+        "target": null,
+        "typeCheck": false,
+        "verifyOutput": false,
+        "wasmSimd": "auto"
+      },
+      "description": "Build configuration for chunk splitting, source maps, asset inlining"
+    },
+    "cache": {
+      "$ref": "#/$defs/CacheConfig",
+      "default": {
+        "dir": "node_modules/.pledge-cache",
+        "enabled": true,
+        "remote": {
+          "backend": "",
+          "bucket": null,
+          "enabled": false,
+          "endpoint": "",
+          "namespace": null,
+          "region": null
+        }
+      },
+      "description": "Whether to enable the persistent filesystem cache"
+    },
+    "compressBrotli": {
+      "default": false,
+      "description": "Whether to generate .br compressed output (default: false)",
+      "type": "boolean"
+    },
+    "compressGzip": {
+      "default": false,
+      "description": "Whether to generate .gz compressed output (default: false)",
+      "type": "boolean"
+    },
+    "conditions": {
+      "default": [
+        "browser",
+        "import"
+      ],
+      "description": "Conditions for package.json exports resolution",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "css": {
+      "$ref": "#/$defs/CssConfig",
+      "default": {
+        "darkMode": "off",
+        "minifyCustomPropertyNames": false,
+        "optimizeCustomProperties": false,
+        "rtl": "off",
+        "scoped": "off"
+      },
+      "description": "CSS RTL auto-generation (#107)"
+    },
+    "cssPreprocessor": {
+      "$ref": "#/$defs/CssPreprocessorConfig",
+      "default": {
+        "less": false,
+        "plugins": [],
+        "sass": false,
+        "stylus": false
+      },
+      "description": "CSS preprocessor configuration"
+    },
+    "define": {
+      "additionalProperties": {
+        "type": "string"
+      },
+      "default": {},
+      "description": "Compile-time constant replacement (define plugin)",
+      "type": "object"
+    },
+    "devServer": {
+      "$ref": "#/$defs/DevServerConfig",
+      "default": {
+        "accessToken": null,
+        "cors": "same-origin",
+        "hmr": true,
+        "host": "localhost",
+        "https": false,
+        "middleware": [],
+        "open": false,
+        "port": 3000,
+        "publicDir": "public",
+        "unixSocket": null
+      },
+      "description": "Dev server configuration"
+    },
+    "edgeTarget": {
+      "default": null,
+      "description": "Edge deployment target (\"cloudflare\", \"vercel\", \"deno\", or null)",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "encrypt": {
+      "$ref": "#/$defs/EncryptConfig",
+      "default": {
+        "enabled": false,
+        "key": null,
+        "keys": []
+      },
+      "description": "Build-time string encryption (#109)\nEncrypt sensitive strings in source at build time"
+    },
+    "entry": {
+      "default": [],
+      "description": "Entry points (e.g., [\"src/index.tsx\"])",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "envDts": {
+      "default": true,
+      "description": "Whether to generate .d.ts for import.meta.env (default: true)",
+      "type": "boolean"
+    },
+    "envPrefix": {
+      "default": [
+        "PLEDGE_"
+      ],
+      "description": "Environment variable prefixes to inject (default: [\"PLEDGE_\"])",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "exports": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ExportsConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Conditional exports resolution (#119)\nAdditional conditions for package.json exports resolution\nexports: { conditions: ['production', 'browser'] }"
+    },
+    "extensions": {
+      "default": [
+        ".tsx",
+        ".ts",
+        ".jsx",
+        ".js",
+        ".mjs",
+        ".json",
+        ".css"
+      ],
+      "description": "File extensions to resolve (default: [\".tsx\", \".ts\", \".jsx\", \".js\", \".json\", \".css\"])",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "federation": {
+      "default": null,
+      "description": "Module federation config (#115)\nShare modules across independently deployed apps\nfederation: { name: 'host', remotes: { app1: 'http://cdn/app1.js' }, shared: ['react'] }"
+    },
+    "framework": {
+      "$ref": "#/$defs/Framework",
+      "default": "pledge",
+      "description": "Framework adapter (\"react\", \"vue\", \"svelte\", \"solid\", \"auto\")"
+    },
+    "graphql": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/GraphqlConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "GraphQL code generation config (#116)\ngraphql: { schema: 'schema.graphql' }"
+    },
+    "htmlEntry": {
+      "default": null,
+      "description": "HTML entry point (default: \"index.html\")",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "https": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/HttpsConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "HTTPS configuration for dev server"
+    },
+    "i18n": {
+      "$ref": "#/$defs/I18nConfig",
+      "default": {
+        "defaultLocale": "en",
+        "enabled": false,
+        "extract": false,
+        "locales": [],
+        "messagePattern": "./messages.${locale}.json"
+      },
+      "description": "i18n-aware bundling (#106)\nSplit bundles by locale, only load current locale's strings"
+    },
+    "image": {
+      "$ref": "#/$defs/ImageConfig",
+      "default": {
+        "avif": false,
+        "enabled": false,
+        "maxHeight": 1080,
+        "maxWidth": 1920,
+        "quality": 80,
+        "responsiveWidths": [],
+        "webp": true
+      },
+      "description": "Image optimization config"
+    },
+    "languages": {
+      "$ref": "#/$defs/LanguageConfig",
+      "default": {
+        "coffeescript": false,
+        "livescript": false,
+        "transformers": []
+      },
+      "description": "Compiled-to-JS language configuration (CoffeeScript, LiveScript)"
+    },
+    "library": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/LibraryConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Library mode configuration (for building npm packages)"
+    },
+    "mode": {
+      "$ref": "#/$defs/BuildMode",
+      "default": "development",
+      "description": "Whether this is a dev or production build"
+    },
+    "nodePolyfills": {
+      "default": false,
+      "description": "Node.js polyfills for browser builds",
+      "type": "boolean"
+    },
+    "optimize": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/OptimizeConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Optimization config (matches pledge.json format)\nSupports: { minify: bool, tree_shake: bool, split_chunks: bool }"
+    },
+    "outDir": {
+      "default": ".pledge",
+      "description": "Output directory (default: \".pledge\")",
+      "type": "string"
+    },
+    "outputFormat": {
+      "$ref": "#/$defs/OutputFormat",
+      "default": "esm",
+      "description": "Output format (\"esm\" or \"cjs\")"
+    },
+    "pluginSecurity": {
+      "$ref": "#/$defs/PluginSecurityConfig",
+      "default": {
+        "allowCapabilities": [],
+        "denyCapabilities": [],
+        "requireSigned": true,
+        "trustedKeys": {}
+      },
+      "description": "Plugin trust policy — signature + capability enforcement for\n`plugins` (default: signed plugins required)."
+    },
+    "plugins": {
+      "default": [],
+      "description": "Plugin paths (JS/TS plugins to load)",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "presets": {
+      "default": [],
+      "description": "Plugin presets to apply (#94)\npresets: ['react', 'tailwind'] applies a bundle of plugins with sensible defaults",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "profile": {
+      "default": false,
+      "description": "Build profiling (timing per phase)",
+      "type": "boolean"
+    },
+    "proxy": {
+      "default": [],
+      "description": "Proxy rules for dev server (path prefix → target URL)",
+      "items": {
+        "$ref": "#/$defs/ProxyConfig"
+      },
+      "type": "array"
+    },
+    "resolve": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ResolveConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Nested resolve config (alternative to flat fields, matches pledge.json format)\nSupports: { alias: [...], extensions: [...], conditions: [...] }"
+    },
+    "resolveAlias": {
+      "default": [],
+      "description": "Resolve aliases (e.g., { \"@\": \"./src\" })",
+      "items": {
+        "$ref": "#/$defs/PathAlias"
+      },
+      "type": "array"
+    },
+    "root": {
+      "default": "",
+      "description": "Root directory of the project (default: cwd)",
+      "type": "string"
+    },
+    "security": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/SecurityConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Security configuration (#81, #82)\nsecurity: { sri: true, csp: 'auto' }"
+    },
+    "serverEntry": {
+      "default": null,
+      "description": "Server entry point for SSR/API routes (enables server-only code hot reload)",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "sourceMaps": {
+      "default": true,
+      "description": "Whether to enable source maps",
+      "type": "boolean"
+    },
+    "strict": {
+      "default": false,
+      "description": "Treat problems in the config file itself (unknown / misspelled keys,\nno entry point) as errors instead of warnings. Also enabled by the\nglobal `--strict` CLI flag. Default: false.",
+      "type": "boolean"
+    },
+    "sw": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/SwCachingConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Service worker caching strategies (#113)\nsw: { caching: [{ pattern: '/api/*', strategy: 'network-first' }] }"
+    },
+    "target": {
+      "$ref": "#/$defs/TargetConfig",
+      "default": "browser",
+      "description": "Build target(s) for multi-platform output\nSupports: \"browser\" (default), \"node\", \"worker\", \"edge\", or array for multiple targets\nExample: target: [\"browser\", \"node\"] builds both browser and Node.js bundles"
+    },
+    "templates": {
+      "$ref": "#/$defs/TemplateConfig",
+      "default": {
+        "ejs": false,
+        "extensions": [],
+        "handlebars": false,
+        "pug": false
+      },
+      "description": "Template language configuration (Pug, Handlebars, EJS)"
+    },
+    "test": {
+      "$ref": "#/$defs/TestConfig",
+      "default": {
+        "coverage": false,
+        "coverageReporter": "text",
+        "environment": "node",
+        "exclude": [
+          "**/node_modules/**",
+          "**/target/**",
+          "**/.pledge/**"
+        ],
+        "globals": false,
+        "include": [
+          "**/*.{test,spec}.{js,ts,jsx,tsx}"
+        ],
+        "isolation": "file",
+        "setupFiles": [],
+        "snapshot": true,
+        "snapshotDir": "__snapshots__",
+        "updateSnapshots": false
+      },
+      "description": "Test configuration (Vitest-compatible)"
+    },
+    "transformPipeline": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/TransformPipelineConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Custom transformer pipeline (#97)\ntransform: { pipeline: ['oxc', 'custom-transform', 'minify'] }\nInsert custom transform steps at any point in the pipeline"
+    },
+    "watch": {
+      "$ref": "#/$defs/WatchConfig",
+      "default": {
+        "debounceMs": 100,
+        "enabled": false
+      },
+      "description": "Watch mode configuration for production builds"
+    },
+    "webhooks": {
+      "$ref": "#/$defs/WebhookConfig",
+      "default": {
+        "enabled": false,
+        "headers": {},
+        "onBuild": null,
+        "onError": null,
+        "secret": null
+      },
+      "description": "Build event webhooks (#105)\nPOST build results to external services on completion"
+    },
+    "workspaces": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/WorkspaceConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Workspace configuration (#98, #99, #100)\nworkspaces: true enables auto-detection of npm/pnpm/yarn workspaces"
+    }
+  },
+  "title": "PledgeConfig",
+  "type": "object"
+}

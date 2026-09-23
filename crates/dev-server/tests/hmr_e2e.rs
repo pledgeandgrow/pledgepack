@@ -67,8 +67,10 @@ async fn start_server(root: &Path, host: &str) -> (u16, tokio::task::JoinHandle<
 
 /// Read WS messages until one parses as JSON with `type == wanted`.
 async fn next_of_type(
-    ws: &mut (impl futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
-              + Unpin),
+    ws: &mut (
+             impl futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
+             + Unpin
+         ),
     wanted: &str,
     within: Duration,
 ) -> Option<serde_json::Value> {
@@ -95,11 +97,10 @@ async fn next_of_type(
 /// Connect, wait for `connected`, then edit `file` repeatedly until an
 /// `update` for `expected_path` arrives.
 async fn assert_edit_produces_update(port: u16, file: &Path, expected_path: &str) {
-    let (mut ws, _) = tokio_tungstenite::connect_async(format!(
-        "ws://127.0.0.1:{port}/__pledge_hmr"
-    ))
-    .await
-    .expect("ws connect");
+    let (mut ws, _) =
+        tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/__pledge_hmr"))
+            .await
+            .expect("ws connect");
     assert!(
         next_of_type(&mut ws, "connected", Duration::from_secs(5))
             .await

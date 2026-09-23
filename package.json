@@ -1,8 +1,17 @@
 {
   "name": "pledgepack",
-  "version": "1.0.0-rc.1",
+  "version": "0.4.0",
   "description": "A Rust+Zig bundler with incremental computation, JS plugins, and Rollup-quality output. Like Vite, Webpack, or Turbopack — but faster.",
   "type": "module",
+  "main": "./index.js",
+  "types": "./index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./index.js"
+    },
+    "./package.json": "./package.json"
+  },
   "bin": {
     "pledgepack": "bin/pledge.js"
   },
@@ -21,10 +30,13 @@
     "test": "pledgepack test",
     "test:watch": "pledgepack test --watch",
     "gen:env": "pledgepack generate-env-types",
+    "gen:types": "node scripts/generate-config-types.mjs",
     "postinstall": "node ./bin/postinstall.js",
     "publish:npm": "npm publish --access public"
   },
   "files": [
+    "index.js",
+    "index.d.ts",
     "bin/pledge.js",
     "bin/postinstall.js",
     "platforms.json",

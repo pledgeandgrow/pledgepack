@@ -1,0 +1,36 @@
+A Rust+Zig bundler with incremental computation, JS plugins, and Rollup-quality output
+
+Usage: pledgepack [OPTIONS] <COMMAND>
+
+Commands:
+  dev                 Start the dev server with HMR
+  build               Create a production build
+  preview             Preview a production build with compression
+  serve               Serve a production build (alias for preview)
+  create              Scaffold a new project (defaults to PledgeStack if no template given)
+  init                Add Pledgepack to an existing project (migrates config from Vite/webpack/CRA)
+  doctor              Diagnose build issues, config problems, and performance bottlenecks
+  migrate             Migrate config from Vite/webpack/CRA/Next.js to pledge.config.ts
+  config              Validate config and show field suggestions
+  analyze             Analyze bundle size with interactive treemap
+  test                Run tests (Vitest-compatible API)
+  cache               Manage the cache
+  bench               Run benchmarks
+  dashboard           Serve the build telemetry dashboard (#101)
+  generate-env-types  Generate TypeScript declarations for env variables
+  completions         Generate shell completion scripts (`pledgepack completions bash`)
+  manpages            Generate man pages for package managers (Homebrew, Scoop, etc.)
+  schema              Generate JSON Schema for pledge.config.ts / pledge.json Useful for IDE autocompletion and config validation
+  playground          Open the PledgePack Playground — interactive transform REPL (#66)
+  plugin              Manage PledgePack plugins — search, install, list, docs (#67, #68, #69)
+  why                 Analyze why a module is included in the bundle (#82)
+  clean               Clean build artifacts and caches
+  update              Self-update PledgePack to the latest (or a specific) version
+  help                Print this message or the help of the given subcommand(s)
+
+Options:
+      --root <ROOT>      Project root directory (default: current directory)
+      --config <CONFIG>  Config file path (default: auto-detect pledge.json)
+      --strict           Treat config-file problems (unknown / misspelled keys) as errors
+  -h, --help             Print help
+  -V, --version          Print version

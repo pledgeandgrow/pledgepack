@@ -64,7 +64,11 @@ fn fixture() -> &'static Fixture {
         }
 
         let importer = root.join("index.js");
-        Fixture { dir, root, importer }
+        Fixture {
+            dir,
+            root,
+            importer,
+        }
     })
 }
 

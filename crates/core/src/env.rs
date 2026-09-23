@@ -154,57 +154,39 @@ impl EnvVars {
             return result;
         }
 
-        // Replace import.meta.env.VAR_NAME with string literal
+        // Replace import.meta.env.VAR_NAME with a string literal.
+        //
+        // Boundary-aware: `import.meta.env.PLEDGE_API` must not rewrite the
+        // head of `import.meta.env.PLEDGE_API_KEY` — the char after the var
+        // name must not be an identifier char. serde_json produces a fully
+        // escaped JS string literal, so `\`/`"`/newlines/`${` in a .env value
+        // can't break out of the string and inject code.
         let env_vars = self.get_with_prefixes(prefixes);
         for (key, value) in &env_vars {
             let pattern = format!("import.meta.env.{}", key);
-            let replacement = format!("\"{}\"", value.replace('"', "\\\""));
-            result = result.replace(&pattern, &replacement);
+            let replacement = serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string());
+            result = replace_member_access(&result, &pattern, &replacement);
         }
 
         // Replace built-in variables
-        result = result.replace(
-            "import.meta.env.PLEDGE_DEV",
-            if self.get("PLEDGE_DEV").unwrap_or("false") == "true" {
-                "true"
+        let dev = self.get("PLEDGE_DEV").unwrap_or("false") == "true";
+        let mode = self.get("PLEDGE_MODE").unwrap_or("development");
+        for (name, replacement) in [
+            ("PLEDGE_DEV", if dev { "true" } else { "false" }),
+            ("PLEDGE_PROD", if dev { "false" } else { "true" }),
+            ("PLEDGE_MODE", ""),
+            ("MODE", ""),
+            ("DEV", if dev { "true" } else { "false" }),
+            ("PROD", if dev { "false" } else { "true" }),
+            ("SSR", "false"),
+        ] {
+            let lit = if replacement.is_empty() {
+                serde_json::to_string(mode).unwrap_or_else(|_| "\"development\"".to_string())
             } else {
-                "false"
-            },
-        );
-        result = result.replace(
-            "import.meta.env.PLEDGE_PROD",
-            if self.get("PLEDGE_PROD").unwrap_or("false") == "true" {
-                "true"
-            } else {
-                "false"
-            },
-        );
-        if let Some(mode) = self.get("PLEDGE_MODE") {
-            result = result.replace("import.meta.env.PLEDGE_MODE", &format!("\"{}\"", mode));
+                replacement.to_string()
+            };
+            result = replace_member_access(&result, &format!("import.meta.env.{name}"), &lit);
         }
-        result = result.replace(
-            "import.meta.env.MODE",
-            &format!("\"{}\"", self.get("PLEDGE_MODE").unwrap_or("development")),
-        );
-        result = result.replace(
-            "import.meta.env.DEV",
-            if self.get("PLEDGE_DEV").unwrap_or("false") == "true" {
-                "true"
-            } else {
-                "false"
-            },
-        );
-        result = result.replace(
-            "import.meta.env.PROD",
-            if self.get("PLEDGE_PROD").unwrap_or("false") == "true" {
-                "true"
-            } else {
-                "false"
-            },
-        );
-
-        // Replace import.meta.env.SSR with false (no SSR by default)
-        result = result.replace("import.meta.env.SSR", "false");
 
         result
     }
@@ -233,14 +215,22 @@ impl EnvVars {
             props.push_str(&format!("    readonly {}: {};\n", key, ty));
         }
 
-        // Add built-in
-        props.push_str("    readonly PLEDGE_DEV: boolean;\n");
-        props.push_str("    readonly PLEDGE_PROD: boolean;\n");
-        props.push_str("    readonly PLEDGE_MODE: string;\n");
-        props.push_str("    readonly MODE: string;\n");
-        props.push_str("    readonly DEV: boolean;\n");
-        props.push_str("    readonly PROD: boolean;\n");
-        props.push_str("    readonly SSR: boolean;\n");
+        // Built-ins — PLEDGE_DEV/PROD/MODE are injected into `vars` at load
+        // time, so they already appear in `entries` when a `PLEDGE_` prefix is
+        // configured; emitting them again would duplicate interface members.
+        for (key, ty) in [
+            ("PLEDGE_DEV", "boolean"),
+            ("PLEDGE_PROD", "boolean"),
+            ("PLEDGE_MODE", "string"),
+            ("MODE", "string"),
+            ("DEV", "boolean"),
+            ("PROD", "boolean"),
+            ("SSR", "boolean"),
+        ] {
+            if !entries.iter().any(|(k, _)| k == key) {
+                props.push_str(&format!("    readonly {}: {};\n", key, ty));
+            }
+        }
 
         format!(
             r#"/// <reference types="pledge/client" />
@@ -255,5 +245,92 @@ interface ImportMeta {{
 "#,
             props
         )
+    }
+}
+
+/// Replace `pattern` with `replacement` only where it is not followed by an
+/// identifier continuation char (`[A-Za-z0-9_$]`). A plain `str::replace` on
+/// `import.meta.env.FOO` would corrupt `import.meta.env.FOO_BAR` into
+/// `"value"_BAR` — emitting broken JS and potentially injecting a *different*
+/// variable's value into a place the developer never asked for it.
+fn replace_member_access(code: &str, pattern: &str, replacement: &str) -> String {
+    let mut out = String::with_capacity(code.len());
+    let mut rest = code;
+    while let Some(pos) = rest.find(pattern) {
+        let end = pos + pattern.len();
+        let follows_ident = rest[end..]
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$');
+        out.push_str(&rest[..pos]);
+        if follows_ident {
+            out.push_str(&rest[pos..end]);
+        } else {
+            out.push_str(replacement);
+        }
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn env_with(pairs: &[(&str, &str)]) -> EnvVars {
+        EnvVars {
+            vars: pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn env_value_with_trailing_backslash_cannot_inject() {
+        // `KEY=abc\` used to emit `"abc\"` — the backslash escaped the closing
+        // quote and whatever followed was interpreted as live JS.
+        let env = env_with(&[("PLEDGE_X", "abc\\")]);
+        let out = env.inject_into_code("const v = import.meta.env.PLEDGE_X;", &["PLEDGE_".into()]);
+        assert_eq!(out, "const v = \"abc\\\\\";");
+    }
+
+    #[test]
+    fn env_value_with_quote_escape_sequence_cannot_inject() {
+        let env = env_with(&[("PLEDGE_X", "\\\"; alert(1); //")]);
+        let out = env.inject_into_code("const v = import.meta.env.PLEDGE_X;", &["PLEDGE_".into()]);
+        // Both the backslash and the quote are escaped — the value can never
+        // terminate the string literal it lands in.
+        assert_eq!(out, "const v = \"\\\\\\\"; alert(1); //\";");
+    }
+
+    #[test]
+    fn env_value_with_newline_stays_inside_string() {
+        let env = env_with(&[("PLEDGE_X", "line1\nline2")]);
+        let out = env.inject_into_code("import.meta.env.PLEDGE_X", &["PLEDGE_".into()]);
+        assert_eq!(out, "\"line1\\nline2\"");
+    }
+
+    #[test]
+    fn longer_var_name_is_not_rewritten_by_shorter_prefix() {
+        let env = env_with(&[("PLEDGE_API", "short")]);
+        let out = env.inject_into_code(
+            "import.meta.env.PLEDGE_API_KEY; import.meta.env.PLEDGE_API;",
+            &["PLEDGE_".into()],
+        );
+        assert_eq!(
+            out,
+            "import.meta.env.PLEDGE_API_KEY; \"short\";",
+            "got: {out}"
+        );
+    }
+
+    #[test]
+    fn builtin_dev_does_not_rewrite_device() {
+        let env = env_with(&[]);
+        let out = env.inject_into_code("import.meta.env.DEVICE; import.meta.env.DEV;", &[]);
+        assert!(out.contains("import.meta.env.DEVICE"));
+        assert!(out.contains("; false;") || out.contains("; true;"));
     }
 }

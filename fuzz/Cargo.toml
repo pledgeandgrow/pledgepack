@@ -9,6 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
+pledgepack-core = { path = "../crates/core" }
 pledgepack-resolver = { path = "../crates/resolver" }
 tempfile = "3"
 
@@ -22,6 +23,27 @@ bench = false
 [[bin]]
 name = "package_json_exports"
 path = "fuzz_targets/package_json_exports.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "js_config_eval"
+path = "fuzz_targets/js_config_eval.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "export_check"
+path = "fuzz_targets/export_check.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "migrate_config"
+path = "fuzz_targets/migrate_config.rs"
 test = false
 doc = false
 bench = false

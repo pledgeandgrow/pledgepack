@@ -148,18 +148,33 @@ pledgepack test --ui               # Browser UI test mode
 pledgepack bench                   # Benchmark build performance
 pledgepack analyze                 # Bundle analyzer
 pledgepack analyze --graph         # Dependency graph
+pledgepack why <module>            # Trace why a module is in the bundle
 pledgepack dashboard               # Build telemetry dashboard
 pledgepack cache clear             # Clear disk cache
 pledgepack cache stats             # Show cache statistics
 pledgepack doctor                  # Diagnose build issues
+pledgepack config                  # Validate config + show effective values
 pledgepack init                    # Add PledgePack to existing project
-pledgepack migrate                 # Migrate from Vite/webpack/CRA
+pledgepack migrate                 # Migrate config from Vite/webpack/CRA/Next.js
+pledgepack clean [--deep]          # Remove build artifacts and caches
+pledgepack update [--version <v>]  # Self-update to latest (or a specific version)
 pledgepack schema                  # Generate JSON Schema for config
 pledgepack generate-env-types      # Generate pledge-env.d.ts
 pledgepack playground              # Interactive transform REPL
 pledgepack completions --shell bash  # Shell completions
 pledgepack manpages                # Man pages
+pledgepack plugin search [query]   # Search the npm registry for plugins
+pledgepack plugin install <name>   # Install a plugin (uses your package manager)
+pledgepack plugin list             # List installed plugins
+pledgepack plugin create <name>    # Scaffold a new plugin project
+pledgepack plugin docs <file>      # Generate API docs from a plugin source file
+pledgepack plugin keygen           # Generate an Ed25519 keypair for plugin signing
+pledgepack plugin sign <file> --identity <id>  # Write a <file>.sig.json trust sidecar
 ```
+
+Global flag: `--strict` treats config-file problems (unknown/misspelled keys,
+invalid values, missing entry) as errors instead of warnings — also settable
+as `strict: true` in `pledge.config.ts`.
 
 ## Configuration
 
@@ -167,16 +182,21 @@ pledgepack manpages                # Man pages
 
 ```typescript
 // pledge.config.ts — config file for PledgePack
-// Note: defineConfig is a type-level helper for IDE autocompletion.
-// In the npm package, the native binary reads this file directly.
+// `defineConfig` is shipped by the npm package (index.js + generated
+// index.d.ts) purely for typed autocompletion. The binary never executes
+// this file — it is parsed and evaluated statically, so only literal values
+// are read; calls like `path.resolve()` are ignored (use plain strings).
 
-export default {
+import { defineConfig } from 'pledgepack';
+
+export default defineConfig({
   // App directory for file-based routing (auto-discovers pages)
   app_dir: 'app',
   // Explicit entry points (optional — use app_dir instead)
   entry: ['src/index.tsx'],
   framework: 'react',
   source_maps: true,
+  strict: false,  // true → unknown/misspelled config keys become errors (see also --strict)
   env_prefix: 'PLEDGE_',
   env_dts: true,
   html_entry: 'index.html',
@@ -380,15 +400,24 @@ The native binary can be used programmatically via Rust crates:
 - `pledgepack_resolver::Resolver` — Resolve module specifiers
 - `pledgepack_dev_server::serve()` — Start a dev server
 
-> **Note:** The npm package is a binary launcher — it does not export JS functions.
-> For JS-level API, use the CLI commands or write a Rust integration.
+> **Note:** The npm package is a binary launcher. Its only JS export is
+> `defineConfig` — an identity helper that gives `pledge.config.ts` typed
+> autocompletion (types are generated from `pledgepack schema` into
+> `index.d.ts`). There is no JS build API; for programmatic use, use the CLI
+> commands or write a Rust integration against the crates above.
 
 ## Testing
 
 - Vitest-compatible API: `describe`, `it`, `test`, `expect` with matchers
 - Lifecycle hooks: `beforeEach`, `afterEach`, `beforeAll`, `afterAll`
 - Real JS execution via `rquickjs` (QuickJS) with `console.log` and `require()` shim
-- TypeScript stripping for QuickJS compatibility
+- Test files are **bundled before execution**: imports of project modules are
+  resolved through the real resolver (relative paths, aliases, tsconfig paths,
+  `node_modules`) and transformed by the same Oxc pipeline the build uses —
+  `import { x } from './utils'` and `import { describe } from 'vitest'` both
+  work. Node built-ins resolve to an empty object.
+- Discovery scans the whole project root for `test.include`/`exclude` matches
+  (`node_modules`, `target`, hidden dirs and the build output are skipped)
 - Watch mode, UI mode, snapshot testing, coverage reporting
 - Mock support: `vi.fn()`, `vi.mock()`, `vi.spyOn()`, `vi.stubGlobal()`
 
@@ -460,7 +489,8 @@ MIT License ([LICENSE](LICENSE)).
 
 ## Status
 
-Current version: **1.0.0-rc.1** (release candidate). For the honest, source-verified picture of what
+Current version: **1.0.0-rc.1** in this repo (release candidate, **not yet
+published** — the latest version on npm is `0.3.3`, `latest` dist-tag). For the honest, source-verified picture of what
 works and what doesn't, see
 [docs/PRODUCTION-READINESS-100.md](docs/PRODUCTION-READINESS-100.md) — it is
 the authoritative status document (a goal only counts as done when backed by

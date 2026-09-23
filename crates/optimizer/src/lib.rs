@@ -10,12 +10,13 @@
 
 use anyhow::Result;
 use pledgepack_core::config::BuildConfig;
-use pledgepack_core::module::{ModuleId, ModuleKind, ResolvedModule};
+use pledgepack_core::module::{ModuleId, ResolvedModule};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
-mod side_effects;
+pub mod side_effects;
+mod tree_shake;
 
 /// The bundle optimizer. Runs tree shaking, code splitting, and chunk
 /// grouping over the full module graph produced by the build engine.
@@ -29,6 +30,10 @@ pub struct Optimizer {
     side_effect_modules: HashSet<ModuleId>,
     /// Chunk grouping
     chunks: Vec<Chunk>,
+    /// Reachable modules whose code was eliminated by export-demand tree
+    /// shaking — emitted as empty `__pp.def` stubs so `__pp.req` still
+    /// resolves for their (provably unused) import sites.
+    stubbed: Vec<ModuleId>,
 }
 
 /// A group of modules emitted together as one output file.
@@ -74,7 +79,13 @@ impl Optimizer {
         Self {
             side_effect_modules: HashSet::new(),
             chunks: Vec::new(),
+            stubbed: Vec::new(),
         }
+    }
+
+    /// Modules eliminated by export-demand tree shaking (emit as stubs).
+    pub fn stubbed_modules(&self) -> &[ModuleId] {
+        &self.stubbed
     }
 
     /// Run all optimization passes
@@ -88,15 +99,26 @@ impl Optimizer {
         // the same Optimizer instance don't accumulate stale chunks/side effects.
         self.chunks.clear();
         self.side_effect_modules.clear();
+        self.stubbed.clear();
 
-        // Phase 1: Mark side-effect-free modules
-        self.mark_side_effects(all_modules);
+        // Phase 1: Parse each JS module once — side effects + import edges.
+        let analyses = tree_shake::analyze_all(all_modules);
+        self.mark_side_effects(all_modules, &analyses);
 
         // Phase 2: Tree shake — remove unreachable modules
         let reachable = self.tree_shake(entry_modules, graph);
 
+        // Phase 2b: Export-demand shake — drop reachable modules whose
+        // imports are all dead (unused re-exports, side-effect-only imports
+        // of `sideEffects:false`/AST-pure packages). Dropped modules are
+        // recorded for stub emission, not removed from the module table.
+        let needed =
+            tree_shake::needed_modules(entry_modules, &reachable, all_modules, &analyses, graph);
+        self.stubbed = reachable.difference(&needed).copied().collect();
+        self.stubbed.sort_unstable();
+
         // Phase 3: Code splitting — group modules into chunks
-        self.split_chunks(entry_modules, &reachable, all_modules, graph);
+        self.split_chunks(entry_modules, &needed, all_modules, graph);
 
         // Phase 4: Scope hoisting — merge entry chunk modules into a single scope
         // (Already handled by emitting modules as separate files with ESM imports)
@@ -116,19 +138,27 @@ impl Optimizer {
         // the same Optimizer instance don't accumulate stale chunks/side effects.
         self.chunks.clear();
         self.side_effect_modules.clear();
+        self.stubbed.clear();
 
-        // Phase 1: Mark side-effect-free modules
-        self.mark_side_effects(all_modules);
+        // Phase 1: Parse each JS module once — side effects + import edges.
+        let analyses = tree_shake::analyze_all(all_modules);
+        self.mark_side_effects(all_modules, &analyses);
 
         // Phase 2: Tree shake — remove unreachable modules
         let reachable = self.tree_shake(entry_modules, graph);
 
+        // Phase 2b: Export-demand shake — see `optimize`.
+        let needed =
+            tree_shake::needed_modules(entry_modules, &reachable, all_modules, &analyses, graph);
+        self.stubbed = reachable.difference(&needed).copied().collect();
+        self.stubbed.sort_unstable();
+
         // Phase 3: Code splitting — group modules into chunks
-        self.split_chunks(entry_modules, &reachable, all_modules, graph);
+        self.split_chunks(entry_modules, &needed, all_modules, graph);
 
         // Phase 3b: Apply manual chunks configuration
         if !build_config.manual_chunks.is_empty() {
-            self.apply_manual_chunks(&reachable, all_modules, &build_config.manual_chunks);
+            self.apply_manual_chunks(&needed, all_modules, &build_config.manual_chunks);
         }
 
         // Phase 3c: If inline_dynamic_imports, merge all async chunks into their parent entry chunks
@@ -140,23 +170,21 @@ impl Optimizer {
     }
 
     /// Mark modules with side effects (parallelized using rayon)
-    fn mark_side_effects(&mut self, modules: &HashMap<ModuleId, ResolvedModule>) {
+    fn mark_side_effects(
+        &mut self,
+        modules: &HashMap<ModuleId, ResolvedModule>,
+        analyses: &HashMap<ModuleId, side_effects::ModuleAnalysis>,
+    ) {
         // Process modules in parallel — each module's side-effect analysis is independent
         let side_effects: Mutex<HashSet<ModuleId>> = Mutex::new(HashSet::new());
 
         modules.par_iter().for_each(|(id, module)| {
-            let source = String::from_utf8_lossy(&module.source);
-
-            // Use AST-based detection (exact) for JS/TS modules, falling back
-            // to the string heuristic for non-JS modules (CSS, JSON, assets).
-            let has_sx = if matches!(
-                module.kind,
-                ModuleKind::JavaScript | ModuleKind::TypeScript | ModuleKind::Jsx | ModuleKind::Tsx
-            ) {
-                let source_type = oxc::span::SourceType::from_path(&module.path)
-                    .unwrap_or(oxc::span::SourceType::mjs());
-                side_effects::has_side_effects_ast(&source, source_type)
+            // JS/TS modules were already parsed by `analyze_all` — reuse the
+            // result; non-JS modules keep the string heuristic.
+            let has_sx = if let Some(a) = analyses.get(id) {
+                a.has_side_effects
             } else {
+                let source = String::from_utf8_lossy(&module.source);
                 module_source_has_side_effects(&source)
             };
 
@@ -311,6 +339,11 @@ impl Optimizer {
                         continue;
                     }
                     visited.insert(id);
+                    // Export-demand shaking may drop reachable modules — they
+                    // are emitted as stubs, not as members of this chunk.
+                    if !reachable.contains(&id) {
+                        continue;
+                    }
                     if id != *entry
                         && !vendor_set.contains(&id)
                         && !shared_set.contains(&id)
@@ -373,10 +406,15 @@ impl Optimizer {
 
             for &id in reachable {
                 if let Some(module) = modules.get(&id) {
-                    let path_str = module.path.to_string_lossy();
-                    if glob_set.is_match(path_str.as_ref())
+                    // Normalize to forward slashes — on Windows the raw path
+                    // uses `\` separators and would never match `/`-style
+                    // patterns like `src/util.ts`.
+                    let path_str = pledgepack_core::normalize_path_str(
+                        &module.path.to_string_lossy(),
+                    );
+                    if glob_set.is_match(path_str.as_str())
                         || patterns.iter().any(|pattern| {
-                            path_str.contains(pattern) || path_str.as_ref() == pattern.as_str()
+                            path_str.contains(pattern) || path_str.as_str() == pattern.as_str()
                         })
                     {
                         chunk_modules.push(id);

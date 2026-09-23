@@ -1,0 +1,14 @@
+Run tests (Vitest-compatible API)
+
+Usage: pledgepack test [OPTIONS]
+
+Options:
+  -p, --pattern <PATTERN>  Test file pattern (glob)
+      --root <ROOT>        Project root directory (default: current directory)
+      --config <CONFIG>    Config file path (default: auto-detect pledge.json)
+  -w, --watch              Watch mode
+      --strict             Treat config-file problems (unknown / misspelled keys) as errors
+      --ui                 UI mode (browser)
+      --visual             Visual regression testing — screenshot comparison (#75)
+      --update-baselines   Update visual baselines instead of comparing
+  -h, --help               Print help

@@ -70,7 +70,7 @@ pub fn run_type_check(root: &Path) -> Result<TypeCheckResult> {
 
     // Run tsc --noEmit --pretty false for parseable output
     let mut cmd = Command::new(&tsc_path);
-    if tsc_path == "npx" {
+    if tsc_path == "npx" || tsc_path == "npx.cmd" {
         cmd.arg("tsc");
     }
     let output = cmd
@@ -210,13 +210,8 @@ pub fn format_type_check_result(result: &TypeCheckResult) -> String {
 
 /// Find the tsc binary in node_modules or PATH
 fn find_tsc(root: &Path) -> Option<String> {
-    // Check node_modules/.bin/tsc
-    let local_tsc = root.join("node_modules").join(".bin").join("tsc");
-    if local_tsc.exists() {
-        return Some(local_tsc.to_string_lossy().to_string());
-    }
-
-    // Check for .cmd variant on Windows
+    // On Windows, `.bin/tsc` is a POSIX shell script that CreateProcess can't
+    // run — prefer the `.cmd` shim (std routes it through cmd.exe).
     #[cfg(target_os = "windows")]
     {
         let local_tsc_cmd = root.join("node_modules").join(".bin").join("tsc.cmd");
@@ -225,14 +220,27 @@ fn find_tsc(root: &Path) -> Option<String> {
         }
     }
 
-    // Try npx
-    let npx_check = Command::new("npx")
+    // Check node_modules/.bin/tsc
+    let local_tsc = root.join("node_modules").join(".bin").join("tsc");
+    if local_tsc.exists() {
+        return Some(local_tsc.to_string_lossy().to_string());
+    }
+
+    // Try npx. On Windows `npx` is a `npx.cmd` batch shim that
+    // `Command::new("npx")` can't resolve — spell the extension out (std
+    // routes .cmd through cmd.exe and escapes args for it).
+    let npx_bin = if cfg!(target_os = "windows") {
+        "npx.cmd"
+    } else {
+        "npx"
+    };
+    let npx_check = Command::new(npx_bin)
         .args(["--no-install", "tsc", "--version"])
         .output();
     if let Ok(out) = npx_check
         && out.status.success()
     {
-        return Some("npx".to_string());
+        return Some(npx_bin.to_string());
     }
 
     None

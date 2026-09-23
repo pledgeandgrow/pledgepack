@@ -5,7 +5,7 @@
 ### PledgePack (Bundler / Build Tool)
 - **Role:** Framework-agnostic bundler, dev server, and build tool (like Turbopack/esbuild/SWC)
 - **Repository:** `https://github.com/pledgeandgrow/pledgepack`
-- **npm package:** `pledgepack` (currently `1.0.0-rc.1`)
+- **npm package:** `pledgepack` (latest published: `0.3.3`; this repo is at `1.0.0-rc.1`, unpublished)
 - **Binary:** Native Rust binary (`pledge.exe` / `pledge`) distributed via GitHub Releases + postinstall download
 - **Language:** Rust (Oxc parser, Lightning CSS, QuickJS JS runtime for plugin host and tests, wasmtime for WASM plugins)
 - **CLI:** `pledgepack dev`, `pledgepack build`, `pledgepack serve`, `pledgepack test`, `pledgepack analyze`, `pledgepack create`, `pledgepack migrate`, `pledgepack doctor`, `pledgepack bench`, `pledgepack cache`, `pledgepack generate-env-types`, `pledgepack completions`, `pledgepack config`
@@ -13,7 +13,7 @@
 ### PledgeStack (React Framework)
 - **Role:** Opinionated React framework with SSR/SSG/RSC, file-based routing, API routes (like Next.js is to Turbopack)
 - **Repository:** `https://github.com/pledgeandgrow/pledgestack` (monorepo)
-- **npm package:** `pledgestack` (published, currently `0.1.12`)
+- **npm package:** `pledgestack` (published, currently `1.0.0-rc.0`; all 34 public packages share one version via a Changesets fixed group)
 - **Language:** TypeScript/JavaScript (depends on pledgepack binary)
 - **CLI:** `pledge dev`, `pledge build`, `pledge start` (`dev`/`build` spawn the compiled `pledgepack` binary directly by resolved path, not via a shell command — see "CLI Command Mapping" below)
 
@@ -31,10 +31,18 @@ User installs pledgestack (framework)
 ```json
 {
   "dependencies": {
-    "pledgepack": "^0.3.2"
+    "pledgepack": "^0.3.3"
   }
 }
 ```
+
+> **Note (2026-09-21):** `^0.3.3` resolves to `>=0.3.3 <0.4.0`, so it does
+> **not** match this repo's `1.0.0-rc.1` — PledgeStack installs the latest
+> 0.3.x, not the RC. As of this date `1.0.0-rc.1` is also **not yet published
+> to npm** (`npm dist-tags`: `latest = 0.3.3`, no `rc` tag), so the range
+> stays at `^0.3.3` on purpose. Bump it (e.g. `^1.0.0-rc.1`, in all four
+> pledgejs `package.json`s plus the `minimumReleaseAgeExclude` pin in
+> `pnpm-workspace.yaml`) only after the RC is actually published.
 
 ---
 
@@ -265,8 +273,8 @@ pledgepack/
 ├── bin/
 │   ├── pledge.js          # CLI shim (resolves native binary)
 │   └── postinstall.js     # Downloads binary from GitHub Releases
-├── pledgepack/
-│   └── index.js           # Programmatic API (runPledgepack, resolveBinary)
+├── index.js               # JS entry — exports `defineConfig` (typed config helper only)
+├── index.d.ts             # Generated config types (`pnpm gen:types`, from `pledgepack schema`)
 ├── package.json           # name: "pledgepack", version: "1.0.0-rc.1"
 ├── README.md
 └── LICENSE
@@ -283,19 +291,19 @@ pledgestack/
 │   │   │   ├── index.ts           # Re-exports all sub-packages
 │   │   │   └── ...
 │   │   ├── scripts/build.mjs      # esbuild bundler (bundles all sub-packages into dist/)
-│   │   ├── package.json           # name: "pledgestack", deps: { pledgepack: "^0.3.2" }
+│   │   ├── package.json           # name: "pledgestack", deps: { pledgepack: "^0.3.3" }
 │   │   └── README.md
-│   ├── shared/                    # Private — bundled into CLI via esbuild aliases
-│   ├── core/                      # Private — bundled into CLI
-│   ├── server/                    # Private — bundled into CLI
-│   ├── client/                    # Private — bundled into CLI
-│   ├── auth/                      # Private — bundled into CLI
-│   ├── state/                     # Private — bundled into CLI
-│   ├── api/                       # Private — bundled into CLI
-│   ├── a11y/                      # Private — bundled into CLI
-│   ├── overlay/                   # Private — bundled into CLI
-│   ├── seo/                       # Private — bundled into CLI
-│   └── ...                        # Other private sub-packages
+│   ├── shared/                    # Public (`pledgestack-shared`) — also bundled into CLI via esbuild
+│   ├── core/                      # Public (`pledgestack-core`) — bundled into CLI
+│   ├── server/                    # Public (`pledgestack-server`) — bundled into CLI
+│   ├── client/                    # Public (`pledgestack-client`) — bundled into CLI
+│   ├── auth/                      # Public (`pledgestack-auth`) — bundled into CLI
+│   ├── state/                     # Public (`pledgestack-state`) — bundled into CLI
+│   ├── api/                       # Public (`pledgestack-api`) — bundled into CLI
+│   ├── a11y/                      # Public (`pledgestack-a11y`) — bundled into CLI
+│   ├── overlay/                   # Public (`pledgestack-overlay`) — bundled into CLI
+│   ├── seo/                       # Public (`pledgestack-seo`) — bundled into CLI
+│   └── ...                        # 34 public packages total (one shared version); only the two VS Code extensions are private
 ```
 
 ---
@@ -454,7 +462,7 @@ Inside each archive: a single binary named `pledge` (Unix) or `pledge.exe` (Wind
 - `crates/core/src/edge.rs` — Edge bundle generation
 - `bin/pledge.js` — JS shim that resolves and spawns native binary
 - `bin/postinstall.js` — Downloads binary from GitHub Releases
-- `package.json` — npm package definition (`pledgepack@1.0.0-rc.1`)
+- `package.json` — npm package definition (repo version `1.0.0-rc.1`; latest published on npm is `0.3.3`)
 
 ### PledgeStack (pledgeandgrow/pledgestack repo)
 - `packages/cli/` — Main framework package (published as `pledgestack` on npm)
@@ -474,7 +482,7 @@ Inside each archive: a single binary named `pledge` (Unix) or `pledge.exe` (Wind
 ## Versioning Strategy
 
 - **PledgePack** and **PledgeStack** version independently
-- PledgeStack `package.json` specifies `pledgepack: "^0.3.2"` (caret range)
+- PledgeStack `package.json` specifies `pledgepack: "^0.3.3"` (caret range) — **this does not match `1.0.0-rc.1`** (`^0.3.3` = `>=0.3.3 <0.4.0`); PledgeStack currently resolves the latest 0.3.x release, which is also the newest version actually published on npm
 - Breaking changes in PledgePack require PledgeStack to update its dependency range
 - PledgeStack can pin PledgePack version for stability: `pledgepack: "1.0.0-rc.1"` (exact)
 
@@ -492,7 +500,7 @@ independently verified compatibility.
 
 | PledgePack | `bundler-pledgepack` | PledgeStack (`pledgestack` CLI) | Manifest schema version | Date | Verified together? |
 |---|---|---|---|---|---|
-| 1.0.0-rc.1 | 0.1.4 | 0.1.12 | 1 (`RouteManifest::SCHEMA_VERSION`) | 2026-09-20 | No — companion versions carried over unchanged, not cross-tested. |
+| 1.0.0-rc.1 | 1.0.0-rc.0 | 1.0.0-rc.0 | 1 (`RouteManifest::SCHEMA_VERSION`) | 2026-09-21 | No — versions recorded from each repo's package.json, not cross-tested. Note pledgejs's declared `^0.3.3` range does not resolve to 1.0.0-rc.1 yet. |
 | 0.3.3 | 0.1.4 | 0.1.12 | 1 (`RouteManifest::SCHEMA_VERSION`, added 2026-09-15) | 2026-09-17 | No — versions recorded, not cross-tested. See goal 87. |
 
 **How compatibility is actually checked at runtime** (goal 81, implemented
@@ -529,7 +537,7 @@ existing analogue, which doesn't cover this specific kind of drift).
 | Failure | Where it's detected | User-facing message | Recovery |
 |---|---|---|---|
 | PledgePack binary not found/not built | `startDevServer`, before spawning | `PledgePack binary not found. Run "cargo build --release" in the pledgepack package.` | Build the binary, or reinstall the `pledgepack` npm package. |
-| `runPledgepack()` binary not found (build/transform path) | `binary-resolver.ts`'s `runPledgepack` | `pledgepack binary not found. The native binary may not have been downloaded. Try running "pnpm rebuild pledgepack" or install the platform-specific package.` | Same as above. |
+| `runPledgepack()` binary not found (build/transform path) | `binary-resolver.ts`'s `runPledgepack` | "pledgepack binary not found. The native binary may not have been downloaded. Try running 'pnpm rebuild pledgepack' or install the platform-specific package." | Same as above. |
 | Dev server port already in use | `checkPortAvailable`, before spawning (goal 80) | `Port {port} on {hostname} is already in use — is another dev server (or a previous PledgePack instance that didn't shut down cleanly) still running on it?` | Stop the other process, or pass a different `bundlerPort`. |
 | Spawn itself fails (binary exists but can't exec — wrong arch, corrupted download, permissions) | `proc.on('error', ...)` during startup (goal 78) | `Failed to launch the PledgePack dev server binary ({path}): {os error}` | Re-download/rebuild the binary; check it's executable and matches the host architecture. |
 | Process exits before ever responding | `proc.on('exit', ...)` during startup (goal 78) | `PledgePack dev server process exited before it started responding (code={code}, signal={signal}). Check its output above for the real cause.` | The binary's own stdout/stderr (inherited to the parent process) has the real error — read it. |
@@ -568,7 +576,7 @@ PRODUCTION-READINESS-100.md (Phase 3-4's verification notes).
 1. Build PledgePack binary:     cargo build --release
 2. Create GitHub Release:       gh release create v1.0.0-rc.1 pledge-x86_64-pc-windows-msvc.zip
 3. Publish PledgePack to npm:   npm publish (from pledgepack repo)
-4. Update PledgeStack dependency:  pledgestack package.json → pledgepack: "^0.3.2"
+4. Update PledgeStack dependency:  pledgestack package.json → pledgepack: "^1.0.0-rc.1" (currently "^0.3.3", which does not match the RC)
 5. Publish PledgeStack to npm:     npm publish (from packages/cli directory)
 ```
 

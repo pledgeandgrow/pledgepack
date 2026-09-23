@@ -5,7 +5,7 @@ use super::env;
 use super::utils;
 use crate::config::{Framework, PledgeConfig, Target, TargetConfig};
 use crate::module::ModuleKind;
-use anyhow::{Result, bail};
+use anyhow::Result;
 use oxc::allocator::Allocator;
 use oxc::codegen::{Codegen, CodegenOptions};
 use oxc::parser::{Parser, ParserReturn};
@@ -112,11 +112,17 @@ pub(super) fn transform_js(
     } = Parser::new(&allocator, source, source_type).parse();
 
     if panicked || !parser_errors.is_empty() {
-        for err in &parser_errors {
-            warn!("Parse error in {}: {:?}", file_path, err);
+        // Rendered as a clean `error: msg` + `--> file:line:col` + code frame;
+        // no `warn!` here - the failure is reported once by the caller.
+        let rendered =
+            crate::diagnostics::from_oxc(file_path, source, &config.root, &parser_errors);
+        if rendered.0.is_empty() {
+            anyhow::bail!(
+                "error: could not parse {}",
+                crate::diagnostics::display_file(file_path, &config.root)
+            );
         }
-        let errors: Vec<String> = parser_errors.iter().map(|e| format!("{:?}", e)).collect();
-        bail!("Parse errors in {}: {}", file_path, errors.join("; "));
+        return Err(rendered.into());
     }
 
     let mut options = TransformOptions::default();
@@ -182,18 +188,25 @@ pub(super) fn transform_js(
     let transformer = Transformer::new(&allocator, path, &options);
     let transform_result = transformer.build_with_scoping(scoping, &mut program);
 
-    if !transform_result.diagnostics.is_empty() {
-        for diag in &transform_result.diagnostics {
-            warn!("Transform diagnostic in {}: {:?}", file_path, diag);
-        }
-        if transform_result.diagnostics.has_errors() {
-            let errors: Vec<String> = transform_result
-                .diagnostics
-                .errors()
-                .map(|e| format!("{:?}", e))
-                .collect();
-            bail!("Transform errors in {}: {}", file_path, errors.join("; "));
-        }
+    if transform_result.diagnostics.has_errors() {
+        let errs: Vec<_> = transform_result.diagnostics.errors().cloned().collect();
+        return Err(crate::diagnostics::from_oxc(file_path, source, &config.root, &errs).into());
+    }
+    for diag in &transform_result.diagnostics {
+        warn!("Transform diagnostic in {}: {}", file_path, diag.message);
+    }
+
+    // Inline `process.env.NODE_ENV` as an AST-level string literal before
+    // minification, so the minifier's own constant folding + dead-code
+    // elimination can strip branches it makes unreachable (see
+    // `env::inline_node_env`'s doc comment for why this has to happen here
+    // rather than as a post-minify text pass).
+    if config.build.env_inline {
+        env::inline_node_env(
+            &mut program,
+            oxc::ast::AstBuilder::new(&allocator),
+            is_production,
+        );
     }
 
     if is_production {
@@ -225,7 +238,7 @@ pub(super) fn transform_js(
     let mut code = env::replace_env_vars(&codegen_result.code, config);
 
     if config.build.env_inline {
-        code = env::inline_process_env(&code, is_production);
+        code = env::inline_process_env(&code, is_production, &config.env_prefix);
     }
 
     code = env::expand_import_meta_glob(&code, file_path, config);

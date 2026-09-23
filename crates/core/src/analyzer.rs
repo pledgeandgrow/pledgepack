@@ -168,6 +168,8 @@ pub fn format_module_sizes(m: &ModuleAnalysis) -> String {
 pub fn analyze_build(engine: &BuildEngine) -> Result<BundleAnalysis> {
     let modules = engine.modules();
     let function_cache = engine.function_cache();
+    let entry_ids: HashSet<crate::module::ModuleId> = engine.entry_ids().into_iter().collect();
+    let module_graph = engine.module_graph();
 
     let mut module_analyses: Vec<ModuleAnalysis> = Vec::new();
     let mut total_original = 0usize;
@@ -208,7 +210,22 @@ pub fn analyze_build(engine: &BuildEngine) -> Result<BundleAnalysis> {
             _ => "unknown",
         };
 
-        let deps = cached.as_ref().map(|c| c.deps.clone()).unwrap_or_default();
+        // Resolved dependency paths (not raw specifiers) — `why`, the
+        // dependency-graph HTML and circular-dep detection all key on
+        // `ModuleAnalysis::path`, which is a normalized filesystem path.
+        // `cached.deps` holds raw specifiers (`./util`) that never match.
+        let deps = module_graph
+            .modules
+            .get(id)
+            .map(|n| {
+                n.dependencies
+                    .iter()
+                    .chain(n.dynamic_dependencies.iter())
+                    .filter_map(|d| module_graph.modules.get(d))
+                    .map(|d| crate::normalize_path(&d.path))
+                    .collect()
+            })
+            .unwrap_or_default();
 
         let is_css = cached.as_ref().map(|c| c.is_css).unwrap_or(false);
         let is_worker = cached.as_ref().map(|c| c.is_worker).unwrap_or(false);
@@ -229,7 +246,7 @@ pub fn analyze_build(engine: &BuildEngine) -> Result<BundleAnalysis> {
             transformed_size,
             gzip_size,
             dependencies: deps,
-            is_entry: engine.modules().values().take(1).any(|m| m.id == *id),
+            is_entry: entry_ids.contains(id),
             is_css,
             is_worker,
         });
@@ -945,7 +962,9 @@ mod tests {
             },
             ..Default::default()
         };
-        let (_e1, dev) = build_and_analyze(&mk(BuildMode::Development)).await.unwrap();
+        let (_e1, dev) = build_and_analyze(&mk(BuildMode::Development))
+            .await
+            .unwrap();
         let (_e2, prod) = build_and_analyze(&mk(BuildMode::Production)).await.unwrap();
         assert_eq!(dev.total_transformed_size, prod.total_transformed_size);
         assert_eq!(dev.total_gzip_size, prod.total_gzip_size);

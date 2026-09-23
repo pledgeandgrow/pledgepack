@@ -1,0 +1,240 @@
+<script>
+        // HMR runtime registries for framework component hot replacement
+        window.__pledge_vue_components = window.__pledge_vue_components || {};
+        window.__pledge_svelte_components = window.__pledge_svelte_components || {};
+        window.__pledge_solid_hmr = window.__pledge_solid_hmr || [];
+        window.__pledge_fast_refresh = window.__pledge_fast_refresh || function(name, reload) {
+          (window.__pledge_fast_refresh_registry = window.__pledge_fast_refresh_registry || {})[name] = reload;
+        };
+        // HMR module registry: path -> module hot data
+        window.__pledge_hmr_modules = window.__pledge_hmr_modules || {};
+
+        // WebSocket with exponential backoff reconnection
+        let __pledge_ws;
+        let __pledge_ws_reconnect_delay = 1000;
+        let __pledge_ws_max_delay = 30000;
+        let __pledge_ws_current_delay = __pledge_ws_reconnect_delay;
+        let __pledge_ws_closed_by_user = false;
+
+        function __pledge_connect_ws() {
+            const ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/__pledge_hmr');
+            window.__pledge_ws = ws;
+
+            ws.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+                if (data.type === 'update') {
+                    console.log('[pledge] HMR update:', data.path, data.deps && data.deps.length ? '(cascading to: ' + data.deps.join(', ') + ')' : '');
+                    clearPledgeError();
+                    // Reset reconnection delay on successful message
+                    __pledge_ws_current_delay = __pledge_ws_reconnect_delay;
+                    if (data.path) {
+                        // CSS Modules HMR: re-import to get updated class name mappings
+                        if (data.path.endsWith('.module.css') && data.moduleMap) {
+                            import(data.path + '?t=' + Date.now()).then(() => {
+                                console.log('[pledge] CSS Module HMR:', data.path);
+                                window.dispatchEvent(new CustomEvent('pledge:hmr-success'));
+                            }).catch((err) => {
+                                console.error('[pledge] CSS Module HMR failed:', err);
+                                location.reload();
+                            });
+                        } else if (data.path.endsWith('.css') || data.css) {
+                            // CSS HMR: inject <style> tag without page reload
+                            if (data.css) {
+                                updatePledgeCSS(data.path, data.css);
+                            } else {
+                                fetchPledgeCSS(data.path);
+                            }
+                        } else {
+                            // Framework HMR: .vue and .svelte use dynamic import for component replacement
+                            if (data.path.endsWith('.vue') || data.path.endsWith('.svelte')) {
+                                import(data.path + '?t=' + Date.now()).then((newModule) => {
+                                    console.log('[pledge] Framework HMR:', data.path);
+                                    window.dispatchEvent(new CustomEvent('pledge:hmr-success'));
+                                }).catch((err) => {
+                                    console.error('[pledge] Framework HMR failed:', err);
+                                    location.reload();
+                                });
+                            } else {
+                                // JS HMR: check for accept callbacks (true HMR) before falling back to script tag reload
+                                if (window.__pledge_hot_accept_callbacks && window.__pledge_hot_accept_callbacks[data.path] && window.__pledge_hot_accept_callbacks[data.path].length > 0) {
+                                    // Capture old callbacks before re-import (new module will overwrite the registry)
+                                    const oldCallbacks = window.__pledge_hot_accept_callbacks[data.path].slice();
+                                    import(data.path + '?t=' + Date.now()).then((newModule) => {
+                                        console.log('[pledge] HMR accept:', data.path);
+                                        oldCallbacks.forEach(cb => {
+                                            try { cb(newModule); } catch(e) { console.error('[pledge] HMR accept error:', e); }
+                                        });
+                                        window.dispatchEvent(new CustomEvent('pledge:hmr-success'));
+                                    }).catch((err) => {
+                                        console.error('[pledge] HMR accept failed, reloading:', err);
+                                        location.reload();
+                                    });
+                                } else {
+                                    // No accept callback — reload the changed script tag
+                                    const links = document.querySelectorAll('script[src="' + data.path + '"]');
+                                    links.forEach(link => {
+                                        const newLink = document.createElement('script');
+                                        newLink.type = 'module';
+                                        newLink.src = data.path + '?t=' + Date.now();
+                                        link.replaceWith(newLink);
+                                    });
+                                }
+                            }
+                        }
+                        // Handle cascading updates for dependent modules
+                        if (data.deps && data.deps.length > 0) {
+                            data.deps.forEach((depPath) => {
+                                console.log('[pledge] HMR cascade:', depPath);
+                                if (depPath.endsWith('.css')) {
+                                    fetchPledgeCSS(depPath);
+                                } else {
+                                    const depLinks = document.querySelectorAll('script[src="' + depPath + '"]');
+                                    depLinks.forEach(link => {
+                                        const newLink = document.createElement('script');
+                                        newLink.type = 'module';
+                                        newLink.src = depPath + '?t=' + Date.now();
+                                        link.replaceWith(newLink);
+                                    });
+                                }
+                            });
+                        }
+                    }
+                } else if (data.type === 'error') {
+                    showPledgeError(data.message, data.file, data.stack, data.line, data.column);
+                } else if (data.type === 'connected') {
+                    console.log('[pledge] HMR connected');
+                } else if (data.type === 'server-reload') {
+                    console.log('[pledge] Server reloading:', data.message);
+                    showPledgeServerReload(data.message);
+                } else if (data.type === 'server-reload-complete') {
+                    console.log('[pledge] Server reloaded:', data.message);
+                    clearPledgeServerReload();
+                }
+            };
+            ws.onopen = () => {
+                console.log('[pledge] HMR connected');
+                __pledge_ws_current_delay = __pledge_ws_reconnect_delay;
+            };
+            ws.onclose = () => {
+                if (__pledge_ws_closed_by_user) return;
+                console.warn('[pledge] HMR disconnected — reconnecting in ' + __pledge_ws_current_delay + 'ms');
+                setTimeout(() => {
+                    __pledge_ws_current_delay = Math.min(__pledge_ws_current_delay * 2, __pledge_ws_max_delay);
+                    __pledge_connect_ws();
+                }, __pledge_ws_current_delay);
+            };
+            ws.onerror = () => {
+                // onclose will handle reconnection
+            };
+        }
+
+        __pledge_connect_ws();
+
+        // CSS HMR: update or inject <style> tag
+        function updatePledgeCSS(path, cssContent) {
+            let styleId = '__pledge_style_' + path.replace(/[^a-zA-Z0-9]/g, '_');
+            let existing = document.getElementById(styleId);
+            if (!existing) {
+                existing = document.createElement('style');
+                existing.id = styleId;
+                document.head.appendChild(existing);
+            }
+            existing.textContent = cssContent;
+            console.log('[pledge] CSS HMR:', path);
+        }
+
+        // CSS HMR: fetch updated CSS and inject
+        async function fetchPledgeCSS(path) {
+            try {
+                const res = await fetch(path + '?t=' + Date.now());
+                const css = await res.text();
+                updatePledgeCSS(path, css);
+            } catch(e) {
+                console.error('[pledge] CSS HMR fetch failed:', e);
+            }
+        }
+
+        // Pledge Error Overlay — beautiful, interactive error display with stack traces
+        function showPledgeError(message, file, stack, line, column) {
+            let overlay = document.getElementById('__pledge_error_overlay');
+            if (!overlay) {
+                overlay = document.createElement('div');
+                overlay.id = '__pledge_error_overlay';
+                overlay.style.cssText = 'position:fixed;inset:0;z-index:99999;background:rgba(0,0,0,0.92);font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;padding:2rem;overflow:auto;display:flex;flex-direction:column;';
+                document.body.appendChild(overlay);
+            }
+            let fileHtml = file ? '<div style="color:#888;margin-bottom:1rem;font-size:0.9rem;">' + file + (line ? ':' + line + (column ? ':' + column : '') : '') + '</div>' : '';
+            // Try to extract source context from error message
+            let sourceContext = '';
+            let lines = message.split('\n');
+            if (lines.length > 1) {
+                sourceContext = lines.map((line, i) => {
+                    let lineClass = line.includes('error') || line.includes('Error') ? 'color:#ff4444;' : 'color:#e0e0e0;';
+                    return '<div style="' + lineClass + 'white-space:pre;padding-left:2rem;">' + line.replace(/</g, '&lt;').replace(/>/g, '&gt;') + '</div>';
+                }).join('');
+            } else {
+                sourceContext = '<pre style="color:#fff;white-space:pre-wrap;font-size:0.9rem;">' + message.replace(/</g, '&lt;').replace(/>/g, '&gt;') + '</pre>';
+            }
+            // Stack trace section
+            let stackHtml = '';
+            if (stack) {
+                let stackLines = stack.split('\n').map(s => {
+                    return '<div style="color:#aaa;white-space:pre;padding-left:2rem;font-size:0.85rem;">' + s.replace(/</g, '&lt;').replace(/>/g, '&gt;') + '</div>';
+                }).join('');
+                stackHtml = '<div style="color:#888;font-size:0.8rem;margin-top:1rem;margin-bottom:0.5rem;">Stack Trace:</div>' +
+                    '<div style="background:#111;border:1px solid #222;border-radius:8px;padding:1rem;margin-bottom:1rem;overflow:auto;">' + stackLines + '</div>';
+            }
+            overlay.innerHTML =
+                '<div style="max-width:900px;margin:0 auto;flex:1;">' +
+                '<div style="display:flex;align-items:center;gap:0.5rem;margin-bottom:1rem;">' +
+                '<span style="color:#ff4444;font-size:1.5rem;">&#9888;</span>' +
+                '<span style="color:#ff4444;font-size:1.3rem;font-weight:600;">Pledge Build Error</span>' +
+                '</div>' +
+                fileHtml +
+                '<div style="background:#1a1a1a;border:1px solid #333;border-radius:8px;padding:1rem;margin-bottom:1rem;overflow:auto;">' + sourceContext + '</div>' +
+                stackHtml +
+                '<div style="color:#666;font-size:0.8rem;">Fix the error and save to reload. The overlay will disappear automatically.</div>' +
+                '<button onclick="clearPledgeError()" style="margin-top:1rem;padding:0.5rem 1rem;background:#333;color:#fff;border:1px solid #555;border-radius:4px;cursor:pointer;font-family:inherit;">Close</button>' +
+                '</div>';
+        }
+        function clearPledgeError() {
+            let overlay = document.getElementById('__pledge_error_overlay');
+            if (overlay) overlay.remove();
+        }
+        function showPledgeServerReload(message) {
+            let banner = document.getElementById('__pledge_server_reload');
+            if (!banner) {
+                banner = document.createElement('div');
+                banner.id = '__pledge_server_reload';
+                banner.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:99998;background:#1a1a2e;color:#7c3aed;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;padding:0.75rem;text-align:center;font-size:0.9rem;border-bottom:1px solid #7c3aed;';
+                document.body.appendChild(banner);
+            }
+            banner.textContent = '⟳ ' + (message || 'Server reloading...');
+        }
+        function clearPledgeServerReload() {
+            let banner = document.getElementById('__pledge_server_reload');
+            if (banner) banner.remove();
+        }
+        // Listen for successful HMR updates to clear errors
+        window.addEventListener('pledge:hmr-success', clearPledgeError);
+
+        // Runtime error overlay — catch unhandled browser errors and display in overlay
+        window.addEventListener('error', function(event) {
+            if (event.error || event.message) {
+                var msg = event.error && event.error.message ? event.error.message : (event.message || 'Unknown runtime error');
+                var file = event.filename || '';
+                var line = event.lineno || 0;
+                var col = event.colno || 0;
+                var stack = event.error && event.error.stack ? event.error.stack : '';
+                showPledgeError(msg, file, stack, line, col);
+            }
+        });
+
+        // Catch unhandled promise rejections and display in overlay
+        window.addEventListener('unhandledrejection', function(event) {
+            var reason = event.reason;
+            var msg = reason && reason.message ? reason.message : String(reason);
+            var stack = reason && reason.stack ? reason.stack : '';
+            showPledgeError('Unhandled Promise Rejection: ' + msg, '', stack, 0, 0);
+        });
+    </script>

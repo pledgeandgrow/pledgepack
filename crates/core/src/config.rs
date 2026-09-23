@@ -19,6 +19,125 @@ pub fn compile_test_globset(patterns: &[String]) -> globset::GlobSet {
     builder.build().unwrap_or_default()
 }
 
+/// Find test files under `root` (the whole project, not just `src/`): every
+/// file whose root-relative, forward-slash path matches one of `include` and
+/// none of `exclude`. `node_modules`, `target`, hidden directories and any
+/// directory listed in `skip_dirs` (e.g. the build output) are not entered.
+/// Only `.js/.jsx/.ts/.tsx/.mjs/.mts` files are returned, sorted.
+pub fn discover_test_files(
+    root: &Path,
+    include: &[String],
+    exclude: &[String],
+    skip_dirs: &[PathBuf],
+) -> Vec<PathBuf> {
+    let include = compile_test_globset(include);
+    let exclude = compile_test_globset(exclude);
+    let mut files = Vec::new();
+
+    fn walk(
+        dir: &Path,
+        root: &Path,
+        include: &globset::GlobSet,
+        exclude: &globset::GlobSet,
+        skip_dirs: &[PathBuf],
+        files: &mut Vec<PathBuf>,
+    ) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                if name == "node_modules"
+                    || name == "target"
+                    || name.starts_with('.')
+                    || skip_dirs.iter().any(|d| d == &path)
+                {
+                    continue;
+                }
+                walk(&path, root, include, exclude, skip_dirs, files);
+            } else if file_type.is_file() {
+                let is_source = matches!(
+                    path.extension().and_then(|e| e.to_str()),
+                    Some("js" | "jsx" | "ts" | "tsx" | "mjs" | "mts")
+                );
+                if !is_source {
+                    continue;
+                }
+                let rel = crate::normalize_path(path.strip_prefix(root).unwrap_or(&path));
+                if include.is_match(&rel) && !exclude.is_match(&rel) {
+                    files.push(path);
+                }
+            }
+        }
+    }
+
+    walk(root, root, &include, &exclude, skip_dirs, &mut files);
+    files.sort();
+    files
+}
+
+#[cfg(test)]
+mod discover_tests {
+    use super::*;
+
+    #[test]
+    fn finds_tests_outside_src_and_honours_excludes() {
+        let dir = tempfile::tempdir().unwrap();
+        for f in [
+            "src/x.test.ts",
+            "tests/y.test.ts",
+            "tests/deep/z.spec.tsx",
+            "a.test.js",
+            "src/not_a_test.ts",
+            "node_modules/pkg/q.test.js",
+            "build/out.test.js",
+            ".hidden/h.test.js",
+        ] {
+            let p = dir.path().join(f);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, "").unwrap();
+        }
+        let found = discover_test_files(
+            dir.path(),
+            &default_test_patterns(),
+            &default_test_exclude(),
+            &[dir.path().join("build")],
+        );
+        let rel: Vec<String> = found
+            .iter()
+            .map(|p| crate::normalize_path(p.strip_prefix(dir.path()).unwrap()))
+            .collect();
+        assert_eq!(
+            rel,
+            vec![
+                "a.test.js",
+                "src/x.test.ts",
+                "tests/deep/z.spec.tsx",
+                "tests/y.test.ts"
+            ]
+        );
+    }
+
+    #[test]
+    fn root_relative_patterns_can_target_a_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        for f in ["tests/a.test.ts", "src/b.test.ts"] {
+            let p = dir.path().join(f);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, "").unwrap();
+        }
+        let found = discover_test_files(dir.path(), &["tests/**/*.test.ts".to_string()], &[], &[]);
+        assert_eq!(found.len(), 1);
+        assert!(found[0].ends_with("a.test.ts"));
+    }
+}
+
 /// Top-level configuration for the Pledge bundler.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", default)]
@@ -269,6 +388,12 @@ pub struct PledgeConfig {
     /// Default: "/" (root deployment)
     #[serde(default = "default_base")]
     pub base: String,
+
+    /// Treat problems in the config file itself (unknown / misspelled keys,
+    /// no entry point) as errors instead of warnings. Also enabled by the
+    /// global `--strict` CLI flag. Default: false.
+    #[serde(default)]
+    pub strict: bool,
 }
 
 /// Test configuration (Vitest-compatible)
@@ -1188,6 +1313,7 @@ impl Default for PledgeConfig {
             workspaces: None,
             security: None,
             base: default_base(),
+            strict: false,
         }
     }
 }
@@ -1312,37 +1438,72 @@ impl PledgeConfig {
     /// Load config from pledge.config.ts, pledge.config.js, pledge.config.json, pledge.json, or defaults
     /// Supports TypeScript config files by extracting the JSON-like config object.
     pub fn load(root: &Path) -> anyhow::Result<Self> {
-        // Check for TS/JS config files first (higher priority)
-        let ts_candidates = [
-            root.join("pledge.config.ts"),
-            root.join("pledge.config.js"),
-            root.join("pledge.config.mjs"),
-        ];
+        Ok(Self::load_checked(root)?.0)
+    }
 
-        for path in &ts_candidates {
-            if path.exists() {
-                let content = std::fs::read_to_string(path)?;
-                let config = Self::parse_ts_config(&content)?;
-                return Ok(config);
-            }
+    /// The config file [`load`](Self::load) would read for `root`, if any.
+    pub fn find_config_file(root: &Path) -> Option<PathBuf> {
+        [
+            "pledge.config.ts",
+            "pledge.config.js",
+            "pledge.config.mjs",
+            "pledge.json",
+            "pledge.config.json",
+            ".pledge.json",
+        ]
+        .iter()
+        .map(|f| root.join(f))
+        .find(|p| p.exists())
+    }
+
+    /// [`load`](Self::load) plus config-file diagnostics: unknown / misspelled
+    /// keys (with did-you-mean suggestions computed against the generated JSON
+    /// schema). The returned issues are advisory; callers decide whether they
+    /// are warnings or (under `strict`) errors.
+    pub fn load_checked(
+        root: &Path,
+    ) -> anyhow::Result<(Self, Vec<crate::config_validate::ValidationError>)> {
+        match Self::find_config_file(root) {
+            Some(path) => Self::load_file_checked(&path),
+            None => Ok((Self::default(), Vec::new())),
         }
+    }
 
-        // Fall back to JSON config files
-        let json_candidates = [
-            root.join("pledge.json"),
-            root.join("pledge.config.json"),
-            root.join(".pledge.json"),
-        ];
+    /// Load one explicit config file (`.ts`/`.js`/`.mjs`/`.cjs` or JSON) and
+    /// report unknown keys.
+    pub fn load_file_checked(
+        path: &Path,
+    ) -> anyhow::Result<(Self, Vec<crate::config_validate::ValidationError>)> {
+        let content = std::fs::read_to_string(path)?;
+        let is_json = path.extension().is_some_and(|e| e == "json")
+            || path
+                .file_name()
+                .is_some_and(|n| n.to_string_lossy().ends_with(".pledge.json"));
+        let config = if is_json {
+            serde_json::from_str::<PledgeConfig>(&content)
+                .map_err(|e| anyhow::anyhow!("Failed to parse {}: {}", path.display(), e))?
+        } else {
+            Self::parse_ts_config(&content)?
+        };
+        let raw = Self::raw_config_value(&content, path);
+        let issues = raw
+            .map(|v| crate::config_validate::find_unknown_fields(&v))
+            .unwrap_or_default();
+        Ok((config, issues))
+    }
 
-        for path in &json_candidates {
-            if path.exists() {
-                let content = std::fs::read_to_string(path)?;
-                let config: PledgeConfig = serde_json::from_str(&content)?;
-                return Ok(config);
-            }
+    /// The config file's top-level object as a raw JSON value (nothing dropped
+    /// by deserialization), or `None` when it cannot be read statically.
+    pub fn raw_config_value(content: &str, path: &Path) -> Option<serde_json::Value> {
+        let is_json = path.extension().is_some_and(|e| e == "json");
+        if is_json {
+            return json5::from_str(content).ok();
         }
-
-        Ok(Self::default())
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "pledge.config.ts".to_string());
+        crate::js_config::eval_config_module(content, &name).ok()
     }
 
     /// Parse a TypeScript/JS config file by extracting the config object.
@@ -1621,6 +1782,12 @@ pub struct SecurityConfig {
     /// #82 — auto-generate CSP headers from build output, writes _headers file
     #[serde(default = "default_csp_mode")]
     pub csp: String,
+    /// Scan emitted client bundles for embedded secrets (private keys,
+    /// provider tokens, non-public `.env` values, high-entropy literals).
+    /// Default: on — recognized credentials fail the build, entropy-only
+    /// findings warn. Set `secretScan: false` to disable.
+    #[serde(default = "default_secret_scan")]
+    pub secret_scan: bool,
 }
 
 impl Default for SecurityConfig {
@@ -1628,8 +1795,13 @@ impl Default for SecurityConfig {
         Self {
             sri: false,
             csp: default_csp_mode(),
+            secret_scan: true,
         }
     }
+}
+
+fn default_secret_scan() -> bool {
+    true
 }
 
 fn default_csp_mode() -> String {

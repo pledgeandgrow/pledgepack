@@ -1,0 +1,10 @@
+Serve the build telemetry dashboard (#101)
+
+Usage: pledgepack dashboard [OPTIONS]
+
+Options:
+  -p, --port <PORT>      Port to serve the dashboard on
+      --root <ROOT>      Project root directory (default: current directory)
+      --config <CONFIG>  Config file path (default: auto-detect pledge.json)
+      --strict           Treat config-file problems (unknown / misspelled keys) as errors
+  -h, --help             Print help

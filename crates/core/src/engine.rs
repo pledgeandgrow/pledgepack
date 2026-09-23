@@ -8,7 +8,7 @@ use crate::config::PledgeConfig;
 use crate::module::{ModuleId, ModuleKind, ResolvedModule};
 use crate::module_graph::SerializableModuleGraph;
 use crate::plugin_hooks::{HookRunner, PluginHooks};
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use dashmap::DashMap;
 use pledgepack_native_sys::Graph;
 use rayon::prelude::*;
@@ -18,20 +18,6 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tracing::{debug, info, warn};
-
-/// Read a file as a string, using memory-mapped I/O for large files (>64KB).
-/// Falls back to standard `std::fs::read_to_string` for smaller files where
-/// mmap setup overhead outweighs the zero-copy benefit.
-fn read_file_mmap(path: &std::path::Path) -> Result<String> {
-    let file = std::fs::File::open(path)?;
-    let metadata = file.metadata()?;
-    if metadata.len() > 65536 {
-        let mmap = unsafe { memmap2::Mmap::map(&file)? };
-        Ok(String::from_utf8_lossy(mmap.as_ref()).into_owned())
-    } else {
-        Ok(std::fs::read_to_string(path)?)
-    }
-}
 
 /// Remove `<script ... src="{entry}">...</script>` tags from an HTML
 /// template for each of `entries` (matched with or without a leading `/`,
@@ -185,6 +171,21 @@ pub struct EmitChunk {
     pub modules: Vec<ModuleId>,
     /// Whether this is an entry chunk (vs. vendor/shared/async)
     pub is_entry: bool,
+    /// Whether this chunk is only loaded on demand via `import()` — its
+    /// modules are registered through `__pp_manifest.js` + `__pp.dyn` rather
+    /// than a static `<script>` tag.
+    pub is_async: bool,
+    /// Modules eliminated by tree shaking — emitted as empty `__pp.def`
+    /// stubs so `__pp.req` still resolves at their (unused) import sites.
+    pub stubbed: Vec<ModuleId>,
+}
+
+/// The rendered body of one chunk: lowered JS content, extracted CSS, and
+/// `(line, module source map)` section offsets for the merged chunk map.
+struct RenderedChunk {
+    content: String,
+    css: String,
+    map_sections: Vec<(usize, String)>,
 }
 
 pub struct BuildEngine {
@@ -233,6 +234,14 @@ pub struct BuildEngine {
     /// `None` when `PLEDGE_LEGACY_ENGINE` is set — the legacy
     /// function_cache/persistent/remote path is used instead.
     task_engine: Option<Arc<crate::task_transform::TaskTransformEngine>>,
+    /// Modules referenced by `new Worker(new URL("./x"))` /
+    /// `new SharedWorker(new URL("./x"))` — emitted as standalone bundles at
+    /// their URL path in addition to their normal chunk registration.
+    worker_modules: HashSet<ModuleId>,
+    /// The single module-resolution implementation (`pledgepack-resolver`):
+    /// aliases, `#imports`, relative/absolute paths, node_modules incl. pnpm,
+    /// `exports` conditions, and workspace packages.
+    resolver: pledgepack_resolver::Resolver,
 }
 
 #[derive(Debug, Clone)]
@@ -265,6 +274,84 @@ fn build_transform_pool(parallelism: usize) -> Result<rayon::ThreadPool> {
         }
     }
     bail!("failed to create a rayon thread pool for module transforms")
+}
+
+/// Build the [`pledgepack_resolver::Resolver`] a [`PledgeConfig`] describes:
+/// tsconfig-style + `resolve.alias` aliases (relative targets joined onto the
+/// project root), export conditions (`config.conditions` plus the
+/// bundler-standard `module`), and workspace packages when workspace support
+/// is enabled and a workspace is detected above `config.root`.
+pub fn module_resolver(config: &PledgeConfig) -> pledgepack_resolver::Resolver {
+    let aliases = config
+        .alias
+        .iter()
+        .chain(config.resolve_alias.iter())
+        .map(|a| {
+            let to_path = PathBuf::from(&a.to);
+            let to = if to_path.is_relative() {
+                config.root.join(to_path)
+            } else {
+                to_path
+            };
+            pledgepack_resolver::Alias {
+                from: a.from.clone(),
+                to: to.to_string_lossy().to_string(),
+            }
+        })
+        .collect();
+
+    let mut conditions = config.conditions.clone();
+    if !conditions.iter().any(|c| c == "module") {
+        conditions.push("module".to_string());
+    }
+
+    let mut resolver = pledgepack_resolver::Resolver::with_conditions(
+        config.root.clone(),
+        config.extensions.clone(),
+        aliases,
+        conditions,
+    );
+
+    // Drive export-condition and `browser`-field handling from the build
+    // target (primary target when several are configured).
+    let primary_target = match &config.target {
+        crate::config::TargetConfig::Single(t) => *t,
+        crate::config::TargetConfig::Multiple(ts) => ts
+            .first()
+            .copied()
+            .unwrap_or(crate::config::Target::Browser),
+    };
+    resolver.set_context(pledgepack_resolver::ResolveContext {
+        runtime: match primary_target {
+            crate::config::Target::Browser => pledgepack_resolver::ResolveRuntime::Browser,
+            crate::config::Target::Node => pledgepack_resolver::ResolveRuntime::Node,
+            crate::config::Target::Worker | crate::config::Target::Edge => {
+                pledgepack_resolver::ResolveRuntime::Worker
+            }
+        },
+        module_type: pledgepack_resolver::ResolveModuleType::default(),
+    });
+
+    let workspaces_enabled = config.workspaces.as_ref().is_none_or(|w| w.enabled);
+    if workspaces_enabled {
+        let ws_root = config
+            .workspaces
+            .as_ref()
+            .and_then(|w| w.root.as_deref())
+            .map(|r| {
+                if r.is_absolute() {
+                    r.to_path_buf()
+                } else {
+                    config.root.join(r)
+                }
+            })
+            .unwrap_or_else(|| config.root.clone());
+        if let Some(ws) = crate::ecosystem::detect_workspace(&ws_root) {
+            resolver.set_workspace(crate::ecosystem::resolver_packages(&ws));
+        }
+    }
+
+    resolver
 }
 
 impl BuildEngine {
@@ -345,6 +432,8 @@ impl BuildEngine {
         // native code (which uses stack protection) runs.
         pledgepack_native_sys::init_stack_canary();
 
+        let resolver = module_resolver(&config);
+
         Self {
             config,
             graph: Mutex::new(Graph::new()),
@@ -361,8 +450,10 @@ impl BuildEngine {
             is_incremental,
             auto_entries: Vec::new(),
             entry_module_ids: Vec::new(),
+            worker_modules: HashSet::new(),
             i18n_catalog: crate::i18n::TranslationCatalog::default(),
             task_engine,
+            resolver,
         }
     }
 
@@ -400,6 +491,33 @@ impl BuildEngine {
         let runner = hooks.map(HookRunner::new);
         let runner = runner.as_ref();
         let start = std::time::Instant::now();
+
+        // envPrefix floor: `""` and `"*"` match EVERY environment variable —
+        // `.env` secrets, CI tokens, OS vars — and `starts_with("")` is always
+        // true, so they'd inject the entire environment into the client
+        // bundle. Refuse the build; a very short prefix or an empty list is
+        // suspicious but not catastrophic, so those warn.
+        for p in &self.config.env_prefix {
+            if p.is_empty() || p == "*" {
+                bail!(
+                    "envPrefix contains \"{p}\" — it would expose ALL environment variables \
+                     (including secrets) to the client bundle. Use a real prefix like \"PLEDGE_\" \
+                     or \"PUBLIC_\"."
+                );
+            }
+            if p.len() < 3 {
+                tracing::warn!(
+                    "envPrefix \"{p}\" is very short — it may match unintended variables \
+                     (e.g. every var starting with '{p}'). Prefer a longer, namespaced prefix."
+                );
+            }
+        }
+        if self.config.env_prefix.is_empty() {
+            tracing::warn!(
+                "envPrefix is empty — no import.meta.env.* variables will be injected. \
+                 If that's intentional, ignore this; otherwise set envPrefix e.g. [\"PLEDGE_\"]."
+            );
+        }
 
         // Phase 0: Auto-discover entry points from appDir if no explicit entry configured
         let mut auto_entries: Vec<String> = Vec::new();
@@ -601,6 +719,9 @@ document.addEventListener("click", function(e) {
         // (specifier, importer) → resolution, so plugin `resolveId` hooks
         // run once per distinct import rather than once per pass.
         let mut resolve_memo: HashMap<(String, PathBuf), Resolution> = HashMap::new();
+        // Resolved file paths referenced by `new Worker(new URL(...))` —
+        // tracked separately so emit can give them standalone bundles.
+        let mut worker_paths: HashSet<PathBuf> = HashSet::new();
 
         while !frontier.is_empty() {
             // Phase A: process this level's modules (sources already in
@@ -714,6 +835,18 @@ document.addEventListener("click", function(e) {
                         dep_specs.push((dep, module.path.clone()));
                     }
                 }
+                // CJS `require("x")` calls inside deps (e.g. node_modules
+                // index files) are dependencies the SIMD scan can't see.
+                for dep in crate::task_transform::scan_require_specifiers(&source_str) {
+                    dep_specs.push((dep, module.path.clone()));
+                }
+                // `new Worker(new URL("./x"))` is a dependency the specifier
+                // scans can't see either (it's a constructor call, not an
+                // import). The `?worker` marker survives resolution (the
+                // resolver strips it) and identifies the edge downstream.
+                for dep in crate::task_transform::scan_worker_specifiers(&source_str) {
+                    dep_specs.push((format!("{dep}?worker"), module.path.clone()));
+                }
                 pending_transforms.push((module_id, module));
             }
 
@@ -724,10 +857,39 @@ document.addEventListener("click", function(e) {
             let mut seen_this_level: HashSet<PathBuf> = HashSet::new();
             let mut next_ids: Vec<ModuleId> = Vec::new();
             for (spec, importer) in dep_specs {
-                let path = match self.resolve_memo(&mut resolve_memo, &spec, &importer, runner)? {
-                    Resolution::External => continue,
-                    Resolution::File(p) => p,
+                let is_worker_spec = spec.ends_with("?worker") || spec.ends_with("?sharedworker");
+                let path = match self.resolve_memo(&mut resolve_memo, &spec, &importer, runner) {
+                    Ok(Resolution::External) => continue,
+                    Ok(Resolution::File(p)) => p,
+                    Err(e) => {
+                        // The raw dep scans can match `import("x")`/`require("x")`
+                        // inside string literals or comments (e.g. React's
+                        // lazy() error text contains `import('./MyComponent')`).
+                        // A specifier that fails to resolve *and* only ever
+                        // appears inside strings/comments is a false positive —
+                        // skip it. Real missing imports still fail the build.
+                        let rescued = self
+                            .path_to_id
+                            .get(&importer)
+                            .and_then(|id| self.modules.get(id))
+                            .is_some_and(|m| {
+                                let text = String::from_utf8_lossy(&m.source);
+                                crate::bundle::specifier_only_in_strings(&text, &spec)
+                            });
+                        if rescued {
+                            debug!(
+                                "skipping unresolved specifier '{}' inside string/comment in {}",
+                                spec,
+                                crate::display_path(&importer)
+                            );
+                            continue;
+                        }
+                        return Err(e);
+                    }
                 };
+                if is_worker_spec {
+                    worker_paths.insert(path.clone());
+                }
                 if let Some(&id) = self.path_to_id.get(&path) {
                     if !processed.contains(&id) {
                         next_ids.push(id);
@@ -756,7 +918,8 @@ document.addEventListener("click", function(e) {
                     to_read.iter().map(|p| p.to_str().unwrap_or("")).collect();
                 let read = pledgepack_native_sys::read_files_batch(&path_strs);
                 for (path, src) in to_read.iter().zip(read) {
-                    let source = src.map_err(|e| anyhow::anyhow!("{}: {}", crate::display_path(&path), e))?;
+                    let source =
+                        src.map_err(|e| anyhow::anyhow!("{}: {}", crate::display_path(path), e))?;
                     loaded.insert(path.clone(), source);
                 }
                 for path in new_paths {
@@ -768,6 +931,14 @@ document.addEventListener("click", function(e) {
             next_ids.sort_unstable();
             next_ids.dedup();
             frontier = next_ids;
+        }
+
+        // Worker files discovered via `new Worker(new URL(...))` — remember
+        // their module ids so emit can write standalone worker bundles.
+        for path in &worker_paths {
+            if let Some(&id) = self.path_to_id.get(path) {
+                self.worker_modules.insert(id);
+            }
         }
 
         // Phase 3b: Transform all uncached modules in parallel
@@ -848,6 +1019,18 @@ document.addEventListener("click", function(e) {
                 .function_cache
                 .get(&module_cache_key(module.content_hash, &module.path))
             {
+                // Dynamic-import specifiers resolve to ids first so the graph
+                // can record them as dynamic edges instead of static ones.
+                let mut dynamic_dep_ids = HashSet::new();
+                for spec in &cached.dynamic_imports {
+                    if let Ok(Resolution::File(dep_path_resolved)) =
+                        self.resolve_memo(&mut resolve_memo, spec, &module.path, runner)
+                        && let Some(&dep_id) = self.path_to_id.get(&dep_path_resolved)
+                    {
+                        dynamic_dep_ids.insert(dep_id);
+                        self.module_graph.add_dynamic_dependency(module_id, dep_id);
+                    }
+                }
                 for dep_path in &cached.deps {
                     if let Ok(Resolution::File(dep_path_resolved)) =
                         self.resolve_memo(&mut resolve_memo, dep_path, &module.path, runner)
@@ -857,11 +1040,18 @@ document.addEventListener("click", function(e) {
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
                             .add_dependency(module_id, dep_id);
-                        self.module_graph.add_dependency(module_id, dep_id);
+                        if !dynamic_dep_ids.contains(&dep_id) {
+                            self.module_graph.add_dependency(module_id, dep_id);
+                        }
                     }
                 }
             }
         }
+
+        // Phase 3e: statically verify named / default imports against the
+        // exports of the project modules they resolve to (error in production,
+        // warning in dev).
+        self.validate_imports(&mut resolve_memo, runner)?;
 
         // Phase 4: Save module graph to disk for next incremental build
         if self.config.cache.enabled {
@@ -898,6 +1088,44 @@ document.addEventListener("click", function(e) {
             modules_cached,
             duration_ms: duration.as_millis(),
         })
+    }
+
+    /// `import { x } from './m'` where `./m` has no export `x` (or no default
+    /// export for `import x from`). Rollup fails the build on this; here it is
+    /// an error for production builds and a warning in development.
+    fn validate_imports(
+        &self,
+        memo: &mut HashMap<(String, PathBuf), Resolution>,
+        hooks: Option<&HookRunner<'_>>,
+    ) -> Result<()> {
+        let modules: Vec<(PathBuf, String)> = self
+            .modules
+            .values()
+            .filter(|m| crate::export_check::is_checkable(&m.path))
+            .map(|m| {
+                (
+                    m.path.clone(),
+                    String::from_utf8_lossy(&m.source).into_owned(),
+                )
+            })
+            .collect();
+        let mut resolve = |spec: &str, importer: &Path| -> Option<PathBuf> {
+            match self.resolve_memo(memo, spec, &importer.to_path_buf(), hooks) {
+                Ok(Resolution::File(p)) => Some(p),
+                _ => None,
+            }
+        };
+        let diags = crate::export_check::check_imports(&modules, &self.config.root, &mut resolve);
+        if diags.is_empty() {
+            return Ok(());
+        }
+        if self.config.mode == crate::config::BuildMode::Production {
+            return Err(crate::diagnostics::SourceDiagnostics(diags).into());
+        }
+        for d in diags {
+            warn!("{}", d);
+        }
+        Ok(())
     }
 
     /// Try to load a cached module output (memory, then persistent cache).
@@ -1091,6 +1319,12 @@ document.addEventListener("click", function(e) {
                 return Ok(Resolution::File(self.plugin_id_to_path(&r.id)));
             }
         }
+        // Node builtins (`node:path`, `fs`, …) can't be bundled — keep the
+        // specifier external so server-side output (SSR/API routes) keeps
+        // the `import "node:…"` statement instead of failing resolution.
+        if crate::polyfills::is_node_builtin(specifier) {
+            return Ok(Resolution::External);
+        }
         self.resolve(specifier, importer).map(Resolution::File)
     }
 
@@ -1227,80 +1461,24 @@ document.addEventListener("click", function(e) {
         Ok(id)
     }
 
-    /// Export conditions used for package `exports` resolution, in priority
-    /// order: the configured conditions, then the bundler-standard `module`.
-    fn export_conditions(&self) -> Vec<String> {
-        let mut conds = self.config.conditions.clone();
-        if !conds.iter().any(|c| c == "module") {
-            conds.push("module".to_string());
-        }
-        conds
-    }
-
-    /// Resolve a `#specifier` through the `imports` field of the importer's
-    /// package (the nearest `package.json` at or above the importing file, as
-    /// in Node: package scope ends at the first `package.json`, even one
-    /// without `imports`). Targets are package-relative files (extension and
-    /// index probing applies) or bare package specifiers resolved as usual.
-    fn resolve_package_import(
-        &self,
-        specifier: &str,
-        importer: Option<&PathBuf>,
-    ) -> Result<PathBuf> {
-        let start = importer
-            .and_then(|p| p.parent())
-            .unwrap_or(&self.config.root)
-            .to_path_buf();
-        let mut current = start.clone();
-        loop {
-            let pkg_json = current.join("package.json");
-            if pkg_json.is_file() {
-                let content = std::fs::read_to_string(&pkg_json)?;
-                let pkg: serde_json::Value = serde_json::from_str(&content)
-                    .map_err(|e| anyhow::anyhow!("invalid {}: {e}", crate::display_path(&pkg_json)))?;
-                let Some(imports) = pkg.get("imports").and_then(|v| v.as_object()) else {
-                    bail!(
-                        "Package import '{specifier}' is not defined: {} has no \"imports\" field",
-                        crate::display_path(&pkg_json)
-                    );
-                };
-                let conditions = self.export_conditions();
-                return match crate::package_map::resolve_imports_entry(
-                    imports,
-                    specifier,
-                    &conditions,
-                ) {
-                    Some(target) if target.starts_with("./") => {
-                        let full = current.join(target.trim_start_matches("./"));
-                        resolve_file_like(&full, &self.config.extensions).ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "Package import '{specifier}' maps to '{target}' in {}, which does not exist",
-                                crate::display_path(&pkg_json)
-                            )
-                        })
-                    }
-                    // A bare package target ("#dep": "dep-pkg").
-                    Some(bare) => self.resolve(&bare, importer),
-                    None => bail!(
-                        "Package import '{specifier}' is not defined in {}",
-                        crate::display_path(&pkg_json)
-                    ),
-                };
-            }
-            if !current.pop() {
-                break;
-            }
-        }
-        bail!(
-            "Cannot resolve package import '{specifier}': no package.json found above {}",
-            crate::display_path(&start)
-        )
+    /// Resolve `specifier` as imported from `importer` exactly the way a build
+    /// would (aliases, relative paths, extensions, `node_modules`, package
+    /// `exports`). Used by the test runner to bundle test files with their
+    /// imports.
+    pub fn resolve_specifier(&self, specifier: &str, importer: &Path) -> Result<PathBuf> {
+        self.resolve(specifier, Some(&importer.to_path_buf()))
     }
 
     /// Resolve a module specifier to a file path.
     /// `importer` is the path of the importing module (for relative resolution).
+    ///
+    /// All real resolution lives in `pledgepack-resolver` (aliases,
+    /// `imports`/`exports` fields, workspaces, pnpm, extension/index probing).
+    /// What remains here is engine-specific: the `/__pledge_router` virtual
+    /// module and a root-relative last resort for specifiers that are not
+    /// module specifiers at all.
     fn resolve(&self, specifier: &str, importer: Option<&PathBuf>) -> Result<PathBuf> {
-        // 0a. Virtual modules: /__pledge_router → .pledge/gen/__pledge_router.tsx
+        // Virtual modules: /__pledge_router → .pledge/gen/__pledge_router.tsx
         if specifier == "/__pledge_router" {
             let gen_router = self
                 .config
@@ -1322,166 +1500,21 @@ document.addEventListener("click", function(e) {
             }
         }
 
-        // 0. Check path aliases (e.g., "@/components" → "src/components").
-        // `alias` (tsconfig-style) and `resolve_alias` (`resolve.alias` in the
-        // config file) are both honoured — the dev server already reads
-        // `resolve_alias`, so the production resolver must too.
-        for alias in self
-            .config
-            .alias
-            .iter()
-            .chain(self.config.resolve_alias.iter())
-        {
-            if specifier.starts_with(&alias.from) {
-                let rest = &specifier[alias.from.len()..];
-                // Ensure we match at a path boundary: alias "@/components" should not match "@/components-extra"
-                if !rest.is_empty() && !rest.starts_with('/') && !alias.from.ends_with('/') {
-                    continue;
+        let importer_path = importer
+            .map(|p| p.as_path())
+            .unwrap_or(self.config.root.as_path());
+        match self.resolver.resolve(specifier, importer_path) {
+            Ok(path) => Ok(path),
+            Err(err) => {
+                // Last resort: a root-relative specifier that is not a module
+                // specifier (e.g. `import "src/util"` without an alias).
+                let path = self.config.root.join(specifier);
+                if path.exists() {
+                    return Ok(path);
                 }
-                let mut alias_path = PathBuf::from(&alias.to);
-                // Relative alias targets are relative to the project root,
-                // not the process working directory.
-                if alias_path.is_relative() {
-                    alias_path = self.config.root.join(alias_path);
-                }
-                let path = if rest.is_empty() {
-                    alias_path
-                } else {
-                    alias_path.join(rest.trim_start_matches('/'))
-                };
-                if let Some(found) = resolve_file_like(&path, &self.config.extensions) {
-                    return Ok(found);
-                }
+                Err(err).with_context(|| format!("Cannot resolve module: {specifier}"))
             }
         }
-
-        // Package `imports` (`#specifier`), scoped to the importer's package.
-        if specifier.starts_with('#') {
-            return self.resolve_package_import(specifier, importer);
-        }
-
-        // Handle relative paths
-        if specifier.starts_with("./") || specifier.starts_with("../") {
-            let base = importer
-                .and_then(|p| p.parent())
-                .unwrap_or(&self.config.root);
-            // Normalize `.`/`..` components out of the joined path instead of
-            // leaving them in place: `base.join("./x")` yields `base/./x`,
-            // and `\\?\`-prefixed roots (Windows verbatim paths, produced by
-            // `canonicalize`) never collapse `.`/`..`, so `exists()` fails
-            // even when the file is present.
-            let path = {
-                let mut p = base.to_path_buf();
-                for comp in std::path::Path::new(specifier).components() {
-                    match comp {
-                        std::path::Component::CurDir => {}
-                        std::path::Component::ParentDir => {
-                            p.pop();
-                        }
-                        other => p.push(other.as_os_str()),
-                    }
-                }
-                p
-            };
-
-            if let Some(found) = resolve_file_like(&path, &self.config.extensions) {
-                return Ok(found);
-            }
-        }
-
-        // Handle bare specifiers (node_modules) — walk up directory tree for monorepo support
-        if !specifier.starts_with('.') && !specifier.starts_with('/') {
-            // Handle subpath imports: "react-dom/client" → "react-dom" + "/client"
-            let (pkg_name, subpath) = if specifier.starts_with('@') {
-                // Scoped: @org/pkg/sub → (@org/pkg, /sub)
-                let parts: Vec<&str> = specifier.splitn(3, '/').collect();
-                if parts.len() >= 2 {
-                    let pkg = format!("{}/{}", parts[0], parts[1]);
-                    let sub = if parts.len() == 3 {
-                        format!("/{}", parts[2])
-                    } else {
-                        String::new()
-                    };
-                    (pkg, sub)
-                } else {
-                    (specifier.to_string(), String::new())
-                }
-            } else {
-                // Non-scoped: pkg/sub → (pkg, /sub)
-                match specifier.split_once('/') {
-                    Some((pkg, sub)) => (pkg.to_string(), format!("/{}", sub)),
-                    None => (specifier.to_string(), String::new()),
-                }
-            };
-
-            let mut current = self.config.root.clone();
-            loop {
-                let node_modules = current.join("node_modules");
-
-                let pkg_dir = node_modules.join(&pkg_name);
-                let pkg_json = pkg_dir.join("package.json");
-
-                if pkg_json.exists() {
-                    let content = read_file_mmap(&pkg_json)?;
-                    let pkg: serde_json::Value = serde_json::from_str(&content)?;
-                    let conditions = self.export_conditions();
-
-                    // "exports" (modern) takes precedence over everything else.
-                    let export_key = if subpath.is_empty() {
-                        ".".to_string()
-                    } else {
-                        format!(".{}", subpath)
-                    };
-                    if let Some(exports) = pkg.get("exports")
-                        && let Some(target) =
-                            resolve_package_exports(exports, &export_key, &conditions)
-                    {
-                        let full = pkg_dir.join(target.trim_start_matches("./"));
-                        if full.is_file() {
-                            return Ok(full);
-                        }
-                    }
-
-                    if subpath.is_empty() {
-                        // Fallback: resolve via "module" or "main"
-                        let entry = pkg
-                            .get("module")
-                            .or_else(|| pkg.get("main"))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("index.js");
-                        let full = pkg_dir.join(entry.trim_start_matches("./"));
-                        if let Some(found) = resolve_file_like(&full, &self.config.extensions) {
-                            return Ok(found);
-                        }
-                        // Try index.js in the package directory
-                        let index = pkg_dir.join("index.js");
-                        if index.is_file() {
-                            return Ok(index);
-                        }
-                        return Ok(full); // Return even if doesn't exist — error will surface on read
-                    } else {
-                        // Fallback: direct file path (with extension probing)
-                        let direct = pkg_dir.join(subpath.trim_start_matches('/'));
-                        if let Some(found) = resolve_file_like(&direct, &self.config.extensions) {
-                            return Ok(found);
-                        }
-                    }
-                }
-
-                // Walk up to parent directory for hoisted node_modules
-                if !current.pop() {
-                    break;
-                }
-            }
-        }
-
-        // Last resort: try as-is
-        let path = self.config.root.join(specifier);
-        if path.exists() {
-            return Ok(path);
-        }
-
-        anyhow::bail!("Cannot resolve module: {}", specifier)
     }
 
     // PRODUCTION-READINESS-100.md goal 91: the single-module `transform_module`
@@ -1727,6 +1760,55 @@ document.addEventListener("click", function(e) {
         self.graph.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// The serializable module graph — records static vs dynamic dependency
+    /// edges per module (see `module_graph::ModuleNode`).
+    pub fn module_graph(&self) -> &SerializableModuleGraph {
+        &self.module_graph
+    }
+
+    /// Modules reachable only through `import()` edges: the transitive
+    /// closure of dynamic roots minus everything reachable statically from
+    /// the entry points. These are the modules async chunks are built from.
+    pub fn async_module_set(&self) -> std::collections::HashSet<ModuleId> {
+        // BFS from entries over STATIC edges only.
+        let mut static_reach: std::collections::HashSet<ModuleId> =
+            self.entry_ids().into_iter().collect();
+        let mut stack: Vec<ModuleId> = static_reach.iter().copied().collect();
+        while let Some(id) = stack.pop() {
+            if let Some(node) = self.module_graph.modules.get(&id) {
+                for &dep in &node.dependencies {
+                    if static_reach.insert(dep) {
+                        stack.push(dep);
+                    }
+                }
+            }
+        }
+        // BFS from dynamic roots over ALL edges, minus the static set.
+        let mut async_reach = std::collections::HashSet::new();
+        let mut frontier: Vec<ModuleId> = self
+            .module_graph
+            .modules
+            .values()
+            .flat_map(|n| n.dynamic_dependencies.iter().copied())
+            .collect();
+        frontier.sort_unstable();
+        frontier.dedup();
+        while let Some(id) = frontier.pop() {
+            if static_reach.contains(&id) || !async_reach.insert(id) {
+                continue;
+            }
+            if let Some(node) = self.module_graph.modules.get(&id) {
+                frontier.extend(
+                    node.dependencies
+                        .iter()
+                        .chain(node.dynamic_dependencies.iter())
+                        .copied(),
+                );
+            }
+        }
+        async_reach
+    }
+
     /// Modules ordered by id. `self.modules` is a `HashMap`, so iterating it
     /// directly makes the order of emitted files, CSS `<link>` tags and entry
     /// `<script>` tags differ from run to run (CSS cascade order included).
@@ -1801,20 +1883,52 @@ document.addEventListener("click", function(e) {
         }
     }
 
-    /// Collect all module code into a single bundle string for edge bundle generation.
-    /// Walks the dependency graph from entry points in dependency order.
-    pub fn collect_bundle_code(&self) -> String {
-        let mut bundle = String::new();
-        let mut css_bundle = String::new();
-        let mut visited = std::collections::HashSet::new();
-        for entry_id in self.entry_ids() {
-            self.collect_module_code(entry_id, &mut visited, &mut bundle, &mut css_bundle);
+    /// The runtime module key for a path — a project-relative path when the
+    /// module lives under the root, otherwise its normalized absolute path.
+    /// Keys are the identity used by `__pp.def`/`__pp.req` in emitted output.
+    fn module_key(&self, path: &Path) -> String {
+        match path.strip_prefix(&self.config.root) {
+            Ok(rel) => crate::normalize_path(rel),
+            Err(_) => crate::normalize_path(path),
         }
-        if !css_bundle.is_empty() {
+    }
+
+    /// Collect all module code into a single bundle string for edge bundle
+    /// generation. Renders through the same `__pp.def`/`__pp.req` lowering as
+    /// file emit so edge bundles are actually runnable (no raw specifiers).
+    pub fn collect_bundle_code(&self) -> Result<String> {
+        let modules: Vec<ModuleId> = self.modules_sorted().iter().map(|m| m.id).collect();
+        let chunk = EmitChunk {
+            id: "edge".to_string(),
+            modules: modules.clone(),
+            is_entry: true,
+            is_async: false,
+            stubbed: Vec::new(),
+        };
+        let module_keys: HashMap<ModuleId, String> = self
+            .modules
+            .iter()
+            .map(|(id, m)| (*id, self.module_key(&m.path)))
+            .collect();
+        let id_by_key: HashMap<String, ModuleId> =
+            module_keys.iter().map(|(id, k)| (k.clone(), *id)).collect();
+        let chunk_of: HashMap<ModuleId, usize> = modules.iter().map(|id| (*id, 0usize)).collect();
+        let mut res_memo = HashMap::new();
+        let rendered = self.render_chunk(
+            &chunk,
+            &module_keys,
+            &id_by_key,
+            &chunk_of,
+            std::slice::from_ref(&chunk),
+            &mut res_memo,
+            None,
+        )?;
+        let mut bundle = rendered.content;
+        if !rendered.css.is_empty() {
             bundle.push_str("\n/* === CSS === */\n");
-            bundle.push_str(&css_bundle);
+            bundle.push_str(&rendered.css);
         }
-        bundle
+        Ok(bundle)
     }
 
     /// Get the function-level cache (transformed outputs)
@@ -1840,6 +1954,144 @@ document.addEventListener("click", function(e) {
         self.emit_with_chunks_hooks(chunks, None)
     }
 
+    /// Render one chunk's content: runtime prelude + every module lowered to
+    /// a `__pp.def` registration (specifiers rewritten to module keys), plus
+    /// the entry bootstrap for entry chunks. Returns the JS content, the
+    /// chunk's extracted CSS, and per-module source-map sections.
+    #[allow(clippy::too_many_arguments)]
+    fn render_chunk(
+        &self,
+        chunk: &EmitChunk,
+        module_keys: &HashMap<ModuleId, String>,
+        id_by_key: &HashMap<String, ModuleId>,
+        chunk_of: &HashMap<ModuleId, usize>,
+        chunks: &[EmitChunk],
+        res_memo: &mut HashMap<(String, PathBuf), Resolution>,
+        runner: Option<&HookRunner<'_>>,
+    ) -> Result<RenderedChunk> {
+        let mut chunk_content = String::from(crate::bundle::RUNTIME_PRELUDE);
+        let mut chunk_css = String::new();
+        // (0-based line in the chunk where the module starts, module map)
+        let mut map_sections: Vec<(usize, String)> = Vec::new();
+        let mut line = crate::bundle::RUNTIME_PRELUDE.matches('\n').count();
+
+        for &module_id in &chunk.modules {
+            let module = self.modules.get(&module_id).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "chunk '{}' references module id {} that is not part of the build",
+                    chunk.id,
+                    module_id
+                )
+            })?;
+            let cached = self.cached_for(module).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "chunk '{}': transformed output for {} is missing from the cache — \
+                     refusing to silently drop it from the bundle",
+                    chunk.id,
+                    crate::display_path(&module.path)
+                )
+            })?;
+            let module_key = module_keys
+                .get(&module_id)
+                .cloned()
+                .unwrap_or_else(|| crate::normalize_path(&module.path));
+            if cached.is_css {
+                chunk_css.push_str(&cached.code);
+                chunk_css.push('\n');
+                // Register a no-op module so a lowered `import "./x.css"`
+                // (now `__pp.req("key")`) resolves instead of throwing.
+                chunk_content.push_str(&crate::bundle::wrap_module(&module_key, "", false));
+                line += 3;
+            } else {
+                // An external per-module map is replaced by one merged
+                // chunk map, so the module's own trailing
+                // `sourceMappingURL` comment must go.
+                let code = if cached.source_map.is_some() {
+                    strip_source_mapping_url(&cached.code)
+                } else {
+                    cached.code.as_str()
+                };
+
+                // Resolve each specifier this module references to its
+                // runtime module key (or leave external specifiers raw).
+                let importer = module.path.clone();
+                let mut resolve = |spec: &str| -> crate::bundle::SpecResolution {
+                    match self.resolve_memo(res_memo, spec, &importer, runner) {
+                        Ok(Resolution::File(p)) => self
+                            .path_to_id
+                            .get(&p)
+                            .and_then(|id| module_keys.get(id))
+                            .map(|k| crate::bundle::SpecResolution::Module(k.clone()))
+                            .unwrap_or_else(|| {
+                                crate::bundle::SpecResolution::External(spec.to_string())
+                            }),
+                        _ => crate::bundle::SpecResolution::External(spec.to_string()),
+                    }
+                };
+                // Dynamic `import()` targets in any static (already-loaded)
+                // chunk resolve locally; targets in async chunks go through
+                // `__pp.dyn` + the manifest.
+                let mut is_static_target = |_: &str, res: &crate::bundle::SpecResolution| match res
+                {
+                    crate::bundle::SpecResolution::Module(k) => id_by_key
+                        .get(k)
+                        .and_then(|id| chunk_of.get(id))
+                        .is_none_or(|i| !chunks[*i].is_async),
+                    _ => true,
+                };
+                let lowered =
+                    crate::bundle::lower_module(code, &mut resolve, &mut is_static_target);
+                let wrapped = crate::bundle::wrap_module(
+                    &module_key,
+                    &lowered.body,
+                    lowered.has_top_level_await,
+                );
+
+                // The section offset is the line of the module's first
+                // *body* line — the `__pp.def(` wrapper occupies `line`.
+                if let Some(m) = self.effective_source_map(module, &cached) {
+                    map_sections.push((line + 1, m));
+                }
+                line += wrapped.matches('\n').count();
+                chunk_content.push_str(&wrapped);
+                // Extract CSS from JS modules
+                if let Some(ref extracted_css) = cached.extracted_css {
+                    chunk_css.push_str(extracted_css);
+                    chunk_css.push('\n');
+                }
+            }
+        }
+
+        // Tree-shaken modules: register empty factories so importers'
+        // `__pp.req` calls resolve to `{}` instead of throwing. Stubs are
+        // only emitted for modules proven side-effect-free, so skipping
+        // the real body is unobservable.
+        for &stub_id in &chunk.stubbed {
+            if let Some(key) = module_keys.get(&stub_id) {
+                chunk_content.push_str(&crate::bundle::wrap_module(key, "", false));
+            }
+        }
+
+        // Entry chunks bootstrap their entry modules once everything is
+        // registered.
+        if chunk.is_entry {
+            for id in &self.entry_module_ids {
+                if chunk.modules.contains(id)
+                    && let Some(key) = module_keys.get(id)
+                {
+                    chunk_content
+                        .push_str(&format!("__pp.req({});\n", crate::bundle::js_str_pub(key)));
+                }
+            }
+        }
+
+        Ok(RenderedChunk {
+            content: chunk_content,
+            css: chunk_css,
+            map_sections,
+        })
+    }
+
     /// [`emit_with_chunks`](Self::emit_with_chunks) with plugin hooks.
     ///
     /// `renderChunk(code, "<chunk-id>.js", "entry" | "chunk")` runs on each
@@ -1858,7 +2110,19 @@ document.addEventListener("click", function(e) {
         hooks: Option<&dyn PluginHooks>,
     ) -> Result<()> {
         if chunks.is_empty() {
-            return self.emit_with_hooks(hooks);
+            // Synthesize a single entry chunk containing every module — the
+            // wrapped emit produces runnable output for any chunk layout.
+            let modules: Vec<ModuleId> = self.modules_sorted().iter().map(|m| m.id).collect();
+            return self.emit_with_chunks_hooks(
+                &[EmitChunk {
+                    id: "entry-0".to_string(),
+                    modules,
+                    is_entry: true,
+                    is_async: false,
+                    stubbed: Vec::new(),
+                }],
+                hooks,
+            );
         }
         let runner = hooks.map(HookRunner::new);
         let runner = runner.as_ref();
@@ -1898,65 +2162,43 @@ document.addEventListener("click", function(e) {
             self.config.entry.clone()
         };
 
-        // Emit each chunk as a single concatenated file
-        for chunk in chunks {
-            let mut chunk_content = String::new();
-            let mut chunk_css = String::new();
-            let mut has_css = false;
-            let mut chunk_dynamic_imports: Vec<String> = Vec::new();
-            // (0-based line in the chunk where the module starts, module map)
-            let mut map_sections: Vec<(usize, String)> = Vec::new();
-            let mut line = 0usize;
-
-            for &module_id in &chunk.modules {
-                let module = self.modules.get(&module_id).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "chunk '{}' references module id {} that is not part of the build",
-                        chunk.id,
-                        module_id
-                    )
-                })?;
-                let cached = self.cached_for(module).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "chunk '{}': transformed output for {} is missing from the cache — \
-                         refusing to silently drop it from the bundle",
-                        chunk.id,
-                        crate::display_path(&module.path)
-                    )
-                })?;
-                if cached.is_css {
-                    chunk_css.push_str(&cached.code);
-                    chunk_css.push('\n');
-                    has_css = true;
-                } else {
-                    // An external per-module map is replaced by one merged
-                    // chunk map, so the module's own trailing
-                    // `sourceMappingURL` comment must go.
-                    let code = if cached.source_map.is_some() {
-                        strip_source_mapping_url(&cached.code)
-                    } else {
-                        cached.code.as_str()
-                    };
-                    if let Some(m) = self.effective_source_map(module, &cached) {
-                        map_sections.push((line, m));
-                    }
-                    chunk_content.push_str(code);
-                    chunk_content.push('\n');
-                    line += code.matches('\n').count() + 1;
-                    // Collect dynamic imports for manifest
-                    for di in &cached.dynamic_imports {
-                        if !chunk_dynamic_imports.contains(di) {
-                            chunk_dynamic_imports.push(di.clone());
-                        }
-                    }
-                    // Extract CSS from JS modules
-                    if let Some(ref extracted_css) = cached.extracted_css {
-                        chunk_css.push_str(extracted_css);
-                        chunk_css.push('\n');
-                        has_css = true;
-                    }
-                }
+        // Module keys are the runtime identity of each module — project-
+        // relative paths when possible so output stays readable/debuggable.
+        let module_keys: HashMap<ModuleId, String> = self
+            .modules
+            .iter()
+            .map(|(id, m)| (*id, self.module_key(&m.path)))
+            .collect();
+        let id_by_key: HashMap<String, ModuleId> =
+            module_keys.iter().map(|(id, k)| (k.clone(), *id)).collect();
+        // module id → index of the chunk it was emitted in (for `import()`)
+        let mut chunk_of: HashMap<ModuleId, usize> = HashMap::new();
+        for (i, c) in chunks.iter().enumerate() {
+            for m in &c.modules {
+                chunk_of.insert(*m, i);
             }
+        }
+        let mut res_memo: HashMap<(String, PathBuf), Resolution> = HashMap::new();
+        // module key → async chunk file, written to __pp_manifest.js
+        let mut manifest_map: Vec<(String, String)> = Vec::new();
+        // non-entry, non-async chunk files — emitted as <script> tags
+        let mut static_chunk_files: Vec<String> = Vec::new();
+
+        // Emit each chunk as a single file of `__pp.def`-wrapped modules.
+        for chunk in chunks.iter() {
+            let rendered = self.render_chunk(
+                chunk,
+                &module_keys,
+                &id_by_key,
+                &chunk_of,
+                chunks,
+                &mut res_memo,
+                runner,
+            )?;
+            let mut chunk_content = rendered.content;
+            let chunk_css = rendered.css;
+            let has_css = !chunk_css.is_empty();
+            let map_sections = rendered.map_sections;
 
             // Chunk ids come from the optimizer / user config (`manual_chunks`
             // names); never let one escape the output directory or produce an
@@ -2027,14 +2269,24 @@ document.addEventListener("click", function(e) {
             }
 
             let is_entry = chunk.is_entry;
-            let is_async = !chunk_dynamic_imports.is_empty()
-                && !self.config.build.inline_dynamic_imports
-                && !is_entry;
+            let is_async = chunk.is_async;
 
             if is_async {
                 async_chunks.push(chunk_rel.clone());
+                // Every module in an async chunk is reachable via `import()` —
+                // map its runtime key to this file in __pp_manifest.js. Store
+                // the asset URL so `import()` resolves from any page path.
+                let chunk_url = self.config.asset_url(&chunk_rel);
+                for module_id in &chunk.modules {
+                    if let Some(key) = module_keys.get(module_id) {
+                        manifest_map.push((key.clone(), chunk_url.clone()));
+                    }
+                }
             } else {
                 js_files.push(chunk_rel.clone());
+                if !is_entry {
+                    static_chunk_files.push(chunk_rel.clone());
+                }
             }
 
             if is_entry {
@@ -2049,11 +2301,7 @@ document.addEventListener("click", function(e) {
                     is_entry,
                     is_css: false,
                     is_async,
-                    imports: if !is_async {
-                        chunk_dynamic_imports.clone()
-                    } else {
-                        Vec::new()
-                    },
+                    imports: Vec::new(),
                     css: if has_css {
                         css_files.last().cloned()
                     } else {
@@ -2062,6 +2310,77 @@ document.addEventListener("click", function(e) {
                 },
             );
         }
+
+        // Worker bundles: `new Worker(new URL("./x"))` references were
+        // rewritten to root-relative `/x.js` URLs by the transform — emit
+        // each worker module (plus its full dependency closure, which a
+        // separate realm must carry even when shared with the main bundle)
+        // as a standalone file at that URL path.
+        for &wid in &self.worker_modules {
+            let Some(module) = self.modules.get(&wid) else {
+                continue;
+            };
+            let mut members = Vec::new();
+            let mut seen = HashSet::new();
+            let mut stack = vec![wid];
+            while let Some(id) = stack.pop() {
+                if !seen.insert(id) || !self.modules.contains_key(&id) {
+                    continue;
+                }
+                members.push(id);
+                if let Some(node) = self.module_graph.modules.get(&id) {
+                    stack.extend(node.dependencies.iter().copied());
+                    stack.extend(node.dynamic_dependencies.iter().copied());
+                }
+            }
+            members.sort_unstable();
+            let wchunk = EmitChunk {
+                id: format!(
+                    "worker-{}",
+                    module
+                        .path
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_else(|| wid.to_string())
+                ),
+                modules: members,
+                is_entry: false,
+                is_async: false,
+                stubbed: Vec::new(),
+            };
+            // Worker members aren't in `chunks`, so `is_static_target`
+            // resolves their imports to `__pp.req` — satisfied by the
+            // registrations rendered into this file.
+            let rendered = self.render_chunk(
+                &wchunk,
+                &module_keys,
+                &id_by_key,
+                &chunk_of,
+                chunks,
+                &mut res_memo,
+                runner,
+            )?;
+            let mut content = rendered.content;
+            if let Some(key) = module_keys.get(&wid) {
+                content.push_str(&format!("__pp.req({});\n", crate::bundle::js_str_pub(key)));
+            }
+            // `worker_url` maps `./x.ts` → `/dir/x.js` — mirror that here.
+            let rel = self.output_rel_path(&module.path).with_extension("js");
+            let wpath = out_dir.join(&rel);
+            if let Some(p) = wpath.parent() {
+                std::fs::create_dir_all(p)?;
+            }
+            write_output_file(&wpath, &content)?;
+            tracing::info!("Emitted worker bundle: {}", crate::display_path(&wpath));
+        }
+
+        // The async-chunk manifest wires `__pp.dyn` module keys to hashed
+        // files — written after all chunks so every hash is known.
+        let manifest_name = "__pp_manifest.js";
+        std::fs::write(
+            out_dir.join(manifest_name),
+            crate::bundle::manifest_code(&manifest_map),
+        )?;
 
         // Generate manifest.json with entry-to-chunk mapping
         let manifest_json = serde_json::to_string_pretty(&manifest_entries)?;
@@ -2136,11 +2455,21 @@ document.addEventListener("click", function(e) {
             }
         };
 
-        // Build script tags for entry chunks
-        let script_tags: String = if entry_chunks.is_empty() {
+        // Build script tags: the __pp manifest + non-entry static chunks load
+        // before entry chunks so every `__pp.def` a `__pp.req` might hit is
+        // already registered (async chunks load on demand via `__pp.dyn`).
+        let mut script_tags = String::from("    <script src=\"");
+        script_tags.push_str(&self.config.asset_url("__pp_manifest.js"));
+        script_tags.push_str("\"></script>\n");
+        for file in &static_chunk_files {
+            script_tags.push_str(&format!(
+                "    <script src=\"{}\"></script>\n",
+                self.config.asset_url(file)
+            ));
+        }
+        if entry_chunks.is_empty() {
             if entries.is_empty() {
-                tracing::warn!("No entry points configured — skipping script tag generation");
-                String::new()
+                tracing::warn!("No entry points configured — skipping entry script tag generation");
             } else {
                 let entry = &entries[0];
                 let entry_js = entry
@@ -2152,23 +2481,26 @@ document.addEventListener("click", function(e) {
                     .find(|m| m.is_entry)
                     .map(|m| m.file.clone())
                     .unwrap_or(entry_js);
-                format!(
+                script_tags.push_str(&format!(
                     r#"    <script type="module" src="{}"></script>"#,
                     self.config.asset_url(&entry_hashed)
-                )
+                ));
             }
         } else {
-            entry_chunks
-                .iter()
-                .map(|(_, hashed)| {
-                    format!(
-                        r#"    <script type="module" src="{}"></script>"#,
-                        self.config.asset_url(hashed)
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
+            script_tags.push_str(
+                &entry_chunks
+                    .iter()
+                    .map(|(_, hashed)| {
+                        format!(
+                            r#"    <script type="module" src="{}"></script>"#,
+                            self.config.asset_url(hashed)
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            );
+        }
+        let script_tags = script_tags.trim_end().to_string();
 
         // Use project's index.html as template if it exists, otherwise generate default
         let project_html_path = self.config.root.join("index.html");
@@ -2229,6 +2561,24 @@ document.addEventListener("click", function(e) {
         std::fs::write(&html_path, html)?;
         info!("Generated: {}", crate::display_path(&html_path));
 
+        // Secret scan: emitted output is the last choke point before code
+        // reaches a browser. Recognized credential shapes and `.env` values
+        // outside `env_prefix` fail the build; entropy-only findings warn.
+        if self
+            .config
+            .security
+            .as_ref()
+            .map(|s| s.secret_scan)
+            .unwrap_or(true)
+        {
+            self.scan_emitted_for_secrets(out_dir)?;
+        }
+
+        // Build output verification (#53)
+        if self.config.build.verify_output {
+            self.verify_build_output(out_dir, &manifest_entries)?;
+        }
+
         Ok(())
     }
 
@@ -2266,7 +2616,26 @@ document.addEventListener("click", function(e) {
     /// runs on every emitted module file and `transformIndexHtml` on the page,
     /// both before hashing / writing. A module whose code a `renderChunk`
     /// plugin changed gets no source map (the module map no longer applies).
+    #[allow(unreachable_code)]
     pub fn emit_with_hooks(&self, hooks: Option<&dyn PluginHooks>) -> Result<()> {
+        // All emit paths funnel through the wrapped-chunk emitter: module
+        // bodies are lowered to `__pp.def`/`__pp.req` calls so no raw
+        // `import`/`export` specifiers survive into output. The legacy
+        // per-module emit below is retained for reference only — it left
+        // unresolved specifiers in emitted files and produced unrunnable
+        // bundles.
+        let modules: Vec<ModuleId> = self.modules_sorted().iter().map(|m| m.id).collect();
+        return self.emit_with_chunks_hooks(
+            &[EmitChunk {
+                id: "entry-0".to_string(),
+                modules,
+                is_entry: true,
+                is_async: false,
+                stubbed: Vec::new(),
+            }],
+            hooks,
+        );
+
         let runner = hooks.map(HookRunner::new);
         let runner = runner.as_ref();
         let out_dir = &self.config.out_dir;
@@ -2897,11 +3266,93 @@ document.addEventListener("click", function(e) {
         };
         std::fs::write(out_dir.join("index.html"), html)?;
 
-        // Build output verification (#53)
-        if self.config.build.verify_output {
-            self.verify_build_output(out_dir, &manifest_entries)?;
+        Ok(())
+    }
+
+    /// Scan emitted client output for embedded secrets.
+    ///
+    /// Two tiers: recognized credential shapes and `.env` values that fall
+    /// outside `env_prefix` are hard failures (the build refuses to ship a
+    /// known credential); high-entropy string literals only warn, since
+    /// minified payloads and inline data can trip the heuristic.
+    fn scan_emitted_for_secrets(&self, out_dir: &std::path::Path) -> Result<()> {
+        // Non-prefixed .env values must never appear in client output —
+        // collecting them here catches leaks even when some other code path
+        // (a plugin, a define, a manual string) smuggled them past
+        // `inject_into_code`'s prefix filter.
+        let env = crate::env::EnvVars::load(
+            &self.config.root,
+            self.config.mode,
+            &self.config.env_prefix,
+        );
+        let leaked_env: Vec<(String, String)> = env
+            .all()
+            .iter()
+            .filter(|(k, _)| {
+                !self
+                    .config
+                    .env_prefix
+                    .iter()
+                    .any(|p| k.starts_with(p.as_str()))
+            })
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            if let Ok(rd) = std::fs::read_dir(dir) {
+                for e in rd.flatten() {
+                    let p = e.path();
+                    if p.is_dir() {
+                        walk(&p, out);
+                    } else if p.extension().is_some_and(|x| {
+                        matches!(x.to_str(), Some("js" | "mjs" | "css" | "html" | "json"))
+                    }) {
+                        out.push(p);
+                    }
+                }
+            }
+        }
+        let mut files = Vec::new();
+        walk(out_dir, &mut files);
+
+        let mut findings = Vec::new();
+        for f in &files {
+            let Ok(content) = std::fs::read_to_string(f) else {
+                continue;
+            };
+            let name = f
+                .strip_prefix(out_dir)
+                .map(|p| crate::normalize_path(p))
+                .unwrap_or_else(|_| f.to_string_lossy().to_string());
+            findings.extend(crate::security::scan_code_for_secrets(
+                &content,
+                &name,
+                &leaked_env,
+            ));
         }
 
+        if findings.is_empty() {
+            return Ok(());
+        }
+        let report = crate::security::format_secret_findings(&findings);
+        let hard = findings.iter().filter(|f| f.hard).count();
+        if hard > 0 {
+            tracing::error!(
+                "Secret scan found {} credential(s) in emitted output:\n{}",
+                hard,
+                report
+            );
+            bail!(
+                "Build refused: {} secret(s) detected in client output. Remove the credential, \
+                 keep it out of `env_prefix`, or set `security.secretScan: false` to override.",
+                hard
+            );
+        }
+        tracing::warn!(
+            "Secret scan: {} possible secret(s) in emitted output (build continues):\n{}",
+            findings.len(),
+            report
+        );
         Ok(())
     }
 
@@ -2993,7 +3444,56 @@ document.addEventListener("click", function(e) {
             checked += 1;
         }
 
-        // Check 5: verify index.html exists
+        // Check 5: every emitted .js file must parse, and no specifier may
+        // dangle. Internal imports are lowered to `__pp.req("module/key")`
+        // calls at emit time, so a surviving `./x` or `/x` specifier in an
+        // emitted chunk must resolve to a real output file.
+        fn walk_js(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            if let Ok(rd) = std::fs::read_dir(dir) {
+                for e in rd.flatten() {
+                    let p = e.path();
+                    if p.is_dir() {
+                        walk_js(&p, out);
+                    } else if p.extension().is_some_and(|x| x == "js") {
+                        out.push(p);
+                    }
+                }
+            }
+        }
+        let mut js_files = Vec::new();
+        walk_js(out_dir, &mut js_files);
+        for js in &js_files {
+            let Ok(content) = std::fs::read_to_string(js) else {
+                continue;
+            };
+            let name = js
+                .strip_prefix(out_dir)
+                .map(|p| crate::normalize_path(p))
+                .unwrap_or_else(|_| js.to_string_lossy().to_string());
+            for e in crate::bundle::chunk_syntax_errors(&content, &name) {
+                errors.push(format!("Unparseable output: {e}"));
+            }
+            for spec in crate::bundle::scan_unresolved_specifiers(&content) {
+                if let Some(rel) = spec.strip_prefix('/') {
+                    // Root-relative URL → resolve under out_dir.
+                    if !out_dir.join(rel).exists() {
+                        errors.push(format!(
+                            "Dangling import in {name}: \"{spec}\" does not resolve to an output file"
+                        ));
+                    }
+                } else if spec.starts_with("./") || spec.starts_with("../") {
+                    let resolved = js.parent().map(|p| p.join(&spec)).unwrap_or_default();
+                    if !resolved.exists() {
+                        errors.push(format!(
+                            "Dangling import in {name}: \"{spec}\" does not resolve to an output file"
+                        ));
+                    }
+                }
+                // Bare specifiers are intentional externals — allowed.
+            }
+        }
+
+        // Check 6: verify index.html exists
         if !out_dir.join("index.html").exists() {
             errors.push("Missing index.html in output directory".to_string());
         }
@@ -3030,7 +3530,23 @@ document.addEventListener("click", function(e) {
 
     /// [`emit_single_file`](Self::emit_single_file) with plugin hooks
     /// (`renderChunk(code, "index.js", "entry")`, `transformIndexHtml`).
+    #[allow(unreachable_code)]
     pub fn emit_single_file_hooks(&self, hooks: Option<&dyn PluginHooks>) -> Result<()> {
+        // Single-file output goes through the wrapped-chunk emitter too —
+        // a single entry chunk inlines every module, and `import()` targets
+        // resolve locally via `__pp.req` instead of loading a chunk file.
+        let modules: Vec<ModuleId> = self.modules_sorted().iter().map(|m| m.id).collect();
+        return self.emit_with_chunks_hooks(
+            &[EmitChunk {
+                id: "entry-0".to_string(),
+                modules,
+                is_entry: true,
+                is_async: false,
+                stubbed: Vec::new(),
+            }],
+            hooks,
+        );
+
         let runner = hooks.map(HookRunner::new);
         let runner = runner.as_ref();
         let out_dir = &self.config.out_dir;
@@ -3184,7 +3700,7 @@ document.addEventListener("click", function(e) {
                         .path
                         .strip_prefix(&self.config.root)
                         .unwrap_or(&module.path);
-                    bundle.push_str(&format!("// === {} ===\n", crate::display_path(&rel)));
+                    bundle.push_str(&format!("// === {} ===\n", crate::display_path(rel)));
                     bundle.push_str(&cached.code);
                     bundle.push('\n');
                 }
@@ -3413,66 +3929,6 @@ fn ensure_safe_out_dir(out_dir: &Path, root: &Path, entries: &[String]) -> Resul
         }
     }
     Ok(())
-}
-
-/// Resolve `path` to a file the way bundlers do: the exact file, then the
-/// path with each configured extension *appended* (so dotted names such as
-/// `./user.service` find `user.service.ts`), then the TypeScript-style
-/// `./x.js` → `x.ts`/`x.tsx` mapping, then `<dir>/index<ext>`.
-fn resolve_file_like(path: &Path, extensions: &[String]) -> Option<PathBuf> {
-    fn dotted(ext: &str) -> String {
-        if ext.starts_with('.') {
-            ext.to_string()
-        } else {
-            format!(".{ext}")
-        }
-    }
-    if path.is_file() {
-        return Some(path.to_path_buf());
-    }
-    if path.file_name().is_some() {
-        for ext in extensions {
-            let mut os = path.as_os_str().to_owned();
-            os.push(dotted(ext));
-            let candidate = PathBuf::from(os);
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-        let alts: &[&str] = match path.extension().and_then(|e| e.to_str()) {
-            Some("js") => &["ts", "tsx"],
-            Some("jsx") => &["tsx"],
-            Some("mjs") => &["mts"],
-            Some("cjs") => &["cts"],
-            _ => &[],
-        };
-        for alt in alts {
-            let candidate = path.with_extension(alt);
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-    }
-    if path.is_dir() {
-        for ext in extensions {
-            let index = path.join(format!("index{}", dotted(ext)));
-            if index.is_file() {
-                return Some(index);
-            }
-        }
-    }
-    None
-}
-
-/// Resolve a package.json `exports` entry for `key` (`"."` or `"./sub"`).
-/// The matching logic is shared with the standalone resolver crate - see
-/// [`crate::package_map`].
-fn resolve_package_exports(
-    exports: &serde_json::Value,
-    key: &str,
-    conditions: &[String],
-) -> Option<String> {
-    crate::package_map::resolve_exports_entry(exports, key, conditions)
 }
 
 fn extract_module_specifier(source: &str, offset: usize) -> Option<String> {
@@ -3740,7 +4196,8 @@ mod tests {
     #[test]
     fn resolve_relative_import_with_dotted_filename() {
         let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
+        // Resolver returns canonical paths — the fixture root must be too.
+        let root = &tmp.path().canonicalize().unwrap();
         write(root, "src/main.ts", "");
         write(root, "src/user.service.ts", "export {}");
         let eng = resolver_engine(root);
@@ -3752,7 +4209,7 @@ mod tests {
     #[test]
     fn resolve_js_specifier_maps_to_ts_source() {
         let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
+        let root = &tmp.path().canonicalize().unwrap();
         write(root, "src/main.ts", "");
         write(root, "src/util.ts", "export {}");
         let eng = resolver_engine(root);
@@ -3764,8 +4221,8 @@ mod tests {
     #[test]
     fn resolve_alias_from_resolve_alias_is_relative_to_root() {
         let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-        write(root, "src/components/button.tsx", "export {}");
+        let root = tmp.path().canonicalize().unwrap();
+        write(&root, "src/components/button.tsx", "export {}");
         let mut cfg = PledgeConfig::default();
         cfg.root = root.to_path_buf();
         cfg.cache.enabled = false;
@@ -3781,7 +4238,7 @@ mod tests {
     #[test]
     fn resolve_exports_prefers_import_over_require_and_handles_nesting() {
         let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
+        let root = &tmp.path().canonicalize().unwrap();
         write(
             root,
             "node_modules/dual/package.json",
@@ -3921,8 +4378,15 @@ mod tests {
         let manifest: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(out.join("manifest.json")).unwrap())
                 .unwrap();
-        assert_eq!(manifest["index.tsx"]["is_entry"], true);
-        assert_eq!(manifest["my-index.tsx"]["is_entry"], false);
+        // Manifest is keyed by chunk: the synthesized "entry-0" chunk holds
+        // every module (entry + the similarly-named non-entry + external).
+        let entries: Vec<_> = manifest
+            .as_object()
+            .unwrap()
+            .values()
+            .filter(|v| v["is_entry"] == true)
+            .collect();
+        assert_eq!(entries.len(), 1, "exactly one entry chunk");
     }
 
     // ─── Plugin hooks wired into the engine ─────────────────────────────
@@ -4030,6 +4494,8 @@ mod tests {
             id: "entry-0".into(),
             modules: ids,
             is_entry: true,
+            is_async: false,
+            stubbed: Vec::new(),
         }]
     }
 
@@ -4068,7 +4534,10 @@ mod tests {
         let js: Vec<_> = std::fs::read_dir(&out)
             .unwrap()
             .flatten()
-            .filter(|e| e.file_name().to_string_lossy().ends_with(".js"))
+            .filter(|e| {
+                let n = e.file_name().to_string_lossy().to_string();
+                n.ends_with(".js") && !n.starts_with("__pp_")
+            })
             .collect();
         assert_eq!(js.len(), 1);
         let name = js[0].file_name().to_string_lossy().to_string();
@@ -4145,14 +4614,17 @@ mod tests {
             root.join("node_modules/dep-pkg/main.js")
         );
         // Mapped-but-missing target and unknown key are clear errors.
-        let e = r("#gone", &importer).unwrap_err().to_string();
+        // `{:#}` walks the anyhow chain — the engine wraps resolver errors
+        // in "Cannot resolve module: <spec>".
+        let e = format!("{:#}", r("#gone", &importer).unwrap_err());
         assert!(e.contains("does not exist"), "{e}");
-        let e = r("#nope", &importer).unwrap_err().to_string();
+        let e = format!("{:#}", r("#nope", &importer).unwrap_err());
         assert!(e.contains("not defined"), "{e}");
         // Package scope: the inner package has no `imports`.
-        let e = r("#utils/a", &root.join("packages/inner/x.ts"))
-            .unwrap_err()
-            .to_string();
+        let e = format!(
+            "{:#}",
+            r("#utils/a", &root.join("packages/inner/x.ts")).unwrap_err()
+        );
         assert!(e.contains("no \"imports\" field"), "{e}");
     }
 
@@ -4298,20 +4770,25 @@ mod tests {
         }
         let mut maps = Vec::new();
         find_maps(&out, &mut maps);
+        // Chunk emit produces one indexed map per chunk: entry-0.*.js.map.
         let entry_map = maps
             .iter()
-            .find(|p| p.to_string_lossy().contains("index"))
+            .find(|p| p.to_string_lossy().contains("entry-0"))
             .unwrap_or_else(|| panic!("no source map emitted: {maps:?}"));
         let map: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(entry_map).unwrap()).unwrap();
-        // The plugin's map was composed in: the final map now points at the
-        // plugin's ORIGINAL source, not the intermediate plugin output.
+        // The plugin's map was composed in: the chunk map's single section
+        // points at the plugin's ORIGINAL source, not the intermediate output.
+        let sections = map["sections"].as_array().expect("indexed map");
         assert_eq!(
-            map["sources"],
+            sections[0]["map"]["sources"],
             serde_json::json!(["original-source.ts"]),
             "{map}"
         );
-        assert!(!map["mappings"].as_str().unwrap().is_empty(), "{map}");
+        assert!(
+            !sections[0]["map"]["mappings"].as_str().unwrap().is_empty(),
+            "{map}"
+        );
     }
 
     #[test]
@@ -4463,6 +4940,8 @@ mod tests {
             id: "../../escape:me".into(),
             modules: vec![0],
             is_entry: true,
+            is_async: false,
+            stubbed: Vec::new(),
         }])
         .unwrap();
         assert!(!root.join("escape").exists());
@@ -4501,6 +4980,8 @@ mod tests {
             id: "entry-0".into(),
             modules,
             is_entry: true,
+            is_async: false,
+            stubbed: Vec::new(),
         };
         let err = eng
             .emit_with_chunks(&[chunk(vec![0, 1])])
@@ -4543,6 +5024,8 @@ mod tests {
             id: "entry-0".into(),
             modules: vec![0, 1],
             is_entry: true,
+            is_async: false,
+            stubbed: Vec::new(),
         }])
         .unwrap();
         let entries: Vec<_> = std::fs::read_dir(&out).unwrap().flatten().collect();
@@ -4565,12 +5048,132 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(map_file.path()).unwrap()).unwrap();
         let sections = merged["sections"].as_array().expect("indexed map");
         assert_eq!(sections.len(), 2, "both modules' maps must be present");
-        assert_eq!(sections[0]["offset"]["line"], 0);
-        // module a is "l1\nl2\n" = 2 lines + the joining newline → b starts at line 2.
-        assert_eq!(sections[1]["offset"]["line"], 2);
+        // Wrapped emit: each module starts at its `__pp.def("key", ...)` line,
+        // preceded by the runtime prelude.
+        let def_lines: Vec<usize> = code
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| l.starts_with("__pp.def("))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(def_lines.len(), 2, "{code}");
+        // Section offsets point at the first body line inside the wrapper.
+        assert_eq!(sections[0]["offset"]["line"], def_lines[0] + 1);
+        assert_eq!(sections[1]["offset"]["line"], def_lines[1] + 1);
         assert_eq!(sections[0]["map"]["sources"][0], "a.ts");
         assert_eq!(sections[1]["map"]["sources"][0], "b.ts");
         // The offset really points at module b's first line in the chunk.
-        assert_eq!(code.lines().nth(2), Some("m1"));
+        assert!(code.lines().nth(def_lines[1]).unwrap().contains("b.ts"));
+    }
+}
+
+#[cfg(test)]
+mod import_scanner_props {
+    //! Property tests for `extract_module_specifier` — the raw byte scanner
+    //! that feeds dep discovery from `summarize_module` offsets. Historically
+    //! it matched the word `from` inside a string literal
+    //! (`export const s = 'a from b'`); these properties pin the boundaries it
+    //! must respect and prove it cannot panic on adversarial source.
+    use super::extract_module_specifier;
+    use proptest::prelude::*;
+
+    /// Adversarial JS-ish fragments: module keywords, delimiters, strings that
+    /// contain keyword text, comment-like text, unicode, and escapes.
+    fn jsish() -> impl Strategy<Value = String> {
+        prop::collection::vec(
+            prop::sample::select(vec![
+                "import",
+                "export",
+                "from",
+                "'",
+                "\"",
+                "`",
+                ";",
+                "{",
+                "}",
+                "(",
+                ")",
+                "=",
+                "<",
+                ">",
+                "const",
+                "default",
+                "class",
+                "//",
+                "/*",
+                "*/",
+                "a",
+                "b",
+                "./x",
+                "pkg",
+                "@scope/y",
+                " ",
+                "\n",
+                "\\",
+                "\\\\",
+                "\'",
+                "\\\"",
+                "\u{e9}",
+                "\u{1f980}",
+                "from from",
+                "impor",
+                "exportx",
+            ]),
+            0..80,
+        )
+        .prop_map(|v| v.concat())
+    }
+
+    proptest! {
+        /// Must never panic — at any byte offset, on any source. Offsets from
+        /// the SIMD scanner can land mid-codepoint after lossy UTF-8 decode.
+        #[test]
+        fn never_panics(src in jsish(), off in any::<usize>()) {
+            let at = off % (src.len() + 1);
+            let _ = extract_module_specifier(&src, at);
+        }
+
+        /// Well-formed static imports yield their specifier.
+        #[test]
+        fn static_import_roundtrips(spec in "[a-zA-Z0-9./@_-]{1,40}") {
+            let src = format!("import x from \"{spec}\"");
+            let got = extract_module_specifier(&src, 0);
+            prop_assert_eq!(got.as_deref(), Some(spec.as_str()));
+        }
+
+        /// Re-exports yield their specifier.
+        #[test]
+        fn export_from_roundtrips(spec in "[a-zA-Z0-9./@_-]{1,40}") {
+            let src = format!("export {{ a, b }} from '{spec}'");
+            let got = extract_module_specifier(&src, 0);
+            prop_assert_eq!(got.as_deref(), Some(spec.as_str()));
+        }
+
+        /// Dynamic `import("spec")` yields its specifier.
+        #[test]
+        fn dynamic_import_roundtrips(spec in "[a-zA-Z0-9./@_-]{1,40}") {
+            let src = format!("import(\"{spec}\")");
+            let got = extract_module_specifier(&src, 0);
+            prop_assert_eq!(got.as_deref(), Some(spec.as_str()));
+        }
+
+        /// `from` inside a string literal is never treated as a clause —
+        /// declarations export values, they don't re-export modules.
+        #[test]
+        fn string_contents_never_become_specifiers(
+            name in "[a-z]{1,12}",
+            val in "[a-z ]*from[a-z ]*",
+        ) {
+            let src = format!("export const {name} = '{val}'");
+            prop_assert_eq!(extract_module_specifier(&src, 0), None);
+        }
+
+        /// `import`/`export` in the middle of an expression or identifier is
+        /// not a statement — the boundary check must reject it.
+        #[test]
+        fn non_statement_position_is_rejected(spec in "[a-zA-Z0-9./@_-]{1,40}") {
+            let src = format!("x = import x from \"{spec}\"");
+            prop_assert_eq!(extract_module_specifier(&src, 4), None);
+        }
     }
 }

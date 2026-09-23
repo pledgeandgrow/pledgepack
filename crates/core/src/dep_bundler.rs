@@ -50,6 +50,13 @@ impl DepBundler {
         let root = &config.root;
         let deps_dir = root.join("node_modules").join(".pledge-deps");
         std::fs::create_dir_all(&deps_dir)?;
+        let node_modules = root
+            .join("node_modules")
+            .canonicalize()
+            .unwrap_or_else(|_| root.join("node_modules"));
+        let resolver = crate::engine::module_resolver(config);
+        // Any path inside the root works as the importer for bare specifiers.
+        let importer = root.join("index.js");
 
         // Step 1: Scan all entry points and their dependencies for bare imports
         let bare_imports = self.scan_for_bare_imports(config)?;
@@ -62,7 +69,14 @@ impl DepBundler {
                 continue;
             }
 
-            match self.pre_bundle_dep(specifier, root, &deps_dir) {
+            match self.pre_bundle_dep(
+                specifier,
+                root,
+                &node_modules,
+                &deps_dir,
+                &resolver,
+                &importer,
+            ) {
                 Ok(dep) => {
                     info!(
                         "  ✓ {} ({} bytes{})",
@@ -79,6 +93,20 @@ impl DepBundler {
         }
 
         Ok(self.deps.values().cloned().collect())
+    }
+
+    /// File name a specifier is pre-bundled to inside `.pledge-deps`
+    /// (`react-dom/client` → `react-dom_client.js`, `@org/pkg` → `org_pkg.js`).
+    pub fn dep_file_name(specifier: &str) -> String {
+        format!("{}.js", specifier.replace('/', "_").replace('@', ""))
+    }
+
+    /// URL path a pre-bundled specifier is served at (`/node_modules/.pledge-deps/<file>`).
+    pub fn dep_url(specifier: &str) -> String {
+        format!(
+            "/node_modules/.pledge-deps/{}",
+            Self::dep_file_name(specifier)
+        )
     }
 
     /// Scan source files for bare imports (non-relative specifiers)
@@ -191,12 +219,17 @@ impl DepBundler {
     fn pre_bundle_dep(
         &self,
         specifier: &str,
-        root: &Path,
+        _root: &Path,
+        node_modules: &Path,
         deps_dir: &Path,
+        resolver: &pledgepack_resolver::Resolver,
+        importer: &Path,
     ) -> Result<PreBundledDep> {
-        // Resolve the dependency from node_modules
-        let node_modules = root.join("node_modules");
-        let dep_path = self.resolve_dep(specifier, &node_modules)?;
+        // Resolve through the shared resolver: exports conditions, subpaths,
+        // workspace packages and pnpm layouts all come for free.
+        let dep_path = resolver
+            .resolve(specifier, importer)
+            .map_err(|e| anyhow::anyhow!("could not resolve dependency {specifier}: {e}"))?;
 
         // Read the source
         let source = std::fs::read_to_string(&dep_path)?;
@@ -207,17 +240,20 @@ impl DepBundler {
             && !source.contains("import ")
             && (source.contains("module.exports") || source.contains("require("));
 
-        // Generate ESM wrapper for CJS modules
+        // CJS deps get a self-contained interop wrapper. ESM deps get a
+        // re-export shim pointing at the canonical node_modules URL — a raw
+        // copy into .pledge-deps would break the dep's own relative imports.
         let (esm_code, was_cjs) = if is_cjs {
             (Self::cjs_to_esm_wrapper(specifier, &source), true)
         } else {
-            // Already ESM, just copy with potential optimizations
-            (source, false)
+            (
+                Self::esm_shim(specifier, &dep_path, node_modules, &source),
+                false,
+            )
         };
 
         // Write pre-bundled output
-        let safe_name = specifier.replace('/', "_").replace('@', "");
-        let output_path = deps_dir.join(format!("{}.js", safe_name));
+        let output_path = deps_dir.join(Self::dep_file_name(specifier));
         std::fs::write(&output_path, &esm_code)?;
 
         let size = esm_code.len();
@@ -231,97 +267,28 @@ impl DepBundler {
         })
     }
 
-    /// Resolve a bare specifier to a file path in node_modules
-    fn resolve_dep(&self, specifier: &str, node_modules: &Path) -> Result<PathBuf> {
-        // Handle scoped packages and subpaths: @org/pkg/sub → @org/pkg + /sub
-        let (pkg_name, subpath) = if specifier.starts_with('@') {
-            let parts: Vec<&str> = specifier.splitn(3, '/').collect();
-            if parts.len() >= 2 {
-                let pkg = format!("{}/{}", parts[0], parts[1]);
-                let sub = if parts.len() > 2 { parts[2] } else { "" };
-                (pkg, sub)
-            } else {
-                (specifier.to_string(), "")
-            }
+    /// URL path a module file is served at: `/node_modules/<rel>` when it
+    /// lives under the canonical node_modules dir, `/@fs/<abs>` otherwise
+    /// (e.g. a workspace package outside the project root).
+    fn dep_web_url(dep_path: &Path, node_modules: &Path) -> String {
+        if let Ok(rel) = dep_path.strip_prefix(node_modules) {
+            format!("/node_modules/{}", crate::normalize_path(rel))
         } else {
-            let parts: Vec<&str> = specifier.splitn(2, '/').collect();
-            if parts.len() > 1 {
-                (parts[0].to_string(), parts[1])
-            } else {
-                (specifier.to_string(), "")
-            }
-        };
-
-        let dep_dir = node_modules.join(&pkg_name);
-
-        if dep_dir.is_dir() {
-            let pkg_json_path = dep_dir.join("package.json");
-            if pkg_json_path.exists() {
-                let pkg = std::fs::read_to_string(&pkg_json_path)?;
-                let pkg_json: serde_json::Value = serde_json::from_str(&pkg)?;
-
-                // Check exports field for subpath
-                if !subpath.is_empty() {
-                    if let Some(exports) = pkg_json.get("exports")
-                        && let Some(obj) = exports.as_object()
-                    {
-                        let key = format!("./{}", subpath);
-                        if let Some(export_val) = obj.get(&key) {
-                            let resolved = if let Some(s) = export_val.as_str() {
-                                Some(s.to_string())
-                            } else if let Some(conditions) = export_val.as_object() {
-                                conditions
-                                    .get("browser")
-                                    .or_else(|| conditions.get("module"))
-                                    .or_else(|| conditions.get("import"))
-                                    .or_else(|| conditions.get("default"))
-                                    .and_then(|v| v.as_str())
-                                    .map(|s| s.to_string())
-                            } else {
-                                None
-                            };
-                            if let Some(resolved_path) = resolved {
-                                let full = dep_dir.join(resolved_path.trim_start_matches("./"));
-                                if full.exists() {
-                                    return Ok(full);
-                                }
-                            }
-                        }
-                    }
-                    // Try direct subpath file
-                    let direct = dep_dir.join(subpath);
-                    if direct.exists() {
-                        return Ok(direct);
-                    }
-                }
-
-                // Prefer "module" (ESM) over "main" (CJS)
-                let entry = pkg_json
-                    .get("module")
-                    .and_then(|v| v.as_str())
-                    .or_else(|| pkg_json.get("main").and_then(|v| v.as_str()))
-                    .unwrap_or("index.js");
-
-                let entry_path = dep_dir.join(entry);
-                if entry_path.exists() {
-                    return Ok(entry_path);
-                }
-            }
-
-            // Fall back to index.js
-            let index = dep_dir.join("index.js");
-            if index.exists() {
-                return Ok(index);
-            }
+            format!("/@fs/{}", crate::normalize_path(dep_path))
         }
+    }
 
-        // Try direct file resolution
-        let direct = node_modules.join(format!("{}.js", specifier));
-        if direct.exists() {
-            return Ok(direct);
+    /// An ESM shim module: re-exports everything (and the default, when the
+    /// source declares one) from the dep's canonical served URL.
+    fn esm_shim(specifier: &str, dep_path: &Path, node_modules: &Path, source: &str) -> String {
+        let url = Self::dep_web_url(dep_path, node_modules);
+        let url_js = serde_json::to_string(&url).unwrap_or_else(|_| "\"\"".to_string());
+        let mut shim =
+            format!("// Pledge pre-bundled: {specifier} (ESM)\nexport * from {url_js};\n");
+        if source.contains("export default") {
+            shim.push_str(&format!("export {{ default }} from {url_js};\n"));
         }
-
-        anyhow::bail!("Could not resolve dependency: {}", specifier)
+        shim
     }
 
     /// Generate an ESM wrapper for a CJS module

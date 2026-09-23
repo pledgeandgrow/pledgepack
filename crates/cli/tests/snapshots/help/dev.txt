@@ -1,0 +1,14 @@
+Start the dev server with HMR
+
+Usage: pledgepack dev [OPTIONS]
+
+Options:
+  -p, --port <PORT>      Port to serve on
+      --root <ROOT>      Project root directory (default: current directory)
+      --config <CONFIG>  Config file path (default: auto-detect pledge.json)
+      --host <HOST>      Host to bind to
+      --open             Open browser on start
+      --strict           Treat config-file problems (unknown / misspelled keys) as errors
+      --https            Enable HTTPS dev server (auto-generates self-signed certs if not provided)
+      --socket <SOCKET>  Unix socket path to listen on (Unix only, overrides --port/--host)
+  -h, --help             Print help

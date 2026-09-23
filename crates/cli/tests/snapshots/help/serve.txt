@@ -1,0 +1,12 @@
+Serve a production build (alias for preview)
+
+Usage: pledgepack serve [OPTIONS]
+
+Options:
+  -p, --port <PORT>        Port to serve on
+      --root <ROOT>        Project root directory (default: current directory)
+      --config <CONFIG>    Config file path (default: auto-detect pledge.json)
+      --host <HOST>        Host to bind to
+      --out-dir <OUT_DIR>  Output directory to serve (overrides config.out_dir)
+      --strict             Treat config-file problems (unknown / misspelled keys) as errors
+  -h, --help               Print help

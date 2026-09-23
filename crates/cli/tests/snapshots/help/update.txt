@@ -1,0 +1,10 @@
+Self-update PledgePack to the latest (or a specific) version
+
+Usage: pledgepack update [OPTIONS]
+
+Options:
+      --root <ROOT>        Project root directory (default: current directory)
+      --version <VERSION>  Version to update to (default: latest)
+      --config <CONFIG>    Config file path (default: auto-detect pledge.json)
+      --strict             Treat config-file problems (unknown / misspelled keys) as errors
+  -h, --help               Print help

@@ -42,8 +42,16 @@ pub(super) fn transform_css(
         ..Default::default()
     };
 
-    let mut stylesheet = StyleSheet::parse(&processed_source, ParserOptions::default())
-        .map_err(|e| anyhow::anyhow!("CSS parse error in {}: {}", file_path, e))?;
+    let mut stylesheet =
+        StyleSheet::parse(&processed_source, ParserOptions::default()).map_err(|e| {
+            crate::diagnostics::css_error(
+                file_path,
+                &processed_source,
+                &config.root,
+                &e.kind.to_string(),
+                e.loc.as_ref().map(|l| (l.line, l.column)),
+            )
+        })?;
 
     if is_production {
         stylesheet

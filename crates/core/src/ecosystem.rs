@@ -81,7 +81,11 @@ pub fn resolve_preset(name: &str) -> Option<PluginPreset> {
         && let Ok(content) = std::fs::read_to_string(&path)
         && let Ok(preset) = serde_json::from_str::<PluginPreset>(&content)
     {
-        info!("Loaded community preset '{}' from {}", name, crate::display_path(&path));
+        info!(
+            "Loaded community preset '{}' from {}",
+            name,
+            crate::display_path(&path)
+        );
         return Some(preset);
     }
     warn!("Preset '{}' not found", name);
@@ -408,63 +412,34 @@ pub fn detect_workspace(start: &Path) -> Option<WorkspaceInfo> {
     })
 }
 
-pub fn resolve_workspace_import(specifier: &str, ws: &WorkspaceInfo) -> Option<PathBuf> {
-    let (pkg_name, subpath) = if let Some(rest) = specifier.strip_prefix('@') {
-        if let Some(pos) = rest.find('/') {
-            (&specifier[..pos + 1], Some(&rest[pos + 1..]))
-        } else {
-            (specifier, None)
-        }
-    } else if let Some(pos) = specifier.find('/') {
-        (&specifier[..pos], Some(&specifier[pos + 1..]))
-    } else {
-        (specifier, None)
-    };
+/// Convert workspace packages to the resolver's package map so a
+/// [`pledgepack_resolver::Resolver`] can be built with workspace support.
+pub fn resolver_packages(
+    ws: &WorkspaceInfo,
+) -> std::collections::HashMap<String, pledgepack_resolver::WorkspacePackage> {
+    ws.packages
+        .iter()
+        .map(|(name, pkg)| {
+            (
+                name.clone(),
+                pledgepack_resolver::WorkspacePackage {
+                    path: pkg.path.clone(),
+                    main: pkg.main.clone(),
+                    module: pkg.module.clone(),
+                    exports: pkg.exports.clone(),
+                },
+            )
+        })
+        .collect()
+}
 
-    let pkg = ws.packages.get(pkg_name)?;
-    if let Some(sub) = subpath {
-        if let Some(exports) = &pkg.exports
-            && let Some(obj) = exports.as_object()
-        {
-            let key = format!("./{}", sub);
-            if let Some(v) = obj.get(&key).and_then(|v| v.as_str()) {
-                let p = pkg.path.join(v);
-                if p.is_file() {
-                    return Some(p);
-                }
-            }
-        }
-        let direct = pkg.path.join(sub);
-        if direct.is_file() {
-            return Some(direct);
-        }
-        for ext in [".ts", ".tsx", ".js", ".jsx", ".mjs", ".json"] {
-            let p = PathBuf::from(format!("{}{}", direct.display(), ext));
-            if p.is_file() {
-                return Some(p);
-            }
-        }
-    } else {
-        if let Some(m) = &pkg.module {
-            let p = pkg.path.join(m);
-            if p.is_file() {
-                return Some(p);
-            }
-        }
-        if let Some(m) = &pkg.main {
-            let p = pkg.path.join(m);
-            if p.is_file() {
-                return Some(p);
-            }
-        }
-        for idx in ["index.ts", "index.tsx", "index.js", "index.jsx"] {
-            let p = pkg.path.join(idx);
-            if p.is_file() {
-                return Some(p);
-            }
-        }
-    }
-    None
+pub fn resolve_workspace_import(specifier: &str, ws: &WorkspaceInfo) -> Option<PathBuf> {
+    // The matching logic lives in `pledgepack-resolver` (the single
+    // resolution implementation); this stays as a thin adapter over
+    // `WorkspaceInfo` for existing callers.
+    const EXTENSIONS: &[&str] = &["ts", "tsx", "js", "jsx", "mjs", "json"];
+    let extensions: Vec<String> = EXTENSIONS.iter().map(|s| s.to_string()).collect();
+    pledgepack_resolver::resolve_workspace_import(specifier, &resolver_packages(ws), &extensions)
 }
 
 // ── Feature 99: Cross-Package HMR ─────────────────────────────────────

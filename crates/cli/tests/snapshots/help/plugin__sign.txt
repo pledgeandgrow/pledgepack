@@ -1,0 +1,15 @@
+Sign a plugin file — writes a `<file>.sig.json` trust sidecar that plugin hosts verify at load time (see `plugin_security` config)
+
+Usage: pledgepack plugin sign [OPTIONS] --identity <IDENTITY> <FILE>
+
+Arguments:
+  <FILE>  Path to the plugin file to sign
+
+Options:
+      --identity <IDENTITY>        Signer identity (e.g. "@myorg" or "github:username")
+      --root <ROOT>                Project root directory (default: current directory)
+      --config <CONFIG>            Config file path (default: auto-detect pledge.json)
+      --secret-key <SECRET_KEY>    Ed25519 secret key (64 hex chars). Defaults to the PLEDGEPACK_PLUGIN_SIGNING_KEY environment variable
+      --capability <CAPABILITIES>  Capability to declare in the sidecar (repeatable), e.g. --capability fs:read --capability network
+      --strict                     Treat config-file problems (unknown / misspelled keys) as errors
+  -h, --help                       Print help

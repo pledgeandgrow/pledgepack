@@ -196,7 +196,11 @@ impl PluginHotReloader {
         };
 
         if let Err(e) = debouncer.watch(&path, RecursiveMode::NonRecursive) {
-            tracing::warn!("Failed to watch plugin source {}: {}", crate::display_path(&path), e);
+            tracing::warn!(
+                "Failed to watch plugin source {}: {}",
+                crate::display_path(&path),
+                e
+            );
             return;
         }
 

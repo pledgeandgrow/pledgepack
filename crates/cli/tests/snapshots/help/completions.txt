@@ -1,0 +1,13 @@
+Generate shell completion scripts (`pledgepack completions bash`)
+
+Usage: pledgepack completions [OPTIONS] [SHELL]
+
+Arguments:
+  [SHELL]  Shell to generate completions for (bash, zsh, fish, powershell, elvish)
+
+Options:
+      --root <ROOT>      Project root directory (default: current directory)
+  -s, --shell <SHELL>    Shell to generate completions for (same as the positional argument)
+      --config <CONFIG>  Config file path (default: auto-detect pledge.json)
+      --strict           Treat config-file problems (unknown / misspelled keys) as errors
+  -h, --help             Print help

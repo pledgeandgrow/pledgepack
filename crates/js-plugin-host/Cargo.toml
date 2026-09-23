@@ -16,6 +16,8 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 rquickjs = "0.12"
 pledgepack-core = { workspace = true }
+# Parses transformed test modules to rewrite ESM imports/exports for the test bundle.
+oxc = { workspace = true }
 # Content-hash check for the plugin signing sidecar (goal 12).
 blake3 = { workspace = true }
 

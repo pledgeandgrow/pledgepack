@@ -68,7 +68,11 @@ async fn json_is_data_unless_imported_and_manifests_are_denied() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(tmp.path().join("src")).unwrap();
     std::fs::write(tmp.path().join("package.json"), r#"{"name":"secret-app"}"#).unwrap();
-    std::fs::write(tmp.path().join("package-lock.json"), r#"{"lockfileVersion":3}"#).unwrap();
+    std::fs::write(
+        tmp.path().join("package-lock.json"),
+        r#"{"lockfileVersion":3}"#,
+    )
+    .unwrap();
     std::fs::write(tmp.path().join("src/data.json"), r#"{"a":1}"#).unwrap();
     std::fs::write(
         tmp.path().join("src/index.tsx"),

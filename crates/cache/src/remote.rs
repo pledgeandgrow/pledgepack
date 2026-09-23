@@ -101,12 +101,61 @@ pub struct RemoteCacheEntry {
 pub struct RemoteCache {
     config: RemoteCacheConfig,
     enabled: bool,
+    /// Shared HTTP client, built once. `reqwest::blocking::Client` spins up
+    /// its own internal Tokio runtime (plus OS proxy autodiscovery) on every
+    /// `build()`; a build is a real build-time cost, not the request's, was
+    /// paying that cost on every single `get`/`set` call — up to two per
+    /// module per build. On loopback that is invisible in isolation but
+    /// compounds badly under CPU contention (hundreds of runtime spin-ups
+    /// competing with the rest of the build for threads). One client is
+    /// reused for the cache's whole lifetime instead; `reqwest::blocking::
+    /// Client` is `Clone` (cheap, `Arc`-backed) so this struct stays `Clone`.
+    /// `None` when the client failed to build (e.g. TLS backend init
+    /// failure) — every call then behaves as a miss/no-op, same as disabled.
+    client: Option<reqwest::blocking::Client>,
 }
 
 impl RemoteCache {
     pub fn new(config: RemoteCacheConfig) -> Self {
         let enabled = config.enabled && !config.endpoint.is_empty();
-        Self { config, enabled }
+        let client = if enabled {
+            match reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(config.timeout_secs))
+                .connect_timeout(std::time::Duration::from_secs(
+                    config.timeout_secs.min(10),
+                ))
+                // A build cache endpoint is a project-configured, trusted
+                // destination, not general web traffic — it should never be
+                // routed through a corporate/system HTTP proxy. This also
+                // sidesteps a well-known reqwest-on-Windows stall: without
+                // `no_proxy()`, the client's first request (in some
+                // environments, every request) can block for many seconds
+                // to tens of seconds on a WinHTTP/WPAD proxy-autoconfig
+                // lookup before it ever reaches the network — reproduced
+                // against the real dev-server-adjacent build path even
+                // though an isolated loopback test of this same code
+                // completed in well under a second (see the tests below).
+                .no_proxy()
+                .build()
+            {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    warn!(
+                        "Remote cache: failed to build HTTP client, disabling: {}",
+                        e
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let enabled = enabled && client.is_some();
+        Self {
+            config,
+            enabled,
+            client,
+        }
     }
 
     /// Check if remote cache is active
@@ -162,9 +211,9 @@ impl RemoteCache {
         validate_url(&url)?;
         debug!("Remote cache GET: {}", url);
 
-        let client = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(self.config.timeout_secs))
-            .build()?;
+        let Some(client) = self.client.as_ref() else {
+            return Ok(None);
+        };
 
         let resp = client.get(&url).send();
         match resp {
@@ -204,9 +253,9 @@ impl RemoteCache {
         validate_url(&url)?;
         let data = bincode::serde::encode_to_vec(entry, bincode::config::standard())?;
 
-        let client = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(self.config.timeout_secs))
-            .build()?;
+        let Some(client) = self.client.as_ref() else {
+            bail!("remote cache client unavailable");
+        };
 
         let resp = client
             .put(&url)
@@ -426,5 +475,154 @@ mod tests {
         let config = RemoteCacheConfig::default();
         let cache = RemoteCache::new(config);
         assert!(!cache.is_enabled());
+    }
+}
+
+#[cfg(test)]
+mod hang_repro {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    /// A minimal HTTP/1.1 server (no framework): stores PUT bodies keyed by
+    /// path, serves them back on GET, 404 otherwise. Runs until the test
+    /// process exits.
+    fn spawn_mock_server() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let store: std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>> =
+                std::sync::Mutex::new(std::collections::HashMap::new());
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut buf = [0u8; 8192];
+                let mut header_end = None;
+                let mut data = Vec::new();
+                while header_end.is_none() {
+                    let Ok(n) = stream.read(&mut buf) else { break };
+                    if n == 0 {
+                        break;
+                    }
+                    data.extend_from_slice(&buf[..n]);
+                    header_end = data.windows(4).position(|w| w == b"\r\n\r\n");
+                }
+                let Some(pos) = header_end else { continue };
+                let head = String::from_utf8_lossy(&data[..pos]).to_string();
+                let mut lines = head.lines();
+                let request_line = lines.next().unwrap_or_default();
+                let mut parts = request_line.split_whitespace();
+                let method = parts.next().unwrap_or_default().to_string();
+                let path = parts.next().unwrap_or_default().to_string();
+                let content_len: usize = lines
+                    .find_map(|l| {
+                        l.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(|v| v.trim().to_string())
+                    })
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+                let mut body = data[pos + 4..].to_vec();
+                while body.len() < content_len {
+                    let Ok(n) = stream.read(&mut buf) else { break };
+                    if n == 0 {
+                        break;
+                    }
+                    body.extend_from_slice(&buf[..n]);
+                }
+                let mut s = store.lock().unwrap();
+                if method == "PUT" {
+                    s.insert(path, body);
+                    let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+                } else if method == "GET" {
+                    if let Some(b) = s.get(&path) {
+                        let head = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\n\r\n",
+                            b.len()
+                        );
+                        let _ = stream.write_all(head.as_bytes());
+                        let _ = stream.write_all(b);
+                    } else {
+                        let _ = stream
+                            .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+                    }
+                } else {
+                    let _ = stream
+                        .write_all(b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n");
+                }
+            }
+        });
+        port
+    }
+
+    #[test]
+    fn http_round_trip_completes_within_five_seconds() {
+        let port = spawn_mock_server();
+        let config = RemoteCacheConfig {
+            backend: "http".to_string(),
+            endpoint: format!("http://127.0.0.1:{port}"),
+            enabled: true,
+            timeout_secs: 5,
+            ..Default::default()
+        };
+        let cache = RemoteCache::new(config);
+        let entry = RemoteCacheEntry {
+            code: "console.log(1)".to_string(),
+            source_map: None,
+            deps: vec![],
+            created_at: 0,
+        };
+
+        let cache2 = cache.clone();
+        let entry2 = entry.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let set_ok = cache2.set("k1", &entry2).is_ok();
+            let got = cache2.get("k1").ok().flatten();
+            let _ = tx.send((set_ok, got));
+        });
+        let (set_ok, got) = rx.recv_timeout(std::time::Duration::from_secs(5)).expect(
+            "remote cache set/get did not complete within 5s on a local loopback \
+                 server — a per-request reqwest::blocking::Client with default OS proxy \
+                 detection is the known cause on Windows (WinHTTP proxy autodiscovery)",
+        );
+        assert!(set_ok, "PUT to mock remote cache failed");
+        assert_eq!(got.expect("GET returned no entry").code, entry.code);
+    }
+
+    #[test]
+    fn many_sequential_requests_stay_fast() {
+        let port = spawn_mock_server();
+        let config = RemoteCacheConfig {
+            backend: "http".to_string(),
+            endpoint: format!("http://127.0.0.1:{port}"),
+            enabled: true,
+            timeout_secs: 5,
+            ..Default::default()
+        };
+        let cache = RemoteCache::new(config);
+        let entry = RemoteCacheEntry {
+            code: "x".to_string(),
+            source_map: None,
+            deps: vec![],
+            created_at: 0,
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let start = std::time::Instant::now();
+            for i in 0..50 {
+                let key = format!("k{i}");
+                let _ = cache.set(&key, &entry);
+                let _ = cache.get(&key);
+            }
+            let _ = tx.send(start.elapsed());
+        });
+        let elapsed = rx
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("50 sequential remote cache round trips did not finish within 20s");
+        assert!(
+            elapsed.as_millis() < 5000,
+            "50 round trips to a local server took {elapsed:?} — expected well under 5s; \
+             a fresh reqwest client per call is too slow for a per-module cache path"
+        );
     }
 }

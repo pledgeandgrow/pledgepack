@@ -13,6 +13,7 @@ categories = ["web-programming", "compilers"]
 anyhow = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 rayon = { workspace = true }
 pledgepack-core = { workspace = true }
 globset = { workspace = true }

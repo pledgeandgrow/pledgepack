@@ -57,7 +57,7 @@ User source files (src/*.tsx, *.ts)
 
 ```
 pledgepack-cli
-├── pledgepack-core (engine, config, transform, pipeline, env, html, compression, analyzer, edge, dep_bundler, polyfills, transform_optimizations, css_features, css_in_js, tailwind_v4, asset_pipeline, plugin_system, output_distribution, service_worker, lsp_server, migrate, module_graph, remote, git_cache, watcher, hmr_diff, lazy_pipeline, middleware, doctor, config_validate, telemetry, budgets, bench, webhooks, i18n, rtl, a11y, encrypt, advanced, ecosystem)
+├── pledgepack-core (engine, config, transform, pipeline, env, html, compression, analyzer, edge, bundle, dep_bundler, polyfills, transform_optimizations, css_features, css_in_js, tailwind_v4, asset_pipeline, plugin_system, output_distribution, service_worker, lsp_server, migrate, module_graph, remote, git_cache, watcher, hmr_diff, lazy_pipeline, middleware, doctor, config_validate, diagnostics, export_check, js_config, telemetry, budgets, bench, webhooks, i18n, rtl, a11y, encrypt, advanced, ecosystem)
 │   ├── pledgepack-cache (function-level cache, memory + disk)
 │   ├── pledgepack-native-sys (FFI to Zig)
 │   ├── oxc (parser, semantic, transformer, codegen)
@@ -98,7 +98,7 @@ pledgepack-cli
 | 6 | `tower-http` | 0.6 (fs, cors) | HTTP middleware | cli, dev-server |
 | 7 | `tokio-tungstenite` | 0.26 | WebSocket (HMR) | dev-server |
 | 8 | `oxc` | 0.36 (full) | JS/TS/JSX compiler | core, dev-server, adapter-react |
-| 9 | `lightningcss` | 1.0.0-alpha.71 | CSS engine | core |
+| 9 | `lightningcss` | 1.0.0-alpha.72 | CSS engine | core |
 | 10 | `blake3` | 1 | Hashing (cache keys) | core, cache |
 | 11 | `base64` | 0.22 | Base64 encoding | core |
 | 12 | `image` | 0.25 (jpeg, png, webp, gif) | Image processing | core |
@@ -290,11 +290,17 @@ Source string
 - CSS Modules: `*.module.css` scoped class names with blake3 content hashing (`generate_css_module_map`)
 
 ### Resolver (`crates/resolver/src/lib.rs`)
-- Resolution order: aliases (tsconfig) → relative → absolute → node_modules
+- The single resolution implementation — `pledgepack-core` depends on it and
+  `BuildEngine::resolve` delegates to it via `engine::module_resolver`
+  (aliases/extensions/conditions/workspace derived from `PledgeConfig`), so
+  engine and tooling can no longer diverge
+  (`crates/core/tests/resolver_conformance.rs` pins the contract)
+- Resolution order: aliases (tsconfig + `resolve.alias`) → `imports`
+  (`#subpath`) → relative → absolute → workspace packages → node_modules
 - Package.json: `exports` (modern) → `module` → `main` → `browser`
 - Exports conditions: `browser` > `import` > `module` > `require` > `default`
 - Subpath patterns: `./utils/*` → `./utils/*.js`
-- DashMap cache per (importer, specifier) pair
+- DashMap cache per (importer, specifier) pair; results are canonicalized
 
 ### Cache (`crates/cache/src/lib.rs`)
 - `CacheKey`: blake3 hash of (content_hash, function_id, params)
@@ -362,7 +368,7 @@ Source string
 - **Vitest-compatible API**: `describe`, `it`, `test`, `expect` with matchers (`toBe`, `toEqual`, `toBeTruthy`, `toContain`, `toHaveLength`, `toThrow`, `not` inverse matchers)
 - **Lifecycle hooks**: `beforeAll`, `beforeEach`, `afterEach`, `afterAll`
 - **Embedded JS runtime**: Tests run in **QuickJS** with `console.log` and `require()` shim
-- **TypeScript stripping**: TS syntax automatically stripped for QuickJS compatibility
+- **Test bundling** (`test_bundle.rs`): each test file is bundled with the project modules it imports — imports are resolved through the build resolver (aliases, tsconfig paths, `node_modules`, extensions), transformed by the same Oxc pipeline, and wrapped in a CommonJS-style registry. `vitest`/`@jest/globals` resolve to the harness globals; Node built-ins resolve to an empty object; unresolved imports throw only when executed. `test.setup_files` are bundled the same way.
 - **Mock support**: `vi.fn()`, `vi.mock()`, `vi.spyOn()`, `vi.stubGlobal()` for Vitest-compatible mocking
 - **Snapshot testing**: `toMatchSnapshot()` and `toMatchInlineSnapshot()` with `SnapshotStore` for `.snap` file persistence, auto-update mode, and mismatch error reporting
 - **Coverage reporting**: `CoverageReport` with text, JSON, HTML, and LCOV output formats; line/function/branch coverage tracking
@@ -525,8 +531,10 @@ Source string
 
 ### Migration Tooling (`crates/core/src/migrate.rs`)
 - **Config migration**: `migrate_config()` from Vite/webpack/CRA/Next.js to `pledge.config.ts`
+- **Static evaluation**: source configs are parsed with Oxc and folded to JSON (`js_config.rs`) — never executed. Values that need a runtime (`path.resolve`, function calls) are kept as `$call`/`$expr` markers and produce explicit warnings in the migration output.
+- **Field mapping**: entry, `base`, `define`/`DefinePlugin`, aliases, `server.port`/`open`/`https`/`proxy`, `build.outDir`/`sourcemaps`, `HtmlWebpackPlugin`/`MiniCssExtractPlugin` → html/CSS extraction equivalents; `render_config_ts()` renders the result as `pledge.config.ts`
+- **Framework detection**: framework plugins in the source config (e.g. `@vitejs/plugin-react`) set the `framework` field
 - **Dry run**: `--dry-run` flag shows what would be migrated without writing files
-- **Framework detection**: Auto-detects framework from existing config files
 
 ### Incremental Build Graph (`crates/core/src/module_graph.rs`)
 - **Content-hash change detection**: Only rebuild changed modules and transitive dependents
@@ -610,10 +618,13 @@ Source string
    ├── Split chunks (entry / vendor / shared)
    └── Return Vec<Chunk>
 5. Emit to .pledge/
-   ├── Write each module as .js file
+   ├── Lower each module's ESM into `__pp.def`/`__pp.req` records and wrap
+   │   chunks in the `__pp` runtime (crates/core/src/bundle.rs) — dynamic
+   │   `import()` resolves via `__pp.dyn` + `__pp_manifest.js`
+   ├── Write each chunk as a content-hashed .js file
    ├── Generate index.html (with hashed asset references)
-   ├── Generate manifest.json
-   └── Generate source maps
+   ├── Generate manifest.json (chunk-id keyed entry-to-file mapping)
+   └── Generate source maps (per-chunk indexed maps merged from module maps)
 6. Post-build steps:
    ├── Generate pledge-env.d.ts (if env_dts enabled)
    ├── Process HTML entry point

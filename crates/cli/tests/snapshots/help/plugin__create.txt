@@ -1,0 +1,14 @@
+Scaffold a new plugin project (#68)
+
+Usage: pledgepack plugin create [OPTIONS] <NAME>
+
+Arguments:
+  <NAME>  Plugin name
+
+Options:
+      --description <DESCRIPTION>  Plugin description
+      --root <ROOT>                Project root directory (default: current directory)
+      --author <AUTHOR>            Author name
+      --config <CONFIG>            Config file path (default: auto-detect pledge.json)
+      --strict                     Treat config-file problems (unknown / misspelled keys) as errors
+  -h, --help                       Print help

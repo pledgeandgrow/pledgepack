@@ -1,0 +1,11 @@
+Add Pledgepack to an existing project (migrates config from Vite/webpack/CRA)
+
+Usage: pledgepack init [OPTIONS]
+
+Options:
+      --force                  Force overwrite existing pledge.config.ts
+      --root <ROOT>            Project root directory (default: current directory)
+      --config <CONFIG>        Config file path (default: auto-detect pledge.json)
+      --framework <FRAMEWORK>  Skip framework detection, use this framework
+      --strict                 Treat config-file problems (unknown / misspelled keys) as errors
+  -h, --help                   Print help

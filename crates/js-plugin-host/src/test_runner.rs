@@ -353,7 +353,10 @@ pub fn run_test_file_with_config_and_limits(
     // Set up coverage tracking if enabled
     let coverage_data = Arc::new(Mutex::new(Vec::<(String, usize, usize)>::new()));
 
-    let js_source = strip_typescript(&source, file_path, project_config)?;
+    // Bundle the test file with the project modules it imports (relative
+    // imports, aliases, TS/JSX, `vitest` globals) instead of deleting imports.
+    let _ = &source;
+    let js_source = crate::test_bundle::bundle_test_file(file_path, project_config)?;
 
     // Everything runs inside the context closure
     let results_json: String = context.with(|ctx| {
@@ -373,8 +376,8 @@ pub fn run_test_file_with_config_and_limits(
         for setup_file in &config.setup_files {
             let setup_path = root.join(setup_file);
             if setup_path.exists()
-                && let Ok(setup_source) = std::fs::read_to_string(&setup_path)
-                && let Ok(setup_js) = strip_typescript(&setup_source, &setup_path, project_config)
+                && let Ok(setup_js) =
+                    crate::test_bundle::bundle_test_file(&setup_path, project_config)
             {
                 let _ = ctx.eval::<(), _>(setup_js.as_str());
             }

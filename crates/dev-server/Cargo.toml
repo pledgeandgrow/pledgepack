@@ -21,6 +21,9 @@ serde_json = { workspace = true }
 notify = { workspace = true }
 notify-debouncer-full = { workspace = true }
 pledgepack-core = { workspace = true }
+# Shared package.json `exports`/`imports` matching (`package_map`) used by the
+# import-map generator — the same matcher the module resolver uses.
+pledgepack-resolver = { workspace = true }
 pledgepack-js-plugin-host = { workspace = true }
 pledgepack-native-sys = { path = "../../native-sys" }
 oxc = { workspace = true }

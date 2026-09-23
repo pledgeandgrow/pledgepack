@@ -1,0 +1,11 @@
+Analyze bundle size with interactive treemap
+
+Usage: pledgepack analyze [OPTIONS]
+
+Options:
+  -p, --port <PORT>      Port to serve the analysis on
+      --root <ROOT>      Project root directory (default: current directory)
+      --config <CONFIG>  Config file path (default: auto-detect pledge.json)
+      --graph            Generate interactive dependency graph instead of treemap (#104)
+      --strict           Treat config-file problems (unknown / misspelled keys) as errors
+  -h, --help             Print help

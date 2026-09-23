@@ -5,6 +5,7 @@
 //   - load(id) → { code, map } | null
 
 pub mod advanced;
+pub mod test_bundle;
 pub mod test_runner;
 //   - transform(code, id) → { code, map } | null
 //   - transformIndexHtml(html) → html | tags[]

@@ -3,9 +3,9 @@
 //!
 //! This module is pure (no file-system access): it only turns a package map
 //! plus a request key into a *target string*; turning that into a file is the
-//! caller's job. It lives in `pledgepack-core` because `pledgepack-resolver`
-//! depends on core (not the other way round), so both can use it without a
-//! dependency cycle.
+//! caller's job. It lives in `pledgepack-resolver` — the single resolution
+//! implementation — and `pledgepack-core` re-exports it as
+//! `pledgepack_core::package_map` for API compatibility.
 //!
 //! Semantics follow Node's package entry points:
 //!

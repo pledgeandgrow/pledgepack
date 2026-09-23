@@ -1,0 +1,11 @@
+Run benchmarks
+
+Usage: pledgepack bench [OPTIONS]
+
+Options:
+      --baseline <BASELINE>    Compare against a baseline ref (git commit hash or name) (#103)
+      --root <ROOT>            Project root directory (default: current directory)
+      --config <CONFIG>        Config file path (default: auto-detect pledge.json)
+      --threshold <THRESHOLD>  Regression threshold percentage (default: 10.0) (#103)
+      --strict                 Treat config-file problems (unknown / misspelled keys) as errors
+  -h, --help                   Print help

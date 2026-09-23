@@ -15,7 +15,6 @@ serde_json = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 dashmap = { workspace = true }
-pledgepack-core = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

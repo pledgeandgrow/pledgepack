@@ -15,6 +15,7 @@ use axum::{
     routing::get,
 };
 use futures_util::{SinkExt, StreamExt};
+use pledgepack_core::diagnostics as pledge_diagnostics;
 use pledgepack_core::module::ModuleKind;
 use pledgepack_core::transform as pledge_transform;
 use pledgepack_core::{BuildEngine, PledgeConfig, normalize_path, normalize_path_str};
@@ -246,6 +247,45 @@ pub struct DevServerState {
     /// [`pledgepack_core::plugin_hooks::PluginHooks`] trait as production
     /// builds. `None` when no plugin defines any of those hooks.
     pub plugin_hooks: Option<Arc<PluginHookService>>,
+    /// Pre-bundled dependencies: bare specifier → served URL
+    /// (`/node_modules/.pledge-deps/<file>.js`), produced by
+    /// [`pledgepack_core::dep_bundler::DepBundler::pre_bundle`] at server
+    /// boot — Vite-style dep pre-bundling so CJS deps are served locally
+    /// instead of via a CDN and bare imports get stable dep URLs.
+    pub prebundled_deps: std::sync::Arc<std::collections::HashMap<String, String>>,
+}
+
+/// Run dependency pre-bundling for dev-server startup: scans the project's
+/// bare imports, resolves them through `pledgepack-resolver`, wraps CJS deps
+/// in an ESM interop module and emits ESM re-export shims, all under
+/// `node_modules/.pledge-deps/`. Returns specifier → URL for rewriting;
+/// a pre-bundle failure is non-fatal (the import map still resolves deps).
+fn prebundle_dependencies(config: &PledgeConfig) -> std::collections::HashMap<String, String> {
+    if !config.root.join("node_modules").is_dir() {
+        return std::collections::HashMap::new();
+    }
+    let mut bundler = pledgepack_core::dep_bundler::DepBundler::new();
+    match bundler.pre_bundle(config) {
+        Ok(deps) => {
+            let map: std::collections::HashMap<String, String> = deps
+                .iter()
+                .map(|d| {
+                    (
+                        d.specifier.clone(),
+                        pledgepack_core::dep_bundler::DepBundler::dep_url(&d.specifier),
+                    )
+                })
+                .collect();
+            if !map.is_empty() {
+                info!("Pre-bundled {} dependencies into .pledge-deps", map.len());
+            }
+            map
+        }
+        Err(e) => {
+            warn!("Dependency pre-bundling failed, serving deps per-file: {e}");
+            std::collections::HashMap::new()
+        }
+    }
 }
 
 /// Configuration for a multi-entry dev server
@@ -349,6 +389,7 @@ pub fn try_create_app_with_plugin_hooks(
     let extra_headers = middleware::response_headers(&middleware_fns);
 
     let entries = detect_entries(&config);
+    let prebundled_deps = prebundle_dependencies(&config);
 
     let state = Arc::new(DevServerState {
         engine: RwLock::new(engine),
@@ -362,6 +403,7 @@ pub fn try_create_app_with_plugin_hooks(
         middleware_chain: RwLock::new(middleware_fns),
         entries: RwLock::new(entries),
         plugin_hooks,
+        prebundled_deps: std::sync::Arc::new(prebundled_deps),
     });
 
     let app = Router::new()
@@ -445,10 +487,29 @@ pub async fn serve(engine: BuildEngine, config: &PledgeConfig) -> Result<()> {
         None if !is_loopback => Some(pledgepack_core::security::generate_random_token(16)),
         None => None,
     };
+    // envPrefix floor: a "" / "*" prefix would expose every environment
+    // variable to transformed modules. `pledge build` refuses outright; in
+    // dev we warn loudly — the served code still leaks, but killing the dev
+    // server over a config warning would be worse DX.
+    if config
+        .env_prefix
+        .iter()
+        .any(|p| p.is_empty() || p == "*")
+    {
+        eprintln!(
+            "  \x1b[31m⚠ envPrefix contains an empty/\"*\" entry — ALL environment variables,\x1b[0m"
+        );
+        eprintln!(
+            "    including .env secrets, will be inlined into served modules. `pledge build`"
+        );
+        eprintln!("    refuses this configuration; fix envPrefix before deploying.");
+        eprintln!();
+    }
+
     if !is_loopback {
         eprintln!();
         eprintln!(
-            "  \x1b[33m⚠ pledge dev is bound to a non-loopback address ({}).\x1b[0m",
+            "  \x1b[33m⚠ pledgepack dev is bound to a non-loopback address ({}).\x1b[0m",
             host
         );
         eprintln!(
@@ -530,6 +591,12 @@ pub async fn serve(engine: BuildEngine, config: &PledgeConfig) -> Result<()> {
         }
     }
 
+    // Vite-style dependency pre-bundling at server boot: bare imports are
+    // resolved once, CJS deps get an ESM interop wrapper, and all bundled
+    // deps are served from node_modules/.pledge-deps/ instead of being
+    // re-resolved/transformed per request (or fetched from a CDN).
+    let prebundled_deps = prebundle_dependencies(config);
+
     let state = Arc::new(DevServerState {
         engine: RwLock::new(engine),
         config: config.clone().into(),
@@ -542,6 +609,7 @@ pub async fn serve(engine: BuildEngine, config: &PledgeConfig) -> Result<()> {
         middleware_chain: RwLock::new(middleware_fns),
         entries: RwLock::new(entries),
         plugin_hooks: serve_plugin_hooks,
+        prebundled_deps: std::sync::Arc::new(prebundled_deps),
     });
 
     // Spawn HMR broadcast task
@@ -963,7 +1031,10 @@ fn network_urls(
 fn announce_listening(scheme: &str, host: &str, bound: &[std::net::SocketAddr], elapsed_ms: u128) {
     println!("\n  \x1b[32mReady in {}ms\x1b[0m\n", elapsed_ms);
     for addr in bound {
-        info!("Dev server running at {}", url_for(scheme, addr.ip(), addr.port()));
+        info!(
+            "Dev server running at {}",
+            url_for(scheme, addr.ip(), addr.port())
+        );
     }
     if bound.is_empty() {
         info!("Dev server running on {host}");
@@ -1039,7 +1110,7 @@ async fn require_access_token(
     if !authorized {
         return (
             StatusCode::UNAUTHORIZED,
-            "pledge dev: this server requires an access token because it is bound to a \
+            "pledgepack dev: this server requires an access token because it is bound to a \
              non-loopback address.\nOpen the URL printed at startup (it includes ?token=...), \
              or pass the token via the X-Pledge-Token header.",
         )
@@ -1140,7 +1211,7 @@ async fn shell_preview_handler(State(state): State<Arc<DevServerState>>) -> Resp
             ),
         };
 
-    let import_map = generate_import_map(&state.config);
+    let import_map = generate_import_map(&state.config, &state.prebundled_deps);
 
     // Show the raw shell (without HMR script) for inspection
     let shell = shell_generator::generate_html_shell(
@@ -1178,6 +1249,24 @@ async fn shell_preview_handler(State(state): State<Arc<DevServerState>>) -> Resp
     Html(html).into_response()
 }
 
+/// The browser-side HMR client: WebSocket reconnect with backoff, module/CSS/
+/// framework hot-update handling, the error overlay, and the runtime-error
+/// hooks. Single source of truth — this previously existed as three inline
+/// copies (index, SPA-fallback, and multi-entry handlers) that had diverged:
+/// only one had framework `.vue`/`.svelte` HMR and the full error overlay.
+const HMR_CLIENT_TAG: &str = include_str!("hmr_client.html");
+
+/// Insert the HMR client `<script>` block immediately before the first
+/// `</body>`; when the document has no body close tag, append one.
+fn inject_hmr_client(html: &mut String) {
+    if html.contains("</body>") {
+        *html = html.replacen("</body>", &format!("{}\n</body>", HMR_CLIENT_TAG), 1);
+    } else {
+        html.push_str(HMR_CLIENT_TAG);
+        html.push_str("\n</body></html>");
+    }
+}
+
 /// Serve the index.html shell
 async fn index_handler(State(state): State<Arc<DevServerState>>) -> impl IntoResponse {
     // Convention: auto-detect project structure
@@ -1211,7 +1300,7 @@ async fn index_handler(State(state): State<Arc<DevServerState>>) -> impl IntoRes
                                 "<title>PledgeStack</title>".to_string(),
                             ),
                         };
-                    let import_map = generate_import_map(&state.config);
+                    let import_map = generate_import_map(&state.config, &state.prebundled_deps);
                     shell_generator::generate_html_shell(
                         &html_attrs,
                         &head_content,
@@ -1229,256 +1318,13 @@ async fn index_handler(State(state): State<Arc<DevServerState>>) -> impl IntoRes
                             "<title>PledgeStack</title>".to_string(),
                         ),
                     };
-                let import_map = generate_import_map(&state.config);
+                let import_map = generate_import_map(&state.config, &state.prebundled_deps);
                 shell_generator::generate_html_shell(&html_attrs, &head_content, "", &import_map)
             }
         }
     };
 
     // Inject HMR client script before </body>
-    let hmr_script = r#"
-    <script>
-        // HMR runtime registries for framework component hot replacement
-        window.__pledge_vue_components = window.__pledge_vue_components || {};
-        window.__pledge_svelte_components = window.__pledge_svelte_components || {};
-        window.__pledge_solid_hmr = window.__pledge_solid_hmr || [];
-        window.__pledge_fast_refresh = window.__pledge_fast_refresh || function(name, reload) {
-          (window.__pledge_fast_refresh_registry = window.__pledge_fast_refresh_registry || {})[name] = reload;
-        };
-        // HMR module registry: path -> module hot data
-        window.__pledge_hmr_modules = window.__pledge_hmr_modules || {};
-
-        // WebSocket with exponential backoff reconnection
-        let __pledge_ws;
-        let __pledge_ws_reconnect_delay = 1000;
-        let __pledge_ws_max_delay = 30000;
-        let __pledge_ws_current_delay = __pledge_ws_reconnect_delay;
-        let __pledge_ws_closed_by_user = false;
-
-        function __pledge_connect_ws() {
-            const ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/__pledge_hmr');
-            window.__pledge_ws = ws;
-
-            ws.onmessage = (event) => {
-                const data = JSON.parse(event.data);
-                if (data.type === 'update') {
-                    console.log('[pledge] HMR update:', data.path, data.deps && data.deps.length ? '(cascading to: ' + data.deps.join(', ') + ')' : '');
-                    clearPledgeError();
-                    // Reset reconnection delay on successful message
-                    __pledge_ws_current_delay = __pledge_ws_reconnect_delay;
-                    if (data.path) {
-                        // CSS Modules HMR: re-import to get updated class name mappings
-                        if (data.path.endsWith('.module.css') && data.moduleMap) {
-                            import(data.path + '?t=' + Date.now()).then(() => {
-                                console.log('[pledge] CSS Module HMR:', data.path);
-                                window.dispatchEvent(new CustomEvent('pledge:hmr-success'));
-                            }).catch((err) => {
-                                console.error('[pledge] CSS Module HMR failed:', err);
-                                location.reload();
-                            });
-                        } else if (data.path.endsWith('.css') || data.css) {
-                            // CSS HMR: inject <style> tag without page reload
-                            if (data.css) {
-                                updatePledgeCSS(data.path, data.css);
-                            } else {
-                                fetchPledgeCSS(data.path);
-                            }
-                        } else {
-                            // Framework HMR: .vue and .svelte use dynamic import for component replacement
-                            if (data.path.endsWith('.vue') || data.path.endsWith('.svelte')) {
-                                import(data.path + '?t=' + Date.now()).then((newModule) => {
-                                    console.log('[pledge] Framework HMR:', data.path);
-                                    window.dispatchEvent(new CustomEvent('pledge:hmr-success'));
-                                }).catch((err) => {
-                                    console.error('[pledge] Framework HMR failed:', err);
-                                    location.reload();
-                                });
-                            } else {
-                                // JS HMR: check for accept callbacks (true HMR) before falling back to script tag reload
-                                if (window.__pledge_hot_accept_callbacks && window.__pledge_hot_accept_callbacks[data.path] && window.__pledge_hot_accept_callbacks[data.path].length > 0) {
-                                    // Capture old callbacks before re-import (new module will overwrite the registry)
-                                    const oldCallbacks = window.__pledge_hot_accept_callbacks[data.path].slice();
-                                    import(data.path + '?t=' + Date.now()).then((newModule) => {
-                                        console.log('[pledge] HMR accept:', data.path);
-                                        oldCallbacks.forEach(cb => {
-                                            try { cb(newModule); } catch(e) { console.error('[pledge] HMR accept error:', e); }
-                                        });
-                                        window.dispatchEvent(new CustomEvent('pledge:hmr-success'));
-                                    }).catch((err) => {
-                                        console.error('[pledge] HMR accept failed, reloading:', err);
-                                        location.reload();
-                                    });
-                                } else {
-                                    // No accept callback — reload the changed script tag
-                                    const links = document.querySelectorAll('script[src="' + data.path + '"]');
-                                    links.forEach(link => {
-                                        const newLink = document.createElement('script');
-                                        newLink.type = 'module';
-                                        newLink.src = data.path + '?t=' + Date.now();
-                                        link.replaceWith(newLink);
-                                    });
-                                }
-                            }
-                        }
-                        // Handle cascading updates for dependent modules
-                        if (data.deps && data.deps.length > 0) {
-                            data.deps.forEach((depPath) => {
-                                console.log('[pledge] HMR cascade:', depPath);
-                                if (depPath.endsWith('.css')) {
-                                    fetchPledgeCSS(depPath);
-                                } else {
-                                    const depLinks = document.querySelectorAll('script[src="' + depPath + '"]');
-                                    depLinks.forEach(link => {
-                                        const newLink = document.createElement('script');
-                                        newLink.type = 'module';
-                                        newLink.src = depPath + '?t=' + Date.now();
-                                        link.replaceWith(newLink);
-                                    });
-                                }
-                            });
-                        }
-                    }
-                } else if (data.type === 'error') {
-                    showPledgeError(data.message, data.file, data.stack, data.line, data.column);
-                } else if (data.type === 'connected') {
-                    console.log('[pledge] HMR connected');
-                } else if (data.type === 'server-reload') {
-                    console.log('[pledge] Server reloading:', data.message);
-                    showPledgeServerReload(data.message);
-                } else if (data.type === 'server-reload-complete') {
-                    console.log('[pledge] Server reloaded:', data.message);
-                    clearPledgeServerReload();
-                }
-            };
-            ws.onopen = () => {
-                console.log('[pledge] HMR connected');
-                __pledge_ws_current_delay = __pledge_ws_reconnect_delay;
-            };
-            ws.onclose = () => {
-                if (__pledge_ws_closed_by_user) return;
-                console.warn('[pledge] HMR disconnected — reconnecting in ' + __pledge_ws_current_delay + 'ms');
-                setTimeout(() => {
-                    __pledge_ws_current_delay = Math.min(__pledge_ws_current_delay * 2, __pledge_ws_max_delay);
-                    __pledge_connect_ws();
-                }, __pledge_ws_current_delay);
-            };
-            ws.onerror = () => {
-                // onclose will handle reconnection
-            };
-        }
-
-        __pledge_connect_ws();
-
-        // CSS HMR: update or inject <style> tag
-        function updatePledgeCSS(path, cssContent) {
-            let styleId = '__pledge_style_' + path.replace(/[^a-zA-Z0-9]/g, '_');
-            let existing = document.getElementById(styleId);
-            if (!existing) {
-                existing = document.createElement('style');
-                existing.id = styleId;
-                document.head.appendChild(existing);
-            }
-            existing.textContent = cssContent;
-            console.log('[pledge] CSS HMR:', path);
-        }
-
-        // CSS HMR: fetch updated CSS and inject
-        async function fetchPledgeCSS(path) {
-            try {
-                const res = await fetch(path + '?t=' + Date.now());
-                const css = await res.text();
-                updatePledgeCSS(path, css);
-            } catch(e) {
-                console.error('[pledge] CSS HMR fetch failed:', e);
-            }
-        }
-
-        // Pledge Error Overlay — beautiful, interactive error display with stack traces
-        function showPledgeError(message, file, stack, line, column) {
-            let overlay = document.getElementById('__pledge_error_overlay');
-            if (!overlay) {
-                overlay = document.createElement('div');
-                overlay.id = '__pledge_error_overlay';
-                overlay.style.cssText = 'position:fixed;inset:0;z-index:99999;background:rgba(0,0,0,0.92);font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;padding:2rem;overflow:auto;display:flex;flex-direction:column;';
-                document.body.appendChild(overlay);
-            }
-            let fileHtml = file ? '<div style="color:#888;margin-bottom:1rem;font-size:0.9rem;">' + file + (line ? ':' + line + (column ? ':' + column : '') : '') + '</div>' : '';
-            // Try to extract source context from error message
-            let sourceContext = '';
-            let lines = message.split('\n');
-            if (lines.length > 1) {
-                sourceContext = lines.map((line, i) => {
-                    let lineClass = line.includes('error') || line.includes('Error') ? 'color:#ff4444;' : 'color:#e0e0e0;';
-                    return '<div style="' + lineClass + 'white-space:pre;padding-left:2rem;">' + line.replace(/</g, '&lt;').replace(/>/g, '&gt;') + '</div>';
-                }).join('');
-            } else {
-                sourceContext = '<pre style="color:#fff;white-space:pre-wrap;font-size:0.9rem;">' + message.replace(/</g, '&lt;').replace(/>/g, '&gt;') + '</pre>';
-            }
-            // Stack trace section
-            let stackHtml = '';
-            if (stack) {
-                let stackLines = stack.split('\n').map(s => {
-                    return '<div style="color:#aaa;white-space:pre;padding-left:2rem;font-size:0.85rem;">' + s.replace(/</g, '&lt;').replace(/>/g, '&gt;') + '</div>';
-                }).join('');
-                stackHtml = '<div style="color:#888;font-size:0.8rem;margin-top:1rem;margin-bottom:0.5rem;">Stack Trace:</div>' +
-                    '<div style="background:#111;border:1px solid #222;border-radius:8px;padding:1rem;margin-bottom:1rem;overflow:auto;">' + stackLines + '</div>';
-            }
-            overlay.innerHTML =
-                '<div style="max-width:900px;margin:0 auto;flex:1;">' +
-                '<div style="display:flex;align-items:center;gap:0.5rem;margin-bottom:1rem;">' +
-                '<span style="color:#ff4444;font-size:1.5rem;">&#9888;</span>' +
-                '<span style="color:#ff4444;font-size:1.3rem;font-weight:600;">Pledge Build Error</span>' +
-                '</div>' +
-                fileHtml +
-                '<div style="background:#1a1a1a;border:1px solid #333;border-radius:8px;padding:1rem;margin-bottom:1rem;overflow:auto;">' + sourceContext + '</div>' +
-                stackHtml +
-                '<div style="color:#666;font-size:0.8rem;">Fix the error and save to reload. The overlay will disappear automatically.</div>' +
-                '<button onclick="clearPledgeError()" style="margin-top:1rem;padding:0.5rem 1rem;background:#333;color:#fff;border:1px solid #555;border-radius:4px;cursor:pointer;font-family:inherit;">Close</button>' +
-                '</div>';
-        }
-        function clearPledgeError() {
-            let overlay = document.getElementById('__pledge_error_overlay');
-            if (overlay) overlay.remove();
-        }
-        function showPledgeServerReload(message) {
-            let banner = document.getElementById('__pledge_server_reload');
-            if (!banner) {
-                banner = document.createElement('div');
-                banner.id = '__pledge_server_reload';
-                banner.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:99998;background:#1a1a2e;color:#7c3aed;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;padding:0.75rem;text-align:center;font-size:0.9rem;border-bottom:1px solid #7c3aed;';
-                document.body.appendChild(banner);
-            }
-            banner.textContent = '⟳ ' + (message || 'Server reloading...');
-        }
-        function clearPledgeServerReload() {
-            let banner = document.getElementById('__pledge_server_reload');
-            if (banner) banner.remove();
-        }
-        // Listen for successful HMR updates to clear errors
-        window.addEventListener('pledge:hmr-success', clearPledgeError);
-
-        // Runtime error overlay — catch unhandled browser errors and display in overlay
-        window.addEventListener('error', function(event) {
-            if (event.error || event.message) {
-                var msg = event.error && event.error.message ? event.error.message : (event.message || 'Unknown runtime error');
-                var file = event.filename || '';
-                var line = event.lineno || 0;
-                var col = event.colno || 0;
-                var stack = event.error && event.error.stack ? event.error.stack : '';
-                showPledgeError(msg, file, stack, line, col);
-            }
-        });
-
-        // Catch unhandled promise rejections and display in overlay
-        window.addEventListener('unhandledrejection', function(event) {
-            var reason = event.reason;
-            var msg = reason && reason.message ? reason.message : String(reason);
-            var stack = reason && reason.stack ? reason.stack : '';
-            showPledgeError('Unhandled Promise Rejection: ' + msg, '', stack, 0, 0);
-        });
-    </script>
-</body>"#;
-
     // Rewrite relative paths to absolute paths based on base_dir
     // e.g., ./index.tsx → /src/index.tsx, ./styles.css → /src/styles.css
     if let Some(base) = base_dir {
@@ -1493,7 +1339,7 @@ async fn index_handler(State(state): State<Arc<DevServerState>>) -> impl IntoRes
     // Inject import map for bare specifiers (react, react-dom, etc.)
     // Skip if HTML already contains an import map (e.g., from shell generator)
     if !html.contains("type=\"importmap\"") {
-        let import_map = generate_import_map(&state.config);
+        let import_map = generate_import_map(&state.config, &state.prebundled_deps);
         if !import_map.is_empty() {
             let map_tag = format!("<script type=\"importmap\">\n{}\n</script>\n", import_map);
             if html.contains("</head>") {
@@ -1506,14 +1352,7 @@ async fn index_handler(State(state): State<Arc<DevServerState>>) -> impl IntoRes
         }
     }
 
-    // Replace the closing </body> with HMR script + </body>
-    if html.contains("</body>") {
-        html = html.replace("</body>", &format!("{}\n</body>", hmr_script));
-    } else {
-        // No </body> tag, just append
-        html.push_str(hmr_script);
-        html.push_str("</body></html>");
-    }
+    inject_hmr_client(&mut html);
 
     Html(html)
 }
@@ -1533,8 +1372,12 @@ async fn app_route_handler(
         .unwrap_or(false);
 
     if has_extension {
-        return module_handler(State(state), Path(path), wants_module(query.as_deref(), &headers))
-            .await;
+        return module_handler(
+            State(state),
+            Path(path),
+            wants_module(query.as_deref(), &headers),
+        )
+        .await;
     }
 
     // Non-asset path — serve the index.html shell for client-side routing
@@ -1562,7 +1405,7 @@ async fn app_route_handler(
                         "<title>PledgeStack</title>".to_string(),
                     ),
                 };
-            let import_map = generate_import_map(&state.config);
+            let import_map = generate_import_map(&state.config, &state.prebundled_deps);
             shell_generator::generate_html_shell(&html_attrs, &head_content, "", &import_map)
         }
     };
@@ -1579,7 +1422,7 @@ async fn app_route_handler(
     // Inject import map for bare specifiers (react, react-dom, etc.)
     // Skip if HTML already contains an import map (e.g., from shell generator)
     if !html.contains("type=\"importmap\"") {
-        let import_map = generate_import_map(&state.config);
+        let import_map = generate_import_map(&state.config, &state.prebundled_deps);
         if !import_map.is_empty() {
             let map_tag = format!("<script type=\"importmap\">\n{}\n</script>\n", import_map);
             if html.contains("</head>") {
@@ -1593,150 +1436,7 @@ async fn app_route_handler(
     }
 
     // Inject HMR client script before </body>
-    let hmr_script = r#"
-    <script>
-        window.__pledge_vue_components = window.__pledge_vue_components || {};
-        window.__pledge_svelte_components = window.__pledge_svelte_components || {};
-        window.__pledge_solid_hmr = window.__pledge_solid_hmr || [];
-        window.__pledge_fast_refresh = window.__pledge_fast_refresh || function(name, reload) {
-          (window.__pledge_fast_refresh_registry = window.__pledge_fast_refresh_registry || {})[name] = reload;
-        };
-        window.__pledge_hmr_modules = window.__pledge_hmr_modules || {};
-        let __pledge_ws;
-        let __pledge_ws_reconnect_delay = 1000;
-        let __pledge_ws_max_delay = 30000;
-        let __pledge_ws_current_delay = __pledge_ws_reconnect_delay;
-        let __pledge_ws_closed_by_user = false;
-        function __pledge_connect_ws() {
-            const ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/__pledge_hmr');
-            window.__pledge_ws = ws;
-            ws.onmessage = (event) => {
-                const data = JSON.parse(event.data);
-                if (data.type === 'update') {
-                    console.log('[pledge] HMR update:', data.path);
-                    clearPledgeError();
-                    __pledge_ws_current_delay = __pledge_ws_reconnect_delay;
-                    if (data.path) {
-                        if (data.path.endsWith('.module.css') && data.moduleMap) {
-                            // CSS Modules HMR: re-import to get updated class name mappings
-                            import(data.path + '?t=' + Date.now()).then(() => {
-                                console.log('[pledge] CSS Module HMR:', data.path);
-                                window.dispatchEvent(new CustomEvent('pledge:hmr-success'));
-                            }).catch((err) => {
-                                console.error('[pledge] CSS Module HMR failed:', err);
-                                location.reload();
-                            });
-                        } else if (data.path.endsWith('.css') || data.css) {
-                            if (data.css) { updatePledgeCSS(data.path, data.css); }
-                            else { fetchPledgeCSS(data.path); }
-                        } else {
-                            // JS HMR: check for accept callbacks (true HMR) before falling back to script tag reload
-                            if (window.__pledge_hot_accept_callbacks && window.__pledge_hot_accept_callbacks[data.path] && window.__pledge_hot_accept_callbacks[data.path].length > 0) {
-                                const oldCallbacks = window.__pledge_hot_accept_callbacks[data.path].slice();
-                                import(data.path + '?t=' + Date.now()).then((newModule) => {
-                                    console.log('[pledge] HMR accept:', data.path);
-                                    oldCallbacks.forEach(cb => {
-                                        try { cb(newModule); } catch(e) { console.error('[pledge] HMR accept error:', e); }
-                                    });
-                                    window.dispatchEvent(new CustomEvent('pledge:hmr-success'));
-                                }).catch((err) => {
-                                    console.error('[pledge] HMR accept failed, reloading:', err);
-                                    location.reload();
-                                });
-                            } else {
-                                const links = document.querySelectorAll('script[src="' + data.path + '"]');
-                                links.forEach(link => {
-                                    const newLink = document.createElement('script');
-                                    newLink.type = 'module';
-                                    newLink.src = data.path + '?t=' + Date.now();
-                                    link.replaceWith(newLink);
-                                });
-                            }
-                        }
-                        if (data.deps && data.deps.length > 0) {
-                            data.deps.forEach((depPath) => {
-                                if (depPath.endsWith('.css')) { fetchPledgeCSS(depPath); }
-                                else {
-                                    const depLinks = document.querySelectorAll('script[src="' + depPath + '"]');
-                                    depLinks.forEach(link => {
-                                        const newLink = document.createElement('script');
-                                        newLink.type = 'module';
-                                        newLink.src = depPath + '?t=' + Date.now();
-                                        link.replaceWith(newLink);
-                                    });
-                                }
-                            });
-                        }
-                    }
-                } else if (data.type === 'error') {
-                    showPledgeError(data.message, data.file, data.stack, data.line, data.column);
-                } else if (data.type === 'connected') {
-                    console.log('[pledge] HMR connected');
-                } else if (data.type === 'server-reload') {
-                    console.log('[pledge] Server reloading:', data.message);
-                    showPledgeServerReload(data.message);
-                } else if (data.type === 'server-reload-complete') {
-                    console.log('[pledge] Server reloaded:', data.message);
-                    clearPledgeServerReload();
-                }
-            };
-            ws.onopen = () => { console.log('[pledge] HMR connected'); __pledge_ws_current_delay = __pledge_ws_reconnect_delay; };
-            ws.onclose = () => {
-                if (__pledge_ws_closed_by_user) return;
-                console.warn('[pledge] HMR disconnected — reconnecting in ' + __pledge_ws_current_delay + 'ms');
-                setTimeout(() => {
-                    __pledge_ws_current_delay = Math.min(__pledge_ws_current_delay * 2, __pledge_ws_max_delay);
-                    __pledge_connect_ws();
-                }, __pledge_ws_current_delay);
-            };
-            ws.onerror = () => {};
-        }
-        __pledge_connect_ws();
-        function updatePledgeCSS(path, cssContent) {
-            let styleId = '__pledge_style_' + path.replace(/[^a-zA-Z0-9]/g, '_');
-            let existing = document.getElementById(styleId);
-            if (!existing) { existing = document.createElement('style'); existing.id = styleId; document.head.appendChild(existing); }
-            existing.textContent = cssContent;
-        }
-        async function fetchPledgeCSS(path) {
-            try { const res = await fetch(path + '?t=' + Date.now()); const css = await res.text(); updatePledgeCSS(path, css); }
-            catch(e) { console.error('[pledge] CSS HMR fetch failed:', e); }
-        }
-        function showPledgeError(message, file, stack, line, column) {
-            let overlay = document.getElementById('__pledge_error_overlay');
-            if (!overlay) {
-                overlay = document.createElement('div');
-                overlay.id = '__pledge_error_overlay';
-                overlay.style.cssText = 'position:fixed;inset:0;z-index:99999;background:rgba(0,0,0,0.92);font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;padding:2rem;overflow:auto;display:flex;flex-direction:column;';
-                document.body.appendChild(overlay);
-            }
-            let fileHtml = file ? '<div style="color:#888;margin-bottom:1rem;font-size:0.9rem;">' + file + (line ? ':' + line + (column ? ':' + column : '') : '') + '</div>' : '';
-            let sourceContext = '<pre style="color:#fff;white-space:pre-wrap;font-size:0.9rem;">' + message.replace(/</g, '&lt;').replace(/>/g, '&gt;') + '</pre>';
-            overlay.innerHTML = '<div style="max-width:900px;margin:0 auto;flex:1;"><div style="display:flex;align-items:center;gap:0.5rem;margin-bottom:1rem;"><span style="color:#ff4444;font-size:1.5rem;">&#9888;</span><span style="color:#ff4444;font-size:1.3rem;font-weight:600;">Pledge Build Error</span></div>' + fileHtml + '<div style="background:#1a1a1a;border:1px solid #333;border-radius:8px;padding:1rem;margin-bottom:1rem;overflow:auto;">' + sourceContext + '</div><div style="color:#666;font-size:0.8rem;">Fix the error and save to reload.</div><button onclick="clearPledgeError()" style="margin-top:1rem;padding:0.5rem 1rem;background:#333;color:#fff;border:1px solid #555;border-radius:4px;cursor:pointer;font-family:inherit;">Close</button></div>';
-        }
-        function clearPledgeError() { let overlay = document.getElementById('__pledge_error_overlay'); if (overlay) overlay.remove(); }
-        function showPledgeServerReload(message) { let b = document.getElementById('__pledge_server_reload'); if (!b) { b = document.createElement('div'); b.id = '__pledge_server_reload'; b.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:99998;background:#1a1a2e;color:#7c3aed;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;padding:0.75rem;text-align:center;font-size:0.9rem;border-bottom:1px solid #7c3aed;'; document.body.appendChild(b); } b.textContent = '⟳ ' + (message || 'Server reloading...'); }
-        function clearPledgeServerReload() { let b = document.getElementById('__pledge_server_reload'); if (b) b.remove(); }
-        window.addEventListener('pledge:hmr-success', clearPledgeError);
-        window.addEventListener('error', function(event) {
-            if (event.error || event.message) {
-                var msg = event.error && event.error.message ? event.error.message : (event.message || 'Unknown runtime error');
-                showPledgeError(msg, event.filename || '', event.error && event.error.stack ? event.error.stack : '', event.lineno || 0, event.colno || 0);
-            }
-        });
-        window.addEventListener('unhandledrejection', function(event) {
-            var reason = event.reason;
-            showPledgeError('Unhandled Promise Rejection: ' + (reason && reason.message ? reason.message : String(reason)), '', reason && reason.stack ? reason.stack : '', 0, 0);
-        });
-    </script>
-</body>"#;
-
-    if html.contains("</body>") {
-        html = html.replace("</body>", &format!("{}\n</body>", hmr_script));
-    } else {
-        html.push_str(hmr_script);
-        html.push_str("</body></html>");
-    }
+    inject_hmr_client(&mut html);
 
     Html(html).into_response()
 }
@@ -1745,7 +1445,10 @@ async fn app_route_handler(
 /// This allows the browser to resolve bare imports without a bundler.
 /// For CJS-only packages (no ESM), use esm.sh CDN.
 /// For ESM packages, serve locally from node_modules.
-fn generate_import_map(config: &PledgeConfig) -> String {
+fn generate_import_map(
+    config: &PledgeConfig,
+    prebundled_deps: &std::collections::HashMap<String, String>,
+) -> String {
     let node_modules = config.root.join("node_modules");
     let mut imports = serde_json::Map::new();
 
@@ -1863,25 +1566,26 @@ fn generate_import_map(config: &PledgeConfig) -> String {
                         ))),
                     );
 
-                    // Add exports map entries
+                    // Add exports map entries — resolved through the shared
+                    // package-map matcher (conditions, arrays, nesting),
+                    // not a hand-rolled condition pick.
                     if let Some(exports) = pkg.get("exports")
                         && let Some(obj) = exports.as_object()
                     {
-                        for (export_key, export_val) in obj {
-                            if export_key == "." {
+                        let dev_conditions: Vec<String> =
+                            ["browser", "module", "import", "default"]
+                                .iter()
+                                .map(|s| s.to_string())
+                                .collect();
+                        for export_key in obj.keys() {
+                            if export_key == "." || export_key.contains('*') {
                                 continue;
                             }
-                            let resolved = if let Some(s) = export_val.as_str() {
-                                Some(s.to_string())
-                            } else if let Some(obj) = export_val.as_object() {
-                                obj.get("browser")
-                                    .or_else(|| obj.get("import"))
-                                    .or_else(|| obj.get("default"))
-                                    .and_then(|v| v.as_str())
-                                    .map(|s| s.to_string())
-                            } else {
-                                None
-                            };
+                            let resolved = pledgepack_resolver::package_map::resolve_exports_entry(
+                                exports,
+                                export_key,
+                                &dev_conditions,
+                            );
                             if let Some(resolved_path) = resolved {
                                 let full_key =
                                     format!("{}/{}", name, export_key.trim_start_matches("./"));
@@ -1899,6 +1603,13 @@ fn generate_import_map(config: &PledgeConfig) -> String {
                 }
             }
         }
+    }
+
+    // Pre-bundled deps win over every other mapping: CJS deps get their
+    // .pledge-deps interop bundle instead of the esm.sh CDN fallback, and
+    // ESM deps get the stable shim URL.
+    for (spec, url) in prebundled_deps {
+        imports.insert(spec.clone(), serde_json::Value::String(url.clone()));
     }
 
     // Build scopes for multi-version deduplication.
@@ -2287,7 +1998,13 @@ async fn module_handler(
 
     // For CJS-wrapped node_modules, skip Oxc transform and serve directly
     if skip_transform {
-        let rewritten = rewrite_imports(&source_str, &path, &state.config.resolve_alias);
+        let rewritten = rewrite_imports(
+            &source_str,
+            &path,
+            &state.config.resolve_alias,
+            &state.prebundled_deps,
+            &state.config.root,
+        );
         return serve_js_module(&path, &rewritten, None, &state).await;
     }
 
@@ -2310,15 +2027,17 @@ async fn module_handler(
             Ok(output) => output,
             Err(e) => {
                 // Send error to all HMR clients via WebSocket
+                let clean = format!("{:#}", e);
+                let location = pledge_diagnostics::parse_location(&clean);
                 let error_update = HmrUpdate {
                     update_type: "error".to_string(),
                     path: path.clone(),
-                    message: Some(format!("{}", e)),
+                    message: Some(clean.clone()),
                     file: Some(file_path.to_string()),
                     css: None,
-                    stack: Some(format!("{:?}", e)),
-                    line: None,
-                    column: None,
+                    stack: Some(clean),
+                    line: location.map(|l| l.0 as u32),
+                    column: location.map(|l| l.1 as u32),
                     deps: Vec::new(),
                     full_reload: None,
                     diff: None,
@@ -2488,6 +2207,8 @@ __existing.textContent = __css;
             &format!("{}\n{}", css_inject, transform_output.code),
             &path,
             &state.config.resolve_alias,
+            &state.prebundled_deps,
+            &state.config.root,
         );
         // Continue with normal JS module handling below using the combined code
         let transform_output = pledgepack_core::transform::TransformOutput {
@@ -2505,7 +2226,13 @@ __existing.textContent = __css;
     }
 
     // JS/TS files: rewrite imports and add HMR boundary
-    let transformed = rewrite_imports(&transform_output.code, &path, &state.config.resolve_alias);
+    let transformed = rewrite_imports(
+        &transform_output.code,
+        &path,
+        &state.config.resolve_alias,
+        &state.prebundled_deps,
+        &state.config.root,
+    );
     // Chain the plugins' map into the built-in transform's map so the browser
     // maps back to the file on disk, not the plugin's intermediate output.
     let source_map = match (
@@ -2571,15 +2298,16 @@ fn plugin_hook_error_response(
     e: &anyhow::Error,
 ) -> Response {
     let message = format!("{e:#}");
+    let location = pledge_diagnostics::parse_location(&message);
     let _ = state.hmr_tx.send(HmrUpdate {
         update_type: "error".to_string(),
         path: path.to_string(),
         message: Some(message.clone()),
         file: Some(file_path.to_string()),
         css: None,
-        stack: Some(format!("{e:?}")),
-        line: None,
-        column: None,
+        stack: Some(message.clone()),
+        line: location.map(|l| l.0 as u32),
+        column: location.map(|l| l.1 as u32),
         deps: Vec::new(),
         full_reload: None,
         diff: None,
@@ -2835,9 +2563,18 @@ fn resolve_relative_require(module_dir: &str, relative_path: &str) -> String {
 /// Bare specifiers like `react` are left as-is (browser must resolve via import map).
 fn rewrite_imports(
     code: &str,
-    _current_module_path: &str,
+    current_module_path: &str,
     aliases: &[pledgepack_core::PathAlias],
+    prebundled_deps: &std::collections::HashMap<String, String>,
+    root: &std::path::Path,
 ) -> String {
+    // Directory of the importing module on disk, used to pick the real
+    // extension for extensionless specifiers (`./util` → `./util.ts` when
+    // `util.ts` exists, not a blanket `.tsx`).
+    let importer_dir = root
+        .join(current_module_path.trim_start_matches('/'))
+        .parent()
+        .map(|p| p.to_path_buf());
     let mut result = code.to_string();
 
     // Rewrite relative import/export specifiers to include .tsx extension
@@ -2878,11 +2615,15 @@ fn rewrite_imports(
                     let spec_rest = &rest[spec_start..];
                     if let Some(end) = spec_rest.find(quote_char) {
                         let specifier = &spec_rest[..end];
+                        let abs_start = after_pattern + spec_start;
+                        let abs_end = abs_start + end;
                         if specifier.starts_with("./") || specifier.starts_with("../") {
-                            let new_spec = add_js_extension(specifier);
-                            let abs_start = after_pattern + spec_start;
-                            let abs_end = abs_start + end;
+                            let new_spec = add_js_extension(specifier, importer_dir.as_deref());
                             result.replace_range(abs_start..abs_end, &new_spec);
+                        } else if let Some(url) = prebundled_deps.get(specifier) {
+                            // Bare dynamic import of a pre-bundled dep.
+                            let url = url.clone();
+                            result.replace_range(abs_start..abs_end, &url);
                         }
                     }
                 }
@@ -2895,12 +2636,18 @@ fn rewrite_imports(
             if let Some(end) = rest.find(closing_quote) {
                 let specifier = &rest[..end];
                 if specifier.starts_with("./") || specifier.starts_with("../") {
-                    let new_spec = add_js_extension(specifier);
+                    let new_spec = add_js_extension(specifier, importer_dir.as_deref());
                     let abs_start = after_pattern;
                     let abs_end = abs_start + end;
                     result.replace_range(abs_start..abs_end, &new_spec);
                     // Advance past the rewritten specifier
                     search_from = abs_end + 1;
+                } else if let Some(url) = prebundled_deps.get(specifier) {
+                    // Bare import of a pre-bundled dep → its .pledge-deps URL.
+                    let url = url.clone();
+                    let abs_end = after_pattern + end;
+                    result.replace_range(after_pattern..abs_end, &url);
+                    search_from = after_pattern + url.len() + 1;
                 } else {
                     // Not a relative path, advance past it
                     search_from = after_pattern + end + 1;
@@ -2945,8 +2692,11 @@ fn rewrite_imports(
     result
 }
 
-/// Add .tsx extension to a relative specifier if it doesn't have one
-fn add_js_extension(specifier: &str) -> String {
+/// Add a JS extension to a relative specifier if it doesn't have one.
+/// When `importer_dir` is known, probe the filesystem for the real extension
+/// (`./util` next to `util.ts` → `./util.ts`, directory → `./dir/index.ts`);
+/// only fall back to `.tsx` when nothing on disk matches (virtual/plugin ids).
+fn add_js_extension(specifier: &str, importer_dir: Option<&std::path::Path>) -> String {
     // Check if it already has a JS-compatible extension
     let has_ext = specifier.ends_with(".js")
         || specifier.ends_with(".jsx")
@@ -2962,6 +2712,22 @@ fn add_js_extension(specifier: &str) -> String {
         format!("{specifier}?import")
     } else if has_ext {
         specifier.to_string()
+    } else if let Some(dir) = importer_dir {
+        let target = dir.join(specifier);
+        for ext in ["ts", "tsx", "js", "jsx", "mjs"] {
+            if target.with_extension(ext).is_file() {
+                return format!("{specifier}.{ext}");
+            }
+        }
+        // Directory import: `./components` → `./components/index.<ext>`
+        if target.is_dir() {
+            for ext in ["ts", "tsx", "js", "jsx", "mjs"] {
+                if target.join(format!("index.{ext}")).is_file() {
+                    return format!("{specifier}/index.{ext}");
+                }
+            }
+        }
+        format!("{specifier}.tsx")
     } else {
         // Use .tsx as default — the dev server module_handler tries
         // alternative extensions (.tsx, .ts, .jsx, .js) when serving
@@ -3433,153 +3199,15 @@ async fn entry_index_handler(
                         format!("<title>Pledge — {}</title>", entry.name),
                     ),
                 };
-            let import_map = generate_import_map(&state.config);
+            let import_map = generate_import_map(&state.config, &state.prebundled_deps);
             shell_generator::generate_html_shell(&html_attrs, &head_content, "", &import_map)
         }
     };
 
     // Inject HMR client script (same as index_handler)
-    let hmr_script = r#"
-    <script>
-        window.__pledge_vue_components = window.__pledge_vue_components || {};
-        window.__pledge_svelte_components = window.__pledge_svelte_components || {};
-        window.__pledge_solid_hmr = window.__pledge_solid_hmr || [];
-        window.__pledge_fast_refresh = window.__pledge_fast_refresh || function(name, reload) {
-          (window.__pledge_fast_refresh_registry = window.__pledge_fast_refresh_registry || {})[name] = reload;
-        };
-        window.__pledge_hmr_modules = window.__pledge_hmr_modules || {};
-        let __pledge_ws;
-        let __pledge_ws_reconnect_delay = 1000;
-        let __pledge_ws_max_delay = 30000;
-        let __pledge_ws_current_delay = __pledge_ws_reconnect_delay;
-        let __pledge_ws_closed_by_user = false;
-        function __pledge_connect_ws() {
-            const ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/__pledge_hmr');
-            window.__pledge_ws = ws;
-            ws.onmessage = (event) => {
-                const data = JSON.parse(event.data);
-                if (data.type === 'update') {
-                    console.log('[pledge] HMR update:', data.path);
-                    clearPledgeError();
-                    __pledge_ws_current_delay = __pledge_ws_reconnect_delay;
-                    if (data.path) {
-                        if (data.path.endsWith('.module.css') && data.moduleMap) {
-                            // CSS Modules HMR: re-import to get updated class name mappings
-                            import(data.path + '?t=' + Date.now()).then(() => {
-                                console.log('[pledge] CSS Module HMR:', data.path);
-                                window.dispatchEvent(new CustomEvent('pledge:hmr-success'));
-                            }).catch((err) => {
-                                console.error('[pledge] CSS Module HMR failed:', err);
-                                location.reload();
-                            });
-                        } else if (data.path.endsWith('.css') || data.css) {
-                            if (data.css) { updatePledgeCSS(data.path, data.css); }
-                            else { fetchPledgeCSS(data.path); }
-                        } else {
-                            // JS HMR: check for accept callbacks (true HMR) before falling back to script tag reload
-                            if (window.__pledge_hot_accept_callbacks && window.__pledge_hot_accept_callbacks[data.path] && window.__pledge_hot_accept_callbacks[data.path].length > 0) {
-                                const oldCallbacks = window.__pledge_hot_accept_callbacks[data.path].slice();
-                                import(data.path + '?t=' + Date.now()).then((newModule) => {
-                                    console.log('[pledge] HMR accept:', data.path);
-                                    oldCallbacks.forEach(cb => {
-                                        try { cb(newModule); } catch(e) { console.error('[pledge] HMR accept error:', e); }
-                                    });
-                                    window.dispatchEvent(new CustomEvent('pledge:hmr-success'));
-                                }).catch((err) => {
-                                    console.error('[pledge] HMR accept failed, reloading:', err);
-                                    location.reload();
-                                });
-                            } else {
-                                const links = document.querySelectorAll('script[src="' + data.path + '"]');
-                                links.forEach(link => {
-                                    const newLink = document.createElement('script');
-                                    newLink.type = 'module';
-                                    newLink.src = data.path + '?t=' + Date.now();
-                                    link.replaceWith(newLink);
-                                });
-                            }
-                        }
-                        if (data.deps && data.deps.length > 0) {
-                            data.deps.forEach((depPath) => {
-                                if (depPath.endsWith('.css')) { fetchPledgeCSS(depPath); }
-                                else {
-                                    const depLinks = document.querySelectorAll('script[src="' + depPath + '"]');
-                                    depLinks.forEach(link => {
-                                        const newLink = document.createElement('script');
-                                        newLink.type = 'module';
-                                        newLink.src = depPath + '?t=' + Date.now();
-                                        link.replaceWith(newLink);
-                                    });
-                                }
-                            });
-                        }
-                    }
-                } else if (data.type === 'error') {
-                    showPledgeError(data.message, data.file, data.stack, data.line, data.column);
-                } else if (data.type === 'connected') {
-                    console.log('[pledge] HMR connected');
-                } else if (data.type === 'server-reload') {
-                    console.log('[pledge] Server reloading:', data.message);
-                    showPledgeServerReload(data.message);
-                } else if (data.type === 'server-reload-complete') {
-                    console.log('[pledge] Server reloaded:', data.message);
-                    clearPledgeServerReload();
-                }
-            };
-            ws.onopen = () => { console.log('[pledge] HMR connected'); __pledge_ws_current_delay = __pledge_ws_reconnect_delay; };
-            ws.onclose = () => {
-                if (__pledge_ws_closed_by_user) return;
-                console.warn('[pledge] HMR disconnected — reconnecting in ' + __pledge_ws_current_delay + 'ms');
-                setTimeout(() => {
-                    __pledge_ws_current_delay = Math.min(__pledge_ws_current_delay * 2, __pledge_ws_max_delay);
-                    __pledge_connect_ws();
-                }, __pledge_ws_current_delay);
-            };
-            ws.onerror = () => {};
-        }
-        __pledge_connect_ws();
-        function updatePledgeCSS(path, cssContent) {
-            let styleId = '__pledge_style_' + path.replace(/[^a-zA-Z0-9]/g, '_');
-            let existing = document.getElementById(styleId);
-            if (!existing) { existing = document.createElement('style'); existing.id = styleId; document.head.appendChild(existing); }
-            existing.textContent = cssContent;
-        }
-        async function fetchPledgeCSS(path) {
-            try { const res = await fetch(path + '?t=' + Date.now()); const css = await res.text(); updatePledgeCSS(path, css); }
-            catch(e) { console.error('[pledge] CSS HMR fetch failed:', e); }
-        }
-        function showPledgeError(message, file, stack, line, column) {
-            let overlay = document.getElementById('__pledge_error_overlay');
-            if (!overlay) {
-                overlay = document.createElement('div');
-                overlay.id = '__pledge_error_overlay';
-                overlay.style.cssText = 'position:fixed;inset:0;z-index:99999;background:rgba(0,0,0,0.92);font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;padding:2rem;overflow:auto;display:flex;flex-direction:column;';
-                document.body.appendChild(overlay);
-            }
-            let fileHtml = file ? '<div style="color:#888;margin-bottom:1rem;font-size:0.9rem;">' + file + (line ? ':' + line + (column ? ':' + column : '') : '') + '</div>' : '';
-            let sourceContext = '<pre style="color:#fff;white-space:pre-wrap;font-size:0.9rem;">' + message.replace(/</g, '&lt;').replace(/>/g, '&gt;') + '</pre>';
-            overlay.innerHTML = '<div style="max-width:900px;margin:0 auto;flex:1;"><div style="display:flex;align-items:center;gap:0.5rem;margin-bottom:1rem;"><span style="color:#ff4444;font-size:1.5rem;">&#9888;</span><span style="color:#ff4444;font-size:1.3rem;font-weight:600;">Pledge Build Error</span></div>' + fileHtml + '<div style="background:#1a1a1a;border:1px solid #333;border-radius:8px;padding:1rem;margin-bottom:1rem;overflow:auto;">' + sourceContext + '</div><div style="color:#666;font-size:0.8rem;">Fix the error and save to reload.</div><button onclick="clearPledgeError()" style="margin-top:1rem;padding:0.5rem 1rem;background:#333;color:#fff;border:1px solid #555;border-radius:4px;cursor:pointer;font-family:inherit;">Close</button></div>';
-        }
-        function clearPledgeError() { let overlay = document.getElementById('__pledge_error_overlay'); if (overlay) overlay.remove(); }
-        function showPledgeServerReload(message) { let b = document.getElementById('__pledge_server_reload'); if (!b) { b = document.createElement('div'); b.id = '__pledge_server_reload'; b.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:99998;background:#1a1a2e;color:#7c3aed;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;padding:0.75rem;text-align:center;font-size:0.9rem;border-bottom:1px solid #7c3aed;'; document.body.appendChild(b); } b.textContent = '⟳ ' + (message || 'Server reloading...'); }
-        function clearPledgeServerReload() { let b = document.getElementById('__pledge_server_reload'); if (b) b.remove(); }
-        window.addEventListener('pledge:hmr-success', clearPledgeError);
-        window.addEventListener('error', function(event) {
-            if (event.error || event.message) {
-                var msg = event.error && event.error.message ? event.error.message : (event.message || 'Unknown runtime error');
-                showPledgeError(msg, event.filename || '', event.error && event.error.stack ? event.error.stack : '', event.lineno || 0, event.colno || 0);
-            }
-        });
-        window.addEventListener('unhandledrejection', function(event) {
-            var reason = event.reason;
-            showPledgeError('Unhandled Promise Rejection: ' + (reason && reason.message ? reason.message : String(reason)), '', reason && reason.stack ? reason.stack : '', 0, 0);
-        });
-    </script>
-</body>"#;
-
     // Inject import map (skip if already present from shell generator)
     if !html.contains("type=\"importmap\"") {
-        let import_map = generate_import_map(&state.config);
+        let import_map = generate_import_map(&state.config, &state.prebundled_deps);
         if !import_map.is_empty() {
             let map_tag = format!("<script type=\"importmap\">\n{}\n</script>\n", import_map);
             if html.contains("</head>") {
@@ -3592,12 +3220,7 @@ async fn entry_index_handler(
         }
     }
 
-    if html.contains("</body>") {
-        html = html.replace("</body>", &format!("{}\n</body>", hmr_script));
-    } else {
-        html.push_str(hmr_script);
-        html.push_str("</body></html>");
-    }
+    inject_hmr_client(&mut html);
 
     Html(html).into_response()
 }
@@ -4144,7 +3767,13 @@ async fn virtual_id_handler(
                         return (StatusCode::PAYLOAD_TOO_LARGE, "Response too large")
                             .into_response();
                     }
-                    let rewritten = rewrite_imports(&code, &path, &state.config.resolve_alias);
+                    let rewritten = rewrite_imports(
+                        &code,
+                        &path,
+                        &state.config.resolve_alias,
+                        &state.prebundled_deps,
+                        &state.config.root,
+                    );
                     return serve_js_module(&path, &rewritten, map.as_deref(), &state).await;
                 }
                 Ok(None) => {}
@@ -4421,6 +4050,8 @@ mod review_regression_tests {
             "import(\u{6a21}\u{5757}); foo('./bar');",
             "src/main.ts",
             &[],
+            &std::collections::HashMap::new(),
+            std::path::Path::new("."),
         );
         // The unrelated string literal must not be treated as the import's
         // specifier.
@@ -4578,7 +4209,11 @@ mod bind_and_banner_tests {
     async fn localhost_binds_v4_and_v6_on_the_same_port() {
         let ls = bind_listeners("localhost", 0).await.unwrap();
         let addrs: Vec<SocketAddr> = ls.iter().map(|l| l.local_addr().unwrap()).collect();
-        assert!(addrs.iter().any(|a| a.ip() == IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        assert!(
+            addrs
+                .iter()
+                .any(|a| a.ip() == IpAddr::V4(Ipv4Addr::LOCALHOST))
+        );
         if std::net::TcpListener::bind("[::1]:0").is_ok() && addrs.len() > 1 {
             assert_eq!(addrs[0].port(), addrs[1].port());
             assert!(addrs[1].ip().is_loopback() && addrs[1].is_ipv6());
@@ -4610,8 +4245,57 @@ mod bind_and_banner_tests {
 
     #[test]
     fn json_specifiers_are_marked_as_module_imports() {
-        assert_eq!(add_js_extension("./data.json"), "./data.json?import");
-        assert_eq!(add_js_extension("./a.ts"), "./a.ts");
-        assert_eq!(add_js_extension("./a"), "./a.tsx");
+        assert_eq!(add_js_extension("./data.json", None), "./data.json?import");
+        assert_eq!(add_js_extension("./a.ts", None), "./a.ts");
+        assert_eq!(add_js_extension("./a", None), "./a.tsx");
+    }
+}
+
+#[cfg(test)]
+mod hmr_client_tests {
+    use super::*;
+
+    #[test]
+    fn hmr_client_is_a_single_balanced_script_tag() {
+        // The client used to live as three diverging inline copies. It now
+        // comes from `hmr_client.html` — pin the essential surface so a future
+        // edit can't silently drop a capability (framework HMR, CSS updates,
+        // the error overlay, WS reconnect).
+        assert_eq!(HMR_CLIENT_TAG.matches("<script>").count(), 1);
+        assert_eq!(HMR_CLIENT_TAG.matches("</script>").count(), 1);
+        for marker in [
+            "__pledge_connect_ws",
+            "__pledge_hmr_modules",
+            "__pledge_vue_components",
+            "__pledge_svelte_components",
+            "__pledge_fast_refresh",
+            "__pledge_hot_accept_callbacks",
+            "pledge:hmr-success",
+            "showPledgeError",
+            "updatePledgeCSS",
+            "unhandledrejection",
+            ".vue",
+            ".svelte",
+        ] {
+            assert!(HMR_CLIENT_TAG.contains(marker), "missing {marker}");
+        }
+    }
+
+    #[test]
+    fn inject_hmr_client_places_script_before_body_close_once() {
+        let mut html = "<html><body><div>app</div></body></html>".to_string();
+        inject_hmr_client(&mut html);
+        let script_at = html.find("<script>").unwrap();
+        let body_close = html.find("</body>").unwrap();
+        assert!(script_at < body_close);
+        assert_eq!(html.matches("</body>").count(), 1);
+    }
+
+    #[test]
+    fn inject_hmr_client_appends_when_no_body_tag() {
+        let mut html = "<html><div>app</div></html>".to_string();
+        inject_hmr_client(&mut html);
+        assert!(html.contains("<script>"));
+        assert!(html.ends_with("</body></html>"));
     }
 }

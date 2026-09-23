@@ -1,0 +1,10 @@
+Open the PledgePack Playground — interactive transform REPL (#66)
+
+Usage: pledgepack playground [OPTIONS]
+
+Options:
+  -p, --port <PORT>      Port to serve the playground on
+      --root <ROOT>      Project root directory (default: current directory)
+      --config <CONFIG>  Config file path (default: auto-detect pledge.json)
+      --strict           Treat config-file problems (unknown / misspelled keys) as errors
+  -h, --help             Print help

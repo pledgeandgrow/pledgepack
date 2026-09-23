@@ -35,10 +35,17 @@ pub fn node_polyfills() -> HashMap<&'static str, &'static str> {
     map
 }
 
-/// Check if a specifier is a Node.js built-in module
+/// Check if a specifier is a Node.js built-in module.
+/// Every `node:…` specifier is a builtin (the prefix is reserved), and bare
+/// builtins match on their first path segment so `fs/promises`,
+/// `stream/web`, `timers/promises`, … are covered too.
 pub fn is_node_builtin(specifier: &str) -> bool {
+    if let Some(rest) = specifier.strip_prefix("node:") {
+        return !rest.is_empty();
+    }
+    let head = specifier.split('/').next().unwrap_or(specifier);
     matches!(
-        specifier,
+        head,
         "buffer"
             | "process"
             | "path"

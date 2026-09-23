@@ -11,8 +11,13 @@
 use anyhow::Result;
 use dashmap::DashMap;
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+/// `package.json` `exports`/`imports` map matching — pure matching logic,
+/// shared with `pledgepack-core` (which re-exports this module).
+pub mod package_map;
 
 /// Resolves module specifiers (imports/exports) to on-disk file paths.
 ///
@@ -38,8 +43,9 @@ pub struct Resolver {
     aliases: Vec<Alias>,
     /// Custom conditions for package.json exports resolution (#119)
     custom_conditions: Vec<String>,
-    /// Optional workspace info for monorepo resolution (#98)
-    workspace: Option<pledgepack_core::ecosystem::WorkspaceInfo>,
+    /// Optional workspace packages for monorepo resolution (#98), keyed by
+    /// package name (e.g. `"@acme/ui"` → its workspace package).
+    workspace: Option<HashMap<String, WorkspacePackage>>,
     /// Target runtime used to derive export condition priority
     runtime: ResolveRuntime,
     /// Module type used to derive export condition priority
@@ -80,6 +86,101 @@ impl Default for ResolveRuntime {
     }
 }
 
+/// A workspace (monorepo) package as the resolver needs it: the on-disk
+/// package directory plus its package.json entry points. This is a subset of
+/// `pledgepack_core::ecosystem::WorkspacePackage` — keeping it here is what
+/// lets the resolver be a leaf crate the engine can depend on.
+#[derive(Debug, Clone, Default)]
+pub struct WorkspacePackage {
+    /// Package directory (contains `package.json`).
+    pub path: PathBuf,
+    /// `main` field, if any.
+    pub main: Option<String>,
+    /// `module` field, if any.
+    pub module: Option<String>,
+    /// `exports` field, if any.
+    pub exports: Option<serde_json::Value>,
+}
+
+/// Resolve a bare specifier against workspace packages: package `exports` for
+/// subpaths, `module`/`main`/index files for the package root, then direct
+/// file + extension probing. Returns the resolved file path when found.
+///
+/// `extensions` are probed in order for extensionless subpaths
+/// (e.g. `[".ts", ".tsx", ".js", ".jsx", ".mjs", ".json"]`).
+pub fn resolve_workspace_import(
+    specifier: &str,
+    packages: &HashMap<String, WorkspacePackage>,
+    extensions: &[String],
+) -> Option<PathBuf> {
+    // Scoped names are two path segments: "@scope/name[/sub…]".
+    let (pkg_name, subpath) = if let Some(rest) = specifier.strip_prefix('@') {
+        match rest.find('/') {
+            Some(first) => match rest[first + 1..].find('/') {
+                Some(second) => (
+                    &specifier[..first + second + 2],
+                    Some(&rest[first + second + 2..]),
+                ),
+                None => (specifier, None),
+            },
+            None => (specifier, None),
+        }
+    } else if let Some(pos) = specifier.find('/') {
+        (&specifier[..pos], Some(&specifier[pos + 1..]))
+    } else {
+        (specifier, None)
+    };
+
+    let pkg = packages.get(pkg_name)?;
+    if let Some(sub) = subpath {
+        // `exports` encapsulates the package: an unlisted subpath must not
+        // probe files directly (Node's PACKAGE_PATH_NOT_EXPORTED).
+        if let Some(exports) = &pkg.exports {
+            if let Some(obj) = exports.as_object() {
+                let key = format!("./{}", sub);
+                if let Some(v) = obj.get(&key).and_then(|v| v.as_str()) {
+                    let p = pkg.path.join(v);
+                    if p.is_file() {
+                        return Some(p);
+                    }
+                }
+            }
+            return None;
+        }
+        let direct = pkg.path.join(sub);
+        if direct.is_file() {
+            return Some(direct);
+        }
+        for ext in extensions {
+            let ext = ext.trim_start_matches('.');
+            let p = direct.with_extension(ext);
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+    } else {
+        if let Some(m) = &pkg.module {
+            let p = pkg.path.join(m);
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+        if let Some(m) = &pkg.main {
+            let p = pkg.path.join(m);
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+        for idx in ["index.ts", "index.tsx", "index.js", "index.jsx"] {
+            let p = pkg.path.join(idx);
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
 /// Module system of the importing module. Determines whether "import"/"module"
 /// or "require" conditions are preferred.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -98,12 +199,14 @@ pub struct ResolveContext {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct TsConfig {
     compiler_options: Option<CompilerOptions>,
     extends: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct CompilerOptions {
     base_url: Option<String>,
     paths: Option<std::collections::HashMap<String, Vec<String>>>,
@@ -140,6 +243,24 @@ fn canonicalize_or_warn(path: PathBuf) -> PathBuf {
             );
             path
         }
+    }
+}
+
+/// One lookup in a `browser` object map: string values are package-relative
+/// replacement file paths; `false`/`null` means "stub this module out",
+/// which a file-path resolver cannot represent — it is skipped so resolution
+/// falls through to the ordinary file (no worse than having no map at all).
+fn browser_map_lookup(
+    browser_obj: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    module_path: &Path,
+) -> Result<Option<PathBuf>> {
+    match browser_obj.get(key).and_then(|v| v.as_str()) {
+        Some(target) => {
+            let p = module_path.join(target.trim_start_matches("./"));
+            Ok(p.is_file().then(|| canonicalize_or_warn(p)))
+        }
+        None => Ok(None),
     }
 }
 
@@ -210,12 +331,15 @@ impl Resolver {
         }
     }
 
-    /// Create a resolver with workspace info (#98)
+    /// Create a resolver with workspace packages for monorepo resolution (#98).
+    /// `workspace` maps package names to their [`WorkspacePackage`]; build it
+    /// from `pledgepack_core::ecosystem::detect_workspace` (or any scan) — see
+    /// `WorkspaceInfo::resolver_packages` in core.
     pub fn with_workspace(
         root: PathBuf,
         extensions: Vec<String>,
         aliases: Vec<Alias>,
-        workspace: pledgepack_core::ecosystem::WorkspaceInfo,
+        workspace: HashMap<String, WorkspacePackage>,
     ) -> Self {
         Self {
             root,
@@ -248,6 +372,22 @@ impl Resolver {
             module_type: context.module_type,
             cache: Arc::new(DashMap::new()),
         }
+    }
+
+    /// Attach workspace packages to an existing resolver — for callers that
+    /// constructed it via `with_conditions`/`with_context` and only learn the
+    /// workspace map later.
+    pub fn set_workspace(&mut self, workspace: HashMap<String, WorkspacePackage>) {
+        self.workspace = Some(workspace);
+    }
+
+    /// Set the resolution context (target runtime + importer module type) on
+    /// an existing resolver — for callers that built it via
+    /// `with_conditions`/`with_workspace` and need to drive condition
+    /// priority afterwards.
+    pub fn set_context(&mut self, context: ResolveContext) {
+        self.runtime = context.runtime;
+        self.module_type = context.module_type;
     }
 
     /// Create a resolver from tsconfig.json or jsconfig.json
@@ -393,7 +533,16 @@ impl Resolver {
                 // Ensure boundary: rest must be empty, start with '/', or the
                 // alias must end with '/' (already a path boundary).
                 if rest.is_empty() || rest.starts_with('/') || alias.from.ends_with('/') {
-                    let path = PathBuf::from(&alias.to).join(rest);
+                    // `join("")` appends a trailing separator — a file path
+                    // plus "/" is not a file. Exact alias hits use `to` as-is.
+                    // `rest` keeps its leading `/` (`@/` → `/components/x`) —
+                    // join() would treat that as a root and discard `to`, so
+                    // strip it first.
+                    let path = if rest.is_empty() {
+                        PathBuf::from(&alias.to)
+                    } else {
+                        PathBuf::from(&alias.to).join(rest.trim_start_matches('/'))
+                    };
                     if let Some(resolved) = self.try_resolve_path(&path)? {
                         return Ok(resolved);
                     }
@@ -431,8 +580,7 @@ impl Resolver {
 
         // 5. Bare specifier → workspace packages (#98)
         if let Some(ref ws) = self.workspace
-            && let Some(resolved) =
-                pledgepack_core::ecosystem::resolve_workspace_import(specifier, ws)
+            && let Some(resolved) = resolve_workspace_import(specifier, ws, &self.extensions)
         {
             return Ok(resolved);
         }
@@ -628,10 +776,18 @@ impl Resolver {
         if pkg_json.is_file()
             && let Ok(content) = std::fs::read_to_string(&pkg_json)
             && let Ok(pkg) = serde_json::from_str::<serde_json::Value>(&content)
-            && let Some(resolved) =
-                self.resolve_package_entry(module_path, &pkg, subpath, specifier)?
         {
-            return Ok(Some(resolved));
+            if let Some(resolved) =
+                self.resolve_package_entry(module_path, &pkg, subpath, specifier)?
+            {
+                return Ok(Some(resolved));
+            }
+            // `exports` encapsulates the package: a subpath it doesn't list
+            // is not reachable by direct-file probing (Node's
+            // PACKAGE_PATH_NOT_EXPORTED).
+            if pkg.get("exports").is_some() {
+                return Ok(None);
+            }
         }
 
         // Try direct file resolution for subpath
@@ -653,7 +809,7 @@ impl Resolver {
         module_path: &Path,
         pkg: &serde_json::Value,
         subpath: Option<&str>,
-        specifier: &str,
+        _specifier: &str,
     ) -> Result<Option<PathBuf>> {
         // 1. Try "exports" field (modern)
         if let Some(exports) = pkg.get("exports")
@@ -662,7 +818,48 @@ impl Resolver {
             return Ok(Some(resolved));
         }
 
-        // 2. Try "module" field (ESM preference)
+        // 2. "browser" field — browser builds only. The object form maps
+        // *package-relative module paths* (`"./server.js": "./browser.js"`)
+        // and wins over module/main for the keys it covers (webpack/
+        // browserify semantics); the string form replaces the entry point.
+        if self.runtime == ResolveRuntime::Browser
+            && let Some(browser) = pkg.get("browser")
+        {
+            if let Some(browser_str) = browser.as_str() {
+                if subpath.is_none() {
+                    let entry_path = module_path.join(browser_str);
+                    if entry_path.is_file() {
+                        return Ok(Some(canonicalize_or_warn(entry_path)));
+                    }
+                }
+            } else if let Some(browser_obj) = browser.as_object() {
+                // Subpath forms: "pkg/lib/server" is looked up as
+                // "./lib/server", "./lib/server.js", "./lib/server/index.js".
+                if let Some(sub) = subpath {
+                    let sub = sub.trim_start_matches('/');
+                    for key in [
+                        format!("./{sub}"),
+                        format!("./{sub}.js"),
+                        format!("./{sub}/index.js"),
+                    ] {
+                        if let Some(resolved) = browser_map_lookup(browser_obj, &key, module_path)?
+                        {
+                            return Ok(Some(resolved));
+                        }
+                    }
+                }
+                // Entry form: the map key is the *would-be* entry file
+                // ("./main.js" → "./main.browser.js").
+                if subpath.is_none()
+                    && let Some(resolved) =
+                        self.browser_entry_override(browser_obj, pkg, module_path)?
+                {
+                    return Ok(Some(resolved));
+                }
+            }
+        }
+
+        // 3. Try "module" field (ESM preference)
         if subpath.is_none() {
             if let Some(module) = pkg.get("module").and_then(|v| v.as_str()) {
                 let entry_path = module_path.join(module);
@@ -671,7 +868,7 @@ impl Resolver {
                 }
             }
 
-            // 3. Try "main" field
+            // 4. Try "main" field
             if let Some(main) = pkg.get("main").and_then(|v| v.as_str()) {
                 let entry_path = module_path.join(main);
                 if entry_path.is_file() {
@@ -680,38 +877,30 @@ impl Resolver {
             }
         }
 
-        // 4. Try "browser" field for browser-specific builds
-        if subpath.is_none()
-            && let Some(browser) = pkg.get("browser")
-        {
-            if let Some(browser_str) = browser.as_str() {
-                // String: replace the package entry with this file.
-                let entry_path = module_path.join(browser_str);
-                if entry_path.is_file() {
-                    return Ok(Some(canonicalize_or_warn(entry_path)));
-                }
-            } else if let Some(browser_obj) = browser.as_object() {
-                // Object: per-module mapping. Check if the current specifier (or
-                // the entry subpath) matches a key in the browser map.
-                let target = subpath.unwrap_or(".");
-                let replacement = browser_obj
-                    .get(target)
-                    .or_else(|| browser_obj.get(specifier));
-                if let Some(repl) = replacement {
-                    if let Some(repl_str) = repl.as_str() {
-                        let entry_path = module_path.join(repl_str);
-                        if entry_path.is_file() {
-                            return Ok(Some(canonicalize_or_warn(entry_path)));
-                        }
-                    } else if repl.is_null() {
-                        // null means stub this module out. A data: URL cannot be
-                        // represented as a PathBuf, so we skip it here and let
-                        // resolution continue/fail naturally.
-                    }
-                }
+        Ok(None)
+    }
+
+    /// Look up the entry file a package *would* resolve to (`module`, then
+    /// `main`, then `index.js`) in a `browser` object map — the browserify
+    /// form where the map key is the main field's path, e.g.
+    /// `"browser": {"./lib/node.js": "./lib/browser.js"}`.
+    fn browser_entry_override(
+        &self,
+        browser_obj: &serde_json::Map<String, serde_json::Value>,
+        pkg: &serde_json::Value,
+        module_path: &Path,
+    ) -> Result<Option<PathBuf>> {
+        let entry = pkg
+            .get("module")
+            .and_then(|v| v.as_str())
+            .or_else(|| pkg.get("main").and_then(|v| v.as_str()))
+            .unwrap_or("index.js")
+            .trim_start_matches("./");
+        for key in [format!("./{entry}"), entry.to_string()] {
+            if let Some(resolved) = browser_map_lookup(browser_obj, &key, module_path)? {
+                return Ok(Some(resolved));
             }
         }
-
         Ok(None)
     }
 
@@ -735,13 +924,24 @@ impl Resolver {
                 if name.starts_with(&prefix) {
                     let real_path = entry.path().join("node_modules").join(pkg_name);
                     let pkg_json = real_path.join("package.json");
-                    if pkg_json.is_file()
-                        && let Ok(content) = std::fs::read_to_string(&pkg_json)
-                        && let Ok(pkg) = serde_json::from_str::<serde_json::Value>(&content)
-                        && let Some(resolved) =
-                            self.resolve_package_entry(&real_path, &pkg, subpath, specifier)?
-                    {
-                        return Ok(Some(resolved));
+                    let pkg = if pkg_json.is_file() {
+                        std::fs::read_to_string(&pkg_json)
+                            .ok()
+                            .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+                    } else {
+                        None
+                    };
+                    if let Some(pkg) = &pkg {
+                        if let Some(resolved) =
+                            self.resolve_package_entry(&real_path, pkg, subpath, specifier)?
+                        {
+                            return Ok(Some(resolved));
+                        }
+                        // `exports` encapsulates the package — no direct-file
+                        // probing for unlisted subpaths.
+                        if pkg.get("exports").is_some() {
+                            continue;
+                        }
                     }
 
                     // Try direct file resolution for subpath
@@ -915,8 +1115,18 @@ impl Resolver {
             if pkg_json_path.is_file()
                 && let Ok(content) = std::fs::read_to_string(&pkg_json_path)
                 && let Ok(pkg) = serde_json::from_str::<serde_json::Value>(&content)
-                && let Some(imports) = pkg.get("imports").and_then(|v| v.as_object())
             {
+                // Node package-scope semantics: the *nearest* package.json
+                // bounds the scope. If it has no `imports` field the `#`
+                // specifier is unresolvable — we must NOT keep climbing to an
+                // ancestor package.json that happens to have one.
+                let Some(imports) = pkg.get("imports").and_then(|v| v.as_object()) else {
+                    anyhow::bail!(
+                        "package \"imports\" specifier '{specifier}' cannot be resolved: \
+                         {} has no \"imports\" field",
+                        pkg_json_path.display()
+                    );
+                };
                 let hit = if let Some(mapping) = imports.get(specifier)
                     && !specifier.contains('*')
                 {
@@ -926,17 +1136,24 @@ impl Resolver {
                         .map(|(key, star)| (&imports[key], Some(star)))
                 };
                 if let Some((mapping, star)) = hit {
-                    return self.resolve_target(
+                    if let Some(p) = self.resolve_target(
                         mapping,
                         &current,
                         star.as_deref(),
                         true,
                         Some(importer),
+                    )? {
+                        return Ok(Some(p));
+                    }
+                    anyhow::bail!(
+                        "package \"imports\" specifier '{specifier}' maps to {mapping} \
+                         which does not exist"
                     );
                 }
-                // imports are package-scoped: once we find a package.json
-                // with an imports field, stop searching upwards.
-                return Ok(None);
+                anyhow::bail!(
+                    "package \"imports\" specifier '{specifier}' is not defined in {}",
+                    pkg_json_path.display()
+                );
             }
             if !current.pop() {
                 break;
@@ -946,9 +1163,10 @@ impl Resolver {
     }
 }
 
-// Pattern-key matching for `exports`/`imports` maps is shared with the build
-// engine: see `pledgepack_core::package_map`.
-use pledgepack_core::package_map::best_pattern_match;
+// Pattern-key matching for `exports`/`imports` maps lives in this crate's
+// `package_map` module (shared with the build engine, which re-exports it as
+// `pledgepack_core::package_map`).
+use crate::package_map::best_pattern_match;
 
 /// Derive export/imports condition priority from a resolution context.
 ///

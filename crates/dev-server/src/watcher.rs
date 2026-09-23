@@ -306,8 +306,7 @@ fn watch_windows(
         FILE_ACTION_RENAMED_OLD_NAME, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OVERLAPPED,
         FILE_LIST_DIRECTORY, FILE_NOTIFY_CHANGE_CREATION, FILE_NOTIFY_CHANGE_DIR_NAME,
         FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE,
-        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
-        ReadDirectoryChangesW,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, ReadDirectoryChangesW,
     };
     use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
     use windows_sys::Win32::System::Threading::{CreateEventW, ResetEvent, WaitForSingleObject};
@@ -421,7 +420,10 @@ fn watch_windows(
     let mut debouncer = Debouncer::new(Duration::from_millis(config.debounce_ms));
     let mut last_activity = std::time::SystemTime::now();
 
-    info!("Native Windows file watcher started on {}", pledgepack_core::display_path(&root));
+    info!(
+        "Native Windows file watcher started on {}",
+        pledgepack_core::display_path(root)
+    );
 
     loop {
         // Sleep until either the kernel completes the (single) pending
@@ -472,7 +474,7 @@ fn watch_windows(
                 // Rescan for anything modified since the last activity.
                 warn!(
                     "file watcher buffer overflow - rescanning {}",
-                    pledgepack_core::display_path(&root)
+                    pledgepack_core::display_path(root)
                 );
                 let since = last_activity - Duration::from_secs(1);
                 for path in rescan_modified_since(root, config, since) {
@@ -520,7 +522,9 @@ fn parse_notify_records(data: &[u8]) -> Vec<(u32, String)> {
             break;
         }
         let units: Vec<u16> = record[12..12 + name_len]
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .collect();
         out.push((action, String::from_utf16_lossy(&units)));
@@ -894,7 +898,7 @@ fn watch_notify_fallback(root: &Path, config: &WatcherConfig, tx: &mpsc::Sender<
 
     info!(
         "File watcher started (notify-debouncer fallback) on {}",
-        pledgepack_core::display_path(&root)
+        pledgepack_core::display_path(root)
     );
 
     loop {
@@ -1228,8 +1232,16 @@ mod fs_tests {
         let mut d = Debouncer::new(Duration::from_millis(100));
         let t0 = Instant::now();
         d.push("a".into(), EventKind::Create, t0);
-        d.push("b".into(), EventKind::Modify, t0 + Duration::from_millis(10));
-        d.push("a".into(), EventKind::Modify, t0 + Duration::from_millis(20));
+        d.push(
+            "b".into(),
+            EventKind::Modify,
+            t0 + Duration::from_millis(10),
+        );
+        d.push(
+            "a".into(),
+            EventKind::Modify,
+            t0 + Duration::from_millis(20),
+        );
         assert!(d.drain_ready(t0 + Duration::from_millis(50)).is_empty());
         let out = d.drain_ready(t0 + Duration::from_millis(115));
         assert_eq!(out.len(), 1);

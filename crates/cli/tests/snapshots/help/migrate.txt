@@ -1,0 +1,10 @@
+Migrate config from Vite/webpack/CRA/Next.js to pledge.config.ts
+
+Usage: pledgepack migrate [OPTIONS]
+
+Options:
+      --dry-run          Dry run — show what would be migrated without writing files
+      --root <ROOT>      Project root directory (default: current directory)
+      --config <CONFIG>  Config file path (default: auto-detect pledge.json)
+      --strict           Treat config-file problems (unknown / misspelled keys) as errors
+  -h, --help             Print help

@@ -851,7 +851,9 @@ impl TaskEngine {
                     .incremental_rebuild(&[id], self.dep_graph.as_ref());
             }
             Err(e) => {
-                error!("Task computation failed: {}: {}", id, e);
+                // Not logged at error level: the failure is returned to the
+                // caller, which reports it once (with a clean message).
+                tracing::debug!("Task computation failed: {}: {}", id, e);
                 self.dep_graph.set_status(id, TaskStatus::Error);
                 return Err(TaskError::ComputationFailed(e.to_string()));
             }

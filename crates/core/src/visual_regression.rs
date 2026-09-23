@@ -301,10 +301,20 @@ fn capture_screenshot(url: &str, width: u32, height: u32) -> Result<Vec<u8>> {
 /// dimensions are treated as completely different.
 fn compare_images(baseline: &Path, current: &Path) -> Result<f32> {
     let a = image::open(baseline)
-        .map_err(|e| anyhow::anyhow!("cannot decode baseline {}: {e}", crate::display_path(&baseline)))?
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "cannot decode baseline {}: {e}",
+                crate::display_path(baseline)
+            )
+        })?
         .to_rgba8();
     let b = image::open(current)
-        .map_err(|e| anyhow::anyhow!("cannot decode screenshot {}: {e}", crate::display_path(&current)))?
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "cannot decode screenshot {}: {e}",
+                crate::display_path(current)
+            )
+        })?
         .to_rgba8();
 
     if a.dimensions() != b.dimensions() {
@@ -321,10 +331,20 @@ fn compare_images(baseline: &Path, current: &Path) -> Result<f32> {
 /// Generate a diff image: unchanged pixels are dimmed, changed pixels red.
 fn generate_diff_image(baseline: &Path, current: &Path, output: &Path) -> Result<()> {
     let a = image::open(baseline)
-        .map_err(|e| anyhow::anyhow!("cannot decode baseline {}: {e}", crate::display_path(&baseline)))?
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "cannot decode baseline {}: {e}",
+                crate::display_path(baseline)
+            )
+        })?
         .to_rgba8();
     let b = image::open(current)
-        .map_err(|e| anyhow::anyhow!("cannot decode screenshot {}: {e}", crate::display_path(&current)))?
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "cannot decode screenshot {}: {e}",
+                crate::display_path(current)
+            )
+        })?
         .to_rgba8();
 
     let width = a.width().max(b.width());
@@ -342,7 +362,12 @@ fn generate_diff_image(baseline: &Path, current: &Path, output: &Path) -> Result
         }
     }
     diff.save_with_format(output, image::ImageFormat::Png)
-        .map_err(|e| anyhow::anyhow!("cannot write diff image {}: {e}", crate::display_path(&output)))?;
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "cannot write diff image {}: {e}",
+                crate::display_path(output)
+            )
+        })?;
     Ok(())
 }
 
@@ -379,7 +404,10 @@ pub fn format_visual_report(report: &VisualTestReport) -> String {
         if !result.passed
             && let Some(ref diff) = result.diff_path
         {
-            out.push_str(&format!("    \x1b[90mDiff: {}\x1b[0m\n", crate::display_path(&diff)));
+            out.push_str(&format!(
+                "    \x1b[90mDiff: {}\x1b[0m\n",
+                crate::display_path(diff)
+            ));
         }
     }
 

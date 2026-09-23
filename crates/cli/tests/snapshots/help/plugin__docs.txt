@@ -1,0 +1,13 @@
+Generate API docs from a plugin source file (#69)
+
+Usage: pledgepack plugin docs [OPTIONS] <FILE>
+
+Arguments:
+  <FILE>  Path to the plugin source file (index.js or index.ts)
+
+Options:
+  -o, --output <OUTPUT>  Output file path (default: stdout)
+      --root <ROOT>      Project root directory (default: current directory)
+      --config <CONFIG>  Config file path (default: auto-detect pledge.json)
+      --strict           Treat config-file problems (unknown / misspelled keys) as errors
+  -h, --help             Print help

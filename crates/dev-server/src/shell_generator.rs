@@ -372,12 +372,19 @@ pub fn try_extract_shell_from_project(root: &Path) -> Option<(String, String)> {
         if candidate.exists() {
             match std::fs::read_to_string(candidate) {
                 Ok(source) => {
-                    info!("Auto-generating HTML shell from {}", pledgepack_core::display_path(&candidate));
+                    info!(
+                        "Auto-generating HTML shell from {}",
+                        pledgepack_core::display_path(candidate)
+                    );
                     let (attrs, head) = extract_shell_from_layout(&source);
                     return Some((attrs, head));
                 }
                 Err(e) => {
-                    warn!("Failed to read {}: {}", pledgepack_core::display_path(&candidate), e);
+                    warn!(
+                        "Failed to read {}: {}",
+                        pledgepack_core::display_path(candidate),
+                        e
+                    );
                 }
             }
         }

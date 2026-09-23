@@ -3,6 +3,11 @@
 use crate::config::PledgeConfig;
 use crate::env::EnvVars;
 use globset::Glob;
+use oxc::ast::AstBuilder;
+use oxc::ast::ast::{Expression, Program};
+use oxc::ast_visit::VisitMut;
+use oxc::ast_visit::walk_mut;
+use oxc::span::SPAN;
 use std::path::Path;
 
 /// Replace import.meta.env.* with actual environment variable values from .env files
@@ -21,20 +26,21 @@ pub(super) fn replace_env_vars(code: &str, config: &PledgeConfig) -> String {
     env.inject_into_code(code, &config.env_prefix)
 }
 
-/// Inline process.env.* variables at build time (#51).
-/// Replaces process.env.NODE_ENV with "production" or "development",
-/// and inlines other process.env.* variables from the actual environment.
-/// Also eliminates dead branches that become unreachable after inlining
-/// (e.g., `if (process.env.NODE_ENV !== "production") { ... }` in production).
-pub(super) fn inline_process_env(code: &str, is_production: bool) -> String {
+/// Inline `process.env.*` variables sourced from the real build-time OS
+/// environment (`process.env.API_URL`, etc. — not `NODE_ENV`, which is
+/// handled separately and earlier by [`inline_node_env`], at the AST level,
+/// so dead branches it creates can be folded away by the minifier).
+///
+/// This part stays a plain text substitution: unlike `NODE_ENV`, these
+/// values are arbitrary and not known until build time, and nothing depends
+/// on constant-folding them away (no `if (process.env.API_URL) {}` dead-code
+/// pattern to worry about here).
+pub(super) fn inline_process_env(
+    code: &str,
+    _is_production: bool,
+    env_prefix: &[String],
+) -> String {
     let mut result = code.to_string();
-
-    let node_env = if is_production {
-        "\"production\""
-    } else {
-        "\"development\""
-    };
-    result = result.replace("process.env.NODE_ENV", node_env);
 
     let mut env_vars_to_replace: Vec<(String, String)> = Vec::new();
     let mut search_pos = 0;
@@ -45,7 +51,17 @@ pub(super) fn inline_process_env(code: &str, is_production: bool) -> String {
             .chars()
             .take_while(|c| c.is_alphanumeric() || *c == '_')
             .collect();
-        if !var_name.is_empty() && var_name != "NODE_ENV" {
+        // Security: only variables matching `env_prefix` are inlined. Reading
+        // an unprefixed name like `process.env.AWS_SECRET_ACCESS_KEY`
+        // previously pulled the real secret out of the OS environment and
+        // baked it into the shipped client bundle — the same exposure rule
+        // as `import.meta.env` now applies. Unmatched references are left as
+        // `process.env.X`, which is an `undefined` read at runtime rather
+        // than a leak.
+        let allowed = !var_name.is_empty()
+            && var_name != "NODE_ENV"
+            && env_prefix.iter().any(|p| var_name.starts_with(p.as_str()));
+        if allowed {
             let pattern = format!("process.env.{}", var_name);
             if !env_vars_to_replace.iter().any(|(p, _)| p == &pattern)
                 && let Ok(value) = std::env::var(&var_name)
@@ -57,174 +73,96 @@ pub(super) fn inline_process_env(code: &str, is_production: bool) -> String {
     }
 
     for (pattern, value) in env_vars_to_replace {
+        // serde_json produces a fully escaped JS string literal — escaping `\`
+        // before `"` manually still left newlines/control chars able to break
+        // out of the literal.
         let replacement = if value == "true" || value == "false" || value.parse::<f64>().is_ok() {
             value.clone()
         } else {
-            format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+            serde_json::to_string(&value).unwrap_or_else(|_| "\"\"".to_string())
         };
         result = result.replace(&pattern, &replacement);
     }
 
-    result = eliminate_dead_branches(&result);
-
     result
 }
 
-/// Eliminate dead branches that result from env var inlining.
-/// Handles simple if-statements with constant conditions.
-fn eliminate_dead_branches(code: &str) -> String {
-    let mut result = code.to_string();
-
-    let str_cmp_patterns: Vec<(&str, bool)> = vec![
-        ("\"production\" === \"production\"", true),
-        ("\"production\" !== \"production\"", false),
-        ("\"development\" === \"development\"", true),
-        ("\"development\" !== \"development\"", false),
-        ("\"production\" == \"production\"", true),
-        ("\"production\" != \"production\"", false),
-    ];
-
-    for (pattern, is_true) in &str_cmp_patterns {
-        let search = format!("if ({})", pattern);
-        while let Some(pos) = result.find(&search) {
-            if let Some((block_start, block_end)) = find_block_after(&result, pos + search.len()) {
-                let after = &result[block_end..];
-                if after.trim_start().starts_with("else") {
-                    let else_start = block_end + after.find("else").unwrap();
-                    if *is_true {
-                        if let Some((_, else_be)) = find_block_after(&result, else_start + 4) {
-                            let if_content = result[block_start + 1..block_end].to_string();
-                            result.replace_range(pos..else_be + 1, if_content.trim());
-                            continue;
-                        }
-                    } else {
-                        if let Some((else_bs, else_be)) = find_block_after(&result, else_start + 4)
-                        {
-                            let else_content = result[else_bs + 1..else_be].to_string();
-                            result.replace_range(pos..else_be + 1, else_content.trim());
-                            continue;
-                        }
-                    }
-                }
-                if *is_true {
-                    let if_content = result[block_start + 1..block_end].to_string();
-                    result.replace_range(pos..block_end + 1, if_content.trim());
-                } else {
-                    result.replace_range(pos..block_end + 1, "");
-                }
-            } else {
-                break;
-            }
-        }
-    }
-
-    while let Some(pos) = result.find("if (false)") {
-        if let Some((_block_start, block_end)) = find_block_after(&result, pos + "if (false)".len())
-        {
-            let after = &result[block_end..];
-            if after.trim_start().starts_with("else") {
-                let else_start = block_end + after.find("else").unwrap();
-                let _after_else = &result[else_start + 4..];
-                if let Some((else_bs, else_be)) = find_block_after(&result, else_start + 4) {
-                    let else_content = result[else_bs + 1..else_be].to_string();
-                    result.replace_range(pos..else_be + 1, else_content.trim());
-                    continue;
-                }
-            }
-            result.replace_range(pos..block_end + 1, "");
-        } else {
-            break;
-        }
-    }
-
-    while let Some(pos) = result.find("if (true)") {
-        if let Some((block_start, block_end)) = find_block_after(&result, pos + "if (true)".len()) {
-            let after = &result[block_end..];
-            if after.trim_start().starts_with("else") {
-                let else_start = block_end + after.find("else").unwrap();
-                if let Some((_, else_be)) = find_block_after(&result, else_start + 4) {
-                    let if_content = result[block_start + 1..block_end].to_string();
-                    result.replace_range(pos..else_be + 1, if_content.trim());
-                    continue;
-                }
-            }
-            let if_content = result[block_start + 1..block_end].to_string();
-            result.replace_range(pos..block_end + 1, if_content.trim());
-        } else {
-            break;
-        }
-    }
-
-    result
-}
-
-/// Find the { ... } block starting after the given position, handling nested braces.
-/// Returns (open_brace_pos, close_brace_pos) or None if no block found.
-fn find_block_after(code: &str, start: usize) -> Option<(usize, usize)> {
-    let mut pos = start;
-    while pos < code.len() && code.as_bytes()[pos].is_ascii_whitespace() {
-        pos += 1;
-    }
-    if pos >= code.len() || code.as_bytes()[pos] != b'{' {
-        return None;
-    }
-    let block_start = pos;
-    let mut depth = 1;
-    pos += 1;
-    while pos < code.len() && depth > 0 {
-        match code.as_bytes()[pos] {
-            b'{' => depth += 1,
-            b'}' => depth -= 1,
-            b'"' => {
-                pos += 1;
-                while pos < code.len() && code.as_bytes()[pos] != b'"' {
-                    if code.as_bytes()[pos] == b'\\' {
-                        pos += 1;
-                    }
-                    pos += 1;
-                }
-            }
-            b'\'' => {
-                pos += 1;
-                while pos < code.len() && code.as_bytes()[pos] != b'\'' {
-                    if code.as_bytes()[pos] == b'\\' {
-                        pos += 1;
-                    }
-                    pos += 1;
-                }
-            }
-            b'`' => {
-                pos += 1;
-                while pos < code.len() && code.as_bytes()[pos] != b'`' {
-                    if code.as_bytes()[pos] == b'\\' {
-                        pos += 1;
-                    }
-                    pos += 1;
-                }
-            }
-            b'/' if pos + 1 < code.len() && code.as_bytes()[pos + 1] == b'/' => {
-                while pos < code.len() && code.as_bytes()[pos] != b'\n' {
-                    pos += 1;
-                }
-            }
-            b'/' if pos + 1 < code.len() && code.as_bytes()[pos + 1] == b'*' => {
-                pos += 2;
-                while pos + 1 < code.len()
-                    && !(code.as_bytes()[pos] == b'*' && code.as_bytes()[pos + 1] == b'/')
-                {
-                    pos += 1;
-                }
-                pos += 1;
-            }
-            _ => {}
-        }
-        pos += 1;
-    }
-    if depth == 0 {
-        Some((block_start, pos - 1))
+/// Replace every `process.env.NODE_ENV` read with a string-literal AST node
+/// (`"production"` / `"development"`), in place, before minification runs.
+///
+/// This used to be a post-codegen text substitution followed by a hand-rolled
+/// `if (LITERAL op LITERAL) { ... }` pattern matcher meant to strip the now-
+/// dead branch (e.g. `if (process.env.NODE_ENV !== "production") { devOnly() }`
+/// in a production build). That matcher required exact unminified spacing
+/// (`"if (" `, `" === "`) — but it ran on code that had *already* been
+/// minified (minification happens in the same codegen call that produces the
+/// text it was matching against), so its patterns could never match a real
+/// production build and the dead branch always survived intact.
+///
+/// Doing the substitution here instead — on the AST, before
+/// `Minifier::minify` runs — means Oxc's own constant folder sees a literal
+/// vs. literal comparison and its dead-code elimination removes the branch
+/// as part of its normal compress pass. That's strictly more general than
+/// the old matcher too: it isn't limited to `if` statements with the current
+/// build's own value on one side (ternaries, `&&`/`||` short-circuits,
+/// `switch` on a literal, etc. all fold the same way), and it isn't
+/// sensitive to quote style or whitespace since it never touches text.
+pub(super) fn inline_node_env<'a>(
+    program: &mut Program<'a>,
+    ast: AstBuilder<'a>,
+    is_production: bool,
+) {
+    let literal = if is_production {
+        "production"
     } else {
-        None
+        "development"
+    };
+    let mut visitor = NodeEnvInliner { ast, literal };
+    visitor.visit_program(program);
+}
+
+struct NodeEnvInliner<'a> {
+    ast: AstBuilder<'a>,
+    literal: &'static str,
+}
+
+impl<'a> VisitMut<'a> for NodeEnvInliner<'a> {
+    fn visit_expression(&mut self, it: &mut Expression<'a>) {
+        if is_process_env_node_env(it) {
+            // `AstBuilder::alloc_string_literal` is deprecated in oxc 0.141
+            // pending a wider AstBuilder interface migration
+            // (oxc-project/oxc#23043) that has no released replacement yet —
+            // and building `StringLiteral` by hand isn't an option either,
+            // since the struct is `#[non_exhaustive]` outside its own crate.
+            // Until oxc ships the new interface, this is the only way to
+            // construct the node; suppressed narrowly rather than crate-wide.
+            #[allow(deprecated)]
+            let literal = self.ast.alloc_string_literal(SPAN, self.literal, None);
+            *it = Expression::StringLiteral(literal);
+            return;
+        }
+        walk_mut::walk_expression(self, it);
     }
+}
+
+/// True for the AST shape of `process.env.NODE_ENV` (a plain, non-optional
+/// member-access chain — `process?.env.NODE_ENV` and friends are left alone,
+/// since rewriting through optional chaining would change its short-circuit
+/// behavior on a missing `process` global).
+fn is_process_env_node_env(expr: &Expression) -> bool {
+    let Expression::StaticMemberExpression(outer) = expr else {
+        return false;
+    };
+    if outer.optional || outer.property.name.as_str() != "NODE_ENV" {
+        return false;
+    }
+    let Expression::StaticMemberExpression(inner) = &outer.object else {
+        return false;
+    };
+    if inner.optional || inner.property.name.as_str() != "env" {
+        return false;
+    }
+    matches!(&inner.object, Expression::Identifier(id) if id.name.as_str() == "process")
 }
 
 /// Replace compile-time constants defined in config.define.
@@ -244,7 +182,7 @@ pub(super) fn apply_define(
         {
             value.clone()
         } else {
-            format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+            serde_json::to_string(&value).unwrap_or_else(|_| "\"\"".to_string())
         };
         result = result.replace(key, &replacement);
     }
@@ -338,7 +276,7 @@ pub(super) fn expand_import_meta_glob(
                     let content = std::fs::read_to_string(abs_path).unwrap_or_else(|e| {
                         tracing::warn!(
                             "import.meta.glob ?raw: cannot read {}: {}",
-                            crate::display_path(&abs_path),
+                            crate::display_path(abs_path),
                             e
                         );
                         String::new()

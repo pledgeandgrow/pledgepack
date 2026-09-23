@@ -335,8 +335,10 @@ jobs:
       - name: Smoke-run each fuzz target (30s)
         working-directory: fuzz
         run: |
-          cargo +nightly fuzz run resolve_specifier -- -max_total_time=30
-          cargo +nightly fuzz run package_json_exports -- -max_total_time=30
+          for t in $(cargo +nightly fuzz list); do
+            echo "== fuzzing $t =="
+            cargo +nightly fuzz run "$t" -- -max_total_time=30
+          done
 
   # ── npm package dry-run (verify package.json is valid) ────────────────
   npm-dry-run:

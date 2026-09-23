@@ -11,29 +11,42 @@ use serde::{Deserialize, Serialize};
 use std::process::Command;
 
 /// NPM search result from registry API
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Every field is optional/defaulted and unknown fields are ignored: the
+/// registry adds fields over time and omits others (for example `keywords`
+/// and `description` on sparse packages), and a search must never fail
+/// because of a shape change.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct NpmSearchResult {
+    #[serde(default)]
     pub objects: Vec<NpmSearchObject>,
+    #[serde(default)]
     pub total: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NpmSearchObject {
     pub package: NpmPackage,
+    #[serde(default)]
     pub score: NpmScore,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NpmPackage {
     pub name: String,
+    #[serde(default)]
     pub version: String,
+    #[serde(default)]
     pub description: String,
+    #[serde(default)]
     pub keywords: Vec<String>,
+    #[serde(default)]
     pub links: NpmPackageLinks,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct NpmPackageLinks {
+    #[serde(default)]
     pub npm: String,
     #[serde(default)]
     pub repository: Option<String>,
@@ -41,12 +54,23 @@ pub struct NpmPackageLinks {
     pub homepage: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// `score` as returned by `registry.npmjs.org/-/v1/search`:
+/// `{ "final": 0.9, "detail": { "quality": .., "popularity": .., "maintenance": .. } }`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct NpmScore {
-    #[serde(rename = "final")]
+    #[serde(rename = "final", default)]
     pub final_score: f64,
+    #[serde(default)]
+    pub detail: NpmScoreDetail,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NpmScoreDetail {
+    #[serde(default)]
     pub quality: f64,
+    #[serde(default)]
     pub popularity: f64,
+    #[serde(default)]
     pub maintenance: f64,
 }
 
@@ -90,7 +114,12 @@ pub fn search_plugins(query: Option<&str>) -> Result<Vec<PluginInfo>> {
     let mut response = agent.get(&url).call()?;
 
     let body = response.body_mut().read_to_string()?;
-    let result: NpmSearchResult = serde_json::from_str(&body)?;
+    parse_search_response(&body)
+}
+
+/// Turn a registry search response body into plugin listings.
+pub fn parse_search_response(body: &str) -> Result<Vec<PluginInfo>> {
+    let result: NpmSearchResult = serde_json::from_str(body)?;
 
     let plugins: Vec<PluginInfo> = result
         .objects
@@ -100,9 +129,10 @@ pub fn search_plugins(query: Option<&str>) -> Result<Vec<PluginInfo>> {
                 || obj.package.keywords.iter().any(|k| k == "pledgepack")
         })
         .map(|obj| {
-            let install_count = (obj.score.popularity * 10000.0) as u32;
-            let rating =
-                ((obj.score.quality * 3.0 + obj.score.maintenance * 2.0) / 5.0 * 5.0) as f32;
+            let install_count = (obj.score.detail.popularity * 10000.0) as u32;
+            let rating = ((obj.score.detail.quality * 3.0 + obj.score.detail.maintenance * 2.0)
+                / 5.0
+                * 5.0) as f32;
             let category = obj
                 .package
                 .keywords
@@ -148,15 +178,25 @@ pub fn search_plugins(query: Option<&str>) -> Result<Vec<PluginInfo>> {
     Ok(plugins)
 }
 
-/// Install a plugin using the detected package manager
+/// Install a plugin using the detected package manager.
+/// Only npm uses `install <pkg>` — pnpm/yarn/bun add packages via `add`,
+/// and each has its own dev-dependency flag.
 pub fn install_plugin(plugin_name: &str, dev: bool) -> Result<()> {
     let (pm, _args) = detect_package_manager();
 
-    let mut cmd_args = vec!["install".to_string()];
+    let mut cmd_args: Vec<String> = match pm.as_str() {
+        "pnpm" | "yarn" | "bun" => vec!["add".to_string()],
+        _ => vec!["install".to_string()],
+    };
     if dev {
-        cmd_args.push("--save-dev".to_string());
-    } else if pm == "pnpm" {
-        cmd_args.push("--save".to_string());
+        cmd_args.push(
+            match pm.as_str() {
+                "bun" => "-d",
+                // npm, pnpm and yarn all accept -D
+                _ => "-D",
+            }
+            .to_string(),
+        );
     }
     cmd_args.push(plugin_name.to_string());
 
@@ -165,7 +205,15 @@ pub fn install_plugin(plugin_name: &str, dev: bool) -> Result<()> {
         plugin_name, pm
     );
 
-    let status = Command::new(&pm).args(&cmd_args).status()?;
+    // On Windows the package managers are .cmd shims — Command::new can't
+    // resolve the bare name, so spell the extension out (std routes .cmd
+    // through cmd.exe and escapes args for it).
+    let pm_bin = if cfg!(target_os = "windows") {
+        format!("{}.cmd", pm)
+    } else {
+        pm.clone()
+    };
+    let status = Command::new(&pm_bin).args(&cmd_args).status()?;
 
     if !status.success() {
         anyhow::bail!("Failed to install {} with {}", plugin_name, pm);
@@ -288,6 +336,9 @@ fn detect_package_manager() -> (String, Vec<String>) {
     }
     if cwd.join("yarn.lock").exists() {
         return ("yarn".to_string(), vec![]);
+    }
+    if cwd.join("bun.lockb").exists() || cwd.join("bun.lock").exists() {
+        return ("bun".to_string(), vec![]);
     }
     // Default to npm
     ("npm".to_string(), vec![])
@@ -590,6 +641,54 @@ pub fn unpin_plugin(name: &str, version: &str, cache_dir: &std::path::Path) -> R
 
 #[cfg(test)]
 mod tests {
+    /// Captured from `registry.npmjs.org/-/v1/search?text=pledgepack&size=2`
+    /// (scores live under `score.detail`, not directly on `score`).
+    const REAL_PLEDGEPACK_RESPONSE: &str =
+        include_str!("../../../tests/fixtures/npm-search-response.json");
+    const REAL_REACT_RESPONSE: &str = include_str!("../../../tests/fixtures/npm-search-react.json");
+
+    #[test]
+    fn parses_a_real_registry_response_with_nested_score_detail() {
+        let raw: NpmSearchResult = serde_json::from_str(REAL_PLEDGEPACK_RESPONSE).unwrap();
+        assert_eq!(raw.total, 1);
+        let obj = &raw.objects[0];
+        assert_eq!(obj.package.name, "pledgepack");
+        assert!(obj.score.final_score > 0.0);
+        assert_eq!(obj.score.detail.quality, 1.0);
+        assert_eq!(obj.score.detail.maintenance, 1.0);
+
+        let plugins = parse_search_response(REAL_PLEDGEPACK_RESPONSE).unwrap();
+        assert_eq!(plugins.len(), 1);
+        assert_eq!(plugins[0].name, "pledgepack");
+        assert!(plugins[0].url.contains("npmjs.com"));
+    }
+
+    #[test]
+    fn unrelated_real_results_are_filtered_not_fatal() {
+        let raw: NpmSearchResult = serde_json::from_str(REAL_REACT_RESPONSE).unwrap();
+        assert!(raw.objects.len() >= 2);
+        assert!(
+            parse_search_response(REAL_REACT_RESPONSE)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn tolerates_missing_and_unknown_fields() {
+        let body = r#"{"objects":[
+            {"package":{"name":"pledgepack-plugin-x","shiny":true},"future":1},
+            {"package":{"name":"pledgepack-plugin-y","version":"1.0.0","keywords":["css"],
+              "links":{"npm":"https://n/y"}},
+             "score":{"final":0.5}}
+        ],"total":2,"time":"now"}"#;
+        let plugins = parse_search_response(body).unwrap();
+        assert_eq!(plugins.len(), 2);
+        assert_eq!(plugins[1].category, "css");
+        assert_eq!(plugins[1].score, 0.5);
+        assert!(parse_search_response("{}").unwrap().is_empty());
+    }
+
     use super::*;
 
     #[test]

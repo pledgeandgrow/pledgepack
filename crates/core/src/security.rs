@@ -272,7 +272,10 @@ pub fn generate_csp_from_build(html: &str, out_dir: &Path) -> String {
     if let Err(e) = std::fs::write(&headers_path, &headers) {
         warn!("Failed to write _headers file: {}", e);
     } else {
-        info!("Generated CSP _headers file at {}", crate::display_path(&headers_path));
+        info!(
+            "Generated CSP _headers file at {}",
+            crate::display_path(&headers_path)
+        );
     }
 
     csp_gen.generate()
@@ -692,6 +695,173 @@ pub fn format_license_report(result: &LicenseCheckResult) -> String {
     out
 }
 
+// ── Post-build secret scan ────────────────────────────────────────────
+//
+// The bundler is the last choke point before code reaches a browser. By the
+// time a `ghp_…` token or a `.env` value is sitting inside an emitted chunk,
+// every earlier safeguard has already been bypassed — so the emitted output
+// itself gets scanned. Two confidence tiers:
+//
+//   * `Error` — recognized credential shapes (PEM blocks, AWS/GitHub/GCP/
+//     Slack/Stripe tokens) and literal `.env` values that were not covered by
+//     `env_prefix`. Effectively zero false positives; fails the build.
+//   * `Warn` — high-entropy string literals that match no known shape.
+//     Minified code and inline base64 can trip this, so it reports without
+//     failing.
+
+/// What was found in emitted output, with the secret itself redacted — a
+/// scan report that echoes the credential would re-leak it into CI logs.
+#[derive(Debug, Clone)]
+pub struct SecretFinding {
+    /// File path relative to the output directory.
+    pub file: String,
+    /// 1-based line number.
+    pub line: usize,
+    /// Credential shape, e.g. "GitHub token" or "env value `DB_PASSWORD`".
+    pub kind: String,
+    /// Where the secret appeared, with the middle elided (first 4 + last 2
+    /// chars only — enough to identify which key leaked, never enough to
+    /// use it).
+    pub redacted: String,
+    /// `true` = recognized credential / leaked env value → fail the build.
+    /// `false` = entropy-only heuristic → warn.
+    pub hard: bool,
+}
+
+fn redact(secret: &str) -> String {
+    let chars: Vec<char> = secret.chars().collect();
+    if chars.len() <= 8 {
+        return "***".to_string();
+    }
+    let head: String = chars[..4].iter().collect();
+    let tail: String = chars[chars.len() - 2..].iter().collect();
+    format!("{head}…{tail}")
+}
+
+/// Credential shapes matched verbatim in emitted code. All are documented,
+/// publicly-known token formats — a match is essentially never a false
+/// positive.
+const SECRET_PATTERNS: &[(&str, &str)] = &[
+    ("private key block", r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY( BLOCK)?-----"),
+    ("AWS access key", r"\b(?:AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16}\b"),
+    ("GitHub token", r"\b(?:ghp|gho|ghu|ghs|ghr|ghv)_[A-Za-z0-9]{36,}\b"),
+    ("GitHub fine-grained PAT", r"\bgithub_pat_[A-Za-z0-9_]{22,}\b"),
+    ("GCP API key", r"\bAIza[0-9A-Za-z_\-]{35}\b"),
+    ("Slack token", r"\bxox[baprs]-[0-9A-Za-z\-]{10,}\b"),
+    ("Stripe live key", r"\b[sr]k_live_[0-9A-Za-z]{16,}\b"),
+    ("npm token", r"\bnpm_[A-Za-z0-9]{36}\b"),
+    ("SendGrid key", r"\bSG\.[A-Za-z0-9_\-]{22}\.[A-Za-z0-9_\-]{43}\b"),
+    (
+        "generic bearer assignment",
+        r#"(?i)(?:api[_-]?key|api[_-]?secret|access[_-]?token|auth[_-]?token|client[_-]?secret)["']?\s*[:=]\s*["'][A-Za-z0-9_\-/.+=]{24,}["']"#,
+    ),
+];
+
+/// Minimum length for a `.env` value to be worth leak-checking — shorter
+/// values ("true", "8080", "dev") would flag every chunk.
+const MIN_ENV_VALUE_LEN: usize = 12;
+
+/// Shannon entropy of a byte string in bits/char.
+fn shannon_entropy(s: &str) -> f64 {
+    if s.is_empty() {
+        return 0.0;
+    }
+    let mut counts = [0usize; 256];
+    for b in s.bytes() {
+        counts[b as usize] += 1;
+    }
+    let n = s.len() as f64;
+    counts
+        .iter()
+        .filter(|&&c| c > 0)
+        .map(|&c| {
+            let p = c as f64 / n;
+            -p * p.log2()
+        })
+        .sum()
+}
+
+/// Scan one emitted file's contents for embedded secrets.
+///
+/// `leaked_env` is `(var_name, value)` pairs for `.env` variables that do
+/// NOT satisfy `env_prefix` — they must never appear in client output.
+/// Values are never stored or returned, only their names and a redaction.
+pub fn scan_code_for_secrets(
+    code: &str,
+    file: &str,
+    leaked_env: &[(String, String)],
+) -> Vec<SecretFinding> {
+    let mut findings = Vec::new();
+
+    for (kind, pattern) in SECRET_PATTERNS {
+        let re = regex::Regex::new(pattern).expect("static secret pattern");
+        for m in re.find_iter(code) {
+            let line = code[..m.start()].bytes().filter(|&b| b == b'\n').count() + 1;
+            findings.push(SecretFinding {
+                file: file.to_string(),
+                line,
+                kind: kind.to_string(),
+                redacted: redact(m.as_str()),
+                hard: true,
+            });
+        }
+    }
+
+    for (name, value) in leaked_env {
+        if value.len() >= MIN_ENV_VALUE_LEN && code.contains(value.as_str()) {
+            // Find the first occurrence's line for the report.
+            let pos = code.find(value.as_str()).unwrap_or(0);
+            let line = code[..pos].bytes().filter(|&b| b == b'\n').count() + 1;
+            findings.push(SecretFinding {
+                file: file.to_string(),
+                line,
+                kind: format!("non-public env value `{name}` inlined"),
+                redacted: redact(value),
+                hard: true,
+            });
+        }
+    }
+
+    // Entropy tier: quoted literals that look random. Skip strings inside
+    // sourcemap data URLs and integrity attributes — both are legitimately
+    // high-entropy.
+    let lit_re = regex::Regex::new(r#"["'`]([A-Za-z0-9+/=_\-]{24,})["'`]"#)
+        .expect("static literal pattern");
+    for cap in lit_re.captures_iter(code) {
+        let s = cap.get(1).unwrap().as_str();
+        if s.starts_with("sha256-") || s.starts_with("data:") {
+            continue;
+        }
+        if shannon_entropy(s) > 4.5 {
+            let pos = cap.get(0).unwrap().start();
+            let line = code[..pos].bytes().filter(|&b| b == b'\n').count() + 1;
+            findings.push(SecretFinding {
+                file: file.to_string(),
+                line,
+                kind: "high-entropy string (possible secret)".to_string(),
+                redacted: redact(s),
+                hard: false,
+            });
+        }
+    }
+
+    findings
+}
+
+/// Render findings for the console. Hard findings and warnings are split so
+/// the caller can fail the build on the former only.
+pub fn format_secret_findings(findings: &[SecretFinding]) -> String {
+    let mut out = String::new();
+    for f in findings {
+        let marker = if f.hard { "✗" } else { "?" };
+        out.push_str(&format!(
+            "  {marker} {}:{} — {} ({})\n",
+            f.file, f.line, f.kind, f.redacted
+        ));
+    }
+    out
+}
+
 // ── Utility ───────────────────────────────────────────────────────────
 
 fn simple_sha256(data: &[u8]) -> Vec<u8> {
@@ -760,5 +930,57 @@ mod tests {
     fn test_base64_encode() {
         assert_eq!(base64_encode(b"hello"), "aGVsbG8=");
         assert_eq!(base64_encode(b"hi"), "aGk=");
+    }
+
+    #[test]
+    fn scan_detects_github_token() {
+        let code = r#"const t = "ghp_abcdefghijklmnopqrstuvwxyz0123456789AB";"#;
+        let findings = scan_code_for_secrets(code, "chunk.js", &[]);
+        assert!(findings.iter().any(|f| f.hard && f.kind == "GitHub token"));
+    }
+
+    #[test]
+    fn scan_detects_private_key_block() {
+        let code = "const pem = \"-----BEGIN RSA PRIVATE KEY-----\\nMIIC...\"";
+        let findings = scan_code_for_secrets(code, "chunk.js", &[]);
+        assert!(findings.iter().any(|f| f.hard && f.kind == "private key block"));
+    }
+
+    #[test]
+    fn scan_detects_leaked_env_value() {
+        let leaked = vec![("DB_PASSWORD".to_string(), "sup3r-s3cret-p4ssw0rd".to_string())];
+        let code = r#"const cfg = { pass: "sup3r-s3cret-p4ssw0rd" };"#;
+        let findings = scan_code_for_secrets(code, "chunk.js", &leaked);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.hard && f.kind.contains("DB_PASSWORD")),
+            "expected env-leak finding, got {findings:?}"
+        );
+        // The value itself must never appear in the report — only a redaction.
+        assert!(!format_secret_findings(&findings).contains("sup3r-s3cret"));
+    }
+
+    #[test]
+    fn scan_ignores_clean_code_and_short_env_values() {
+        let code = "export function add(a, b) { return a + b; }";
+        let leaked = vec![
+            ("MODE".to_string(), "production".to_string()), // 10 chars — below min
+            ("PORT".to_string(), "3000".to_string()),
+        ];
+        let findings = scan_code_for_secrets(code, "chunk.js", &leaked);
+        assert!(
+            findings.iter().all(|f| !f.hard),
+            "clean code produced hard findings: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn scan_redaction_never_reveals_full_secret() {
+        let code = "const k = \"AKIAIOSFODNN7EXAMPLE\";";
+        let findings = scan_code_for_secrets(code, "c.js", &[]);
+        let report = format_secret_findings(&findings);
+        assert!(!report.contains("AKIAIOSFODNN7EXAMPLE"));
+        assert!(report.contains("AKIA"));
     }
 }

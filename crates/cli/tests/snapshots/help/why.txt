@@ -1,0 +1,12 @@
+Analyze why a module is included in the bundle (#82)
+
+Usage: pledgepack why [OPTIONS] <MODULE>
+
+Arguments:
+  <MODULE>  Module name or path to trace
+
+Options:
+      --root <ROOT>      Project root directory (default: current directory)
+      --config <CONFIG>  Config file path (default: auto-detect pledge.json)
+      --strict           Treat config-file problems (unknown / misspelled keys) as errors
+  -h, --help             Print help

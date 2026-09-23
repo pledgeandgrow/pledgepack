@@ -1,0 +1,14 @@
+Scaffold a new project (defaults to PledgeStack if no template given)
+
+Usage: pledgepack create [OPTIONS] [TEMPLATE] [NAME]
+
+Arguments:
+  [TEMPLATE]  Template name (pledge, react, vue, svelte, solid, next, tanstack, vanilla) If omitted, defaults to pledge
+  [NAME]      Project name / directory
+
+Options:
+      --flash            Flash create — skip wizard, git init, README; just get coding
+      --root <ROOT>      Project root directory (default: current directory)
+      --config <CONFIG>  Config file path (default: auto-detect pledge.json)
+      --strict           Treat config-file problems (unknown / misspelled keys) as errors
+  -h, --help             Print help

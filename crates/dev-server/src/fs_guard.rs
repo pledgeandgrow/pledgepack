@@ -97,8 +97,11 @@ pub fn is_lockfile(path: &Path) -> bool {
 fn component_denied(name: &str, parent: Option<&str>) -> bool {
     let lower = name.to_ascii_lowercase();
     if lower.starts_with('.') {
-        // node_modules/.pnpm holds real package files under pnpm layouts.
-        if lower == ".pnpm" && parent.is_some_and(|p| p.eq_ignore_ascii_case("node_modules")) {
+        // node_modules/.pnpm holds real package files under pnpm layouts;
+        // node_modules/.pledge-deps is our own dependency pre-bundle output.
+        if (lower == ".pnpm" || lower == ".pledge-deps")
+            && parent.is_some_and(|p| p.eq_ignore_ascii_case("node_modules"))
+        {
             return false;
         }
         return true;
@@ -277,12 +280,14 @@ mod tests {
             "src/main.tsx",
             "node_modules/react/index.js",
             "node_modules/.pnpm/react@18.0.0/node_modules/react/index.js",
+            "node_modules/.pledge-deps/react.js",
             "public/logo.svg",
         ] {
             assert!(!path_is_denied(Path::new(p)), "{p} should be allowed");
         }
-        // .pnpm outside node_modules is a plain dotdir
+        // .pnpm/.pledge-deps outside node_modules are plain dotdirs
         assert!(path_is_denied(Path::new("src/.pnpm/x.js")));
+        assert!(path_is_denied(Path::new("src/.pledge-deps/x.js")));
     }
 
     #[test]
@@ -303,18 +308,33 @@ mod tests {
 
         // package.json: refused as a plain file, allowed as a module import.
         let pj = root.join("package.json");
-        assert_eq!(resolve_servable(&root, "package.json", &pj), Err(Denied::Forbidden));
+        assert_eq!(
+            resolve_servable(&root, "package.json", &pj),
+            Err(Denied::Forbidden)
+        );
         assert!(resolve_servable_module(&root, "package.json", &pj).is_ok());
         // Case variants resolve to the same file and are refused too.
         let upper = root.join("PACKAGE.JSON");
         if upper.exists() {
-            assert_eq!(resolve_servable(&root, "PACKAGE.JSON", &upper), Err(Denied::Forbidden));
+            assert_eq!(
+                resolve_servable(&root, "PACKAGE.JSON", &upper),
+                Err(Denied::Forbidden)
+            );
         }
         // Lockfiles: never (either mode). Only the JSON ones pass the extension
         // allowlist, the YAML/.lock ones are refused by it as well.
-        for name in ["package-lock.json", "yarn.lock", "pnpm-lock.yaml", "npm-shrinkwrap.json"] {
+        for name in [
+            "package-lock.json",
+            "yarn.lock",
+            "pnpm-lock.yaml",
+            "npm-shrinkwrap.json",
+        ] {
             let p = root.join(name);
-            assert_eq!(resolve_servable(&root, name, &p), Err(Denied::Forbidden), "{name}");
+            assert_eq!(
+                resolve_servable(&root, name, &p),
+                Err(Denied::Forbidden),
+                "{name}"
+            );
             assert_eq!(
                 resolve_servable_module(&root, name, &p),
                 Err(Denied::Forbidden),

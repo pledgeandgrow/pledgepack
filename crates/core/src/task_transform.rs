@@ -463,6 +463,13 @@ impl TaskTransformEngine {
                         imports.push(dep);
                     }
                 }
+                // CJS `require("x")` calls are dependencies too.
+                imports.extend(scan_require_specifiers(&source_str));
+                imports.extend(
+                    scan_worker_specifiers(&source_str)
+                        .into_iter()
+                        .map(|s| format!("{s}?worker")),
+                );
 
                 let output = FileReadOutput {
                     source: source.clone(),
@@ -572,6 +579,12 @@ impl TaskTransformEngine {
                         deps.push(dep);
                     }
                 }
+                deps.extend(scan_require_specifiers(&source_clone));
+                deps.extend(
+                    scan_worker_specifiers(&source_clone)
+                        .into_iter()
+                        .map(|s| format!("{s}?worker")),
+                );
                 task_output.deps = deps;
 
                 Ok(StoredOutput::new(
@@ -657,6 +670,12 @@ impl TaskTransformEngine {
                         deps.push(dep);
                     }
                 }
+                deps.extend(scan_require_specifiers(&source_clone));
+                deps.extend(
+                    scan_worker_specifiers(&source_clone)
+                        .into_iter()
+                        .map(|s| format!("{s}?worker")),
+                );
                 task_output.deps = deps;
 
                 Ok(StoredOutput::new(
@@ -754,6 +773,12 @@ impl TaskTransformEngine {
                         deps.push(dep);
                     }
                 }
+                deps.extend(scan_require_specifiers(&source_clone));
+                deps.extend(
+                    scan_worker_specifiers(&source_clone)
+                        .into_iter()
+                        .map(|s| format!("{s}?worker")),
+                );
                 task_output.deps = deps;
 
                 Ok(StoredOutput::new(
@@ -779,9 +804,7 @@ impl TaskTransformEngine {
         &self,
         task: Task<TransformTaskOutput>,
     ) -> anyhow::Result<Arc<TransformTaskOutput>> {
-        task.read(&self.engine)
-            .await
-            .map_err(|e| anyhow::anyhow!("Transform task failed: {:?}", e))
+        task.read(&self.engine).await.map_err(task_error_to_anyhow)
     }
 
     /// Blocking variant of `read_transform` for rayon worker threads in
@@ -792,7 +815,7 @@ impl TaskTransformEngine {
         task: Task<TransformTaskOutput>,
     ) -> anyhow::Result<Arc<TransformTaskOutput>> {
         task.read_blocking(&self.engine)
-            .map_err(|e| anyhow::anyhow!("Transform task failed: {:?}", e))
+            .map_err(task_error_to_anyhow)
     }
 
     /// Blocking variant of `read_parse` for rayon worker threads.
@@ -965,6 +988,13 @@ fn parse_module_sync(
             imports.push(dep);
         }
     }
+    // CJS `require("x")` specifiers — the SIMD scan only sees import/export.
+    imports.extend(scan_require_specifiers(source));
+    imports.extend(
+        scan_worker_specifiers(source)
+            .into_iter()
+            .map(|s| format!("{s}?worker")),
+    );
 
     // AST traversal for exports and dynamic imports
     let (exports, has_default_export, dynamic_imports) =
@@ -1210,6 +1240,118 @@ fn extract_module_specifier(source: &str, offset: usize) -> Option<String> {
     None
 }
 
+/// Scan a module's source for CommonJS `require("specifier")` calls and
+/// return every literal specifier. The SIMD import scan only looks for
+/// `import`/`export` keywords — without this, a CJS dependency's internal
+/// `require("./cjs/x.js")` never enters the module graph and the emitted
+/// bundle keeps a browser-unresolvable `require` call.
+///
+/// Deliberately permissive: a false positive (e.g. `require` inside a string
+/// or comment) resolves to nothing and is dropped downstream; a false
+/// negative silently breaks the bundle.
+pub(crate) fn scan_require_specifiers(source: &str) -> Vec<String> {
+    scan_require_specifiers_loc(source)
+        .into_iter()
+        .map(|(_, spec)| spec)
+        .collect()
+}
+
+/// Same as [`scan_require_specifiers`] but each result carries the byte
+/// offset of the `require` token — callers resolving the specifier can use
+/// it to tell real calls apart from matches inside strings/comments.
+pub(crate) fn scan_require_specifiers_loc(source: &str) -> Vec<(usize, String)> {
+    let bytes = source.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while let Some(pos) = source[i..].find("require") {
+        let start = i + pos;
+        i = start + "require".len();
+        // Word boundary: not preceded or followed by an identifier char or `.`
+        // (`myrequire(`, `x.require(`, `requirement(` are not calls).
+        if start > 0 {
+            let c = bytes[start - 1];
+            if c.is_ascii_alphanumeric() || c == b'_' || c == b'$' || c == b'.' {
+                continue;
+            }
+        }
+        if i < bytes.len()
+            && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'$')
+        {
+            continue;
+        }
+        // Skip whitespace then require `(`.
+        let mut j = i;
+        while j < bytes.len() && (bytes[j] as char).is_whitespace() {
+            j += 1;
+        }
+        if j >= bytes.len() || bytes[j] != b'(' {
+            continue;
+        }
+        j += 1;
+        while j < bytes.len() && (bytes[j] as char).is_whitespace() {
+            j += 1;
+        }
+        if j >= bytes.len() || (bytes[j] != b'"' && bytes[j] != b'\'') {
+            continue;
+        }
+        let quote = bytes[j];
+        let spec_start = j + 1;
+        let mut k = spec_start;
+        while k < bytes.len() && bytes[k] != quote && bytes[k] != b'\n' {
+            k += 1;
+        }
+        if k < bytes.len() && bytes[k] == quote && k > spec_start {
+            out.push((start, source[spec_start..k].to_string()));
+            i = k + 1;
+        }
+    }
+    out
+}
+
+/// Scan a module's source for `new Worker(new URL("./x"))` /
+/// `new SharedWorker(new URL("./x"))` constructions and return the worker
+/// specifiers. The transform rewrites these to `new Worker("/src/x.js")`
+/// URLs, but nothing else discovers the worker file as a dependency — so
+/// the worker source would never be transformed or emitted. Discovered
+/// worker files are emitted as standalone bundles at their URL path.
+pub(crate) fn scan_worker_specifiers(source: &str) -> Vec<String> {
+    let bytes = source.as_bytes();
+    let mut out = Vec::new();
+    for pat in ["new Worker(", "new SharedWorker("] {
+        let mut i = 0usize;
+        while let Some(pos) = source[i..].find(pat) {
+            i += pos + pat.len();
+            // Skip whitespace, then require `new URL("…"` (possibly with the
+            // `import.meta.url` second argument — only the literal first
+            // argument is a static worker reference).
+            let mut j = i;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if !source[j..].starts_with("new URL(") {
+                continue;
+            }
+            j += "new URL(".len();
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j >= bytes.len() || (bytes[j] != b'"' && bytes[j] != b'\'') {
+                continue;
+            }
+            let quote = bytes[j];
+            let spec_start = j + 1;
+            let mut k = spec_start;
+            while k < bytes.len() && bytes[k] != quote && bytes[k] != b'\n' {
+                k += 1;
+            }
+            if k < bytes.len() && bytes[k] == quote && k > spec_start {
+                out.push(source[spec_start..k].to_string());
+            }
+        }
+    }
+    out
+}
+
 /// Compute a hash of the config for task ID computation.
 ///
 /// This ensures that changing config options (e.g., production mode,
@@ -1234,6 +1376,16 @@ fn config_hash(config: &PledgeConfig) -> u64 {
         config.define[key].hash(&mut hasher);
     }
     hasher.finish()
+}
+
+/// Surface a task failure as its own message. A failed transform already
+/// carries a rendered `error: ... --> file:line:col` frame; wrapping it in
+/// `{:?}` used to bury that under `Transform task failed: ComputationFailed(..)`.
+fn task_error_to_anyhow(e: pledgepack_task_system::TaskError) -> anyhow::Error {
+    match e {
+        pledgepack_task_system::TaskError::ComputationFailed(msg) => anyhow::anyhow!(msg),
+        other => anyhow::anyhow!("Transform task failed: {}", other),
+    }
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────

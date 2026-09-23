@@ -123,6 +123,18 @@ impl PackageManager {
         }
     }
 
+    /// Install-as-devDependency command (e.g. `pnpm add -D pledgepack`).
+    /// `install_cmd` lacks the flag, so this variant exists for tools like
+    /// pledgepack that belong in devDependencies.
+    pub fn install_dev_cmd(&self) -> &'static str {
+        match self {
+            Self::Npm => "npm install -D",
+            Self::Yarn => "yarn add -D",
+            Self::Pnpm => "pnpm add -D",
+            Self::Bun => "bun add -d",
+        }
+    }
+
     pub fn dev_cmd(&self) -> &'static str {
         match self {
             Self::Npm => "npx",
@@ -216,10 +228,23 @@ pub fn detect_project(root: &Path) -> ProjectDetection {
         DetectedFramework::Vanilla
     };
 
-    // Detect TypeScript
+    // Detect entry file
+    let entry_file = detect_entry_file(root, &framework);
+
+    // Detect TypeScript: a typescript dependency, a tsconfig, a TS entry
+    // (.ts/.tsx), or a TS build-tool config (vite.config.ts, ...).
     let typescript = deps.contains_key("typescript")
         || root.join("tsconfig.json").exists()
-        || root.join("jsconfig.json").exists();
+        || entry_file.ends_with(".ts")
+        || entry_file.ends_with(".tsx")
+        || [
+            "vite.config.ts",
+            "webpack.config.ts",
+            "next.config.ts",
+            "pledge.config.ts",
+        ]
+        .iter()
+        .any(|f| root.join(f).exists());
 
     // Detect CSS preprocessor
     let css_preprocessor = if deps.contains_key("tailwindcss") {
@@ -290,9 +315,6 @@ pub fn detect_project(root: &Path) -> ProjectDetection {
         BuildTool::Unknown
     };
 
-    // Detect entry file
-    let entry_file = detect_entry_file(root, &framework);
-
     ProjectDetection {
         framework,
         typescript,
@@ -317,7 +339,36 @@ fn detect_package_manager(root: &Path) -> PackageManager {
     }
 }
 
+/// First module `<script src="...">` referenced by the project's `index.html`
+/// (Vite-style HTML entry), when that file exists on disk.
+pub fn entry_from_html(root: &Path) -> Option<String> {
+    let html = std::fs::read_to_string(root.join("index.html")).ok()?;
+    let mut rest = html.as_str();
+    while let Some(pos) = rest.find("<script") {
+        let tag_end = rest[pos..].find('>').map(|e| pos + e)?;
+        let tag = &rest[pos..tag_end];
+        if let Some(src_pos) = tag.find("src=") {
+            let after = &tag[src_pos + 4..];
+            let quote = after.chars().next()?;
+            if quote == '"' || quote == '\'' {
+                let val = &after[1..];
+                if let Some(end) = val.find(quote) {
+                    let src = val[..end].trim_start_matches('/').trim_start_matches("./");
+                    if !src.starts_with("http") && root.join(src).is_file() {
+                        return Some(src.to_string());
+                    }
+                }
+            }
+        }
+        rest = &rest[tag_end..];
+    }
+    None
+}
+
 fn detect_entry_file(root: &Path, framework: &DetectedFramework) -> String {
+    if let Some(e) = entry_from_html(root) {
+        return e;
+    }
     let candidates = match framework {
         DetectedFramework::Next | DetectedFramework::Remix | DetectedFramework::Pledge => {
             vec![
@@ -410,4 +461,248 @@ export default defineConfig({{
         plugins = plugins_str,
         extra_fields = extra_fields.trim_end_matches(",\n"),
     )
+}
+
+/// Result of [`add_missing_scripts`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScriptsPatch {
+    /// The (possibly unchanged) package.json text.
+    pub text: String,
+    /// Scripts that were added.
+    pub added: Vec<String>,
+    /// `(name, existing command)` for scripts that already existed and were
+    /// left untouched.
+    pub kept: Vec<(String, String)>,
+}
+
+/// Add each `(name, command)` to package.json's `scripts` unless a script with
+/// that name already exists. The edit is textual so key order, indentation and
+/// formatting of the rest of the file are preserved. Returns `None` if
+/// `package_json` is not a JSON object (or `scripts` is not an object).
+pub fn add_missing_scripts(package_json: &str, wanted: &[(&str, &str)]) -> Option<ScriptsPatch> {
+    add_missing_entries(package_json, "scripts", wanted)
+}
+
+/// Same as [`add_missing_scripts`] but for an arbitrary top-level object
+/// member of package.json (e.g. `"devDependencies"`).
+pub fn add_missing_entries(
+    package_json: &str,
+    section: &str,
+    wanted: &[(&str, &str)],
+) -> Option<ScriptsPatch> {
+    let value: serde_json::Value = serde_json::from_str(package_json).ok()?;
+    let obj = value.as_object()?;
+    let existing = match obj.get(section) {
+        None => None,
+        Some(serde_json::Value::Object(m)) => Some(m),
+        Some(_) => return None,
+    };
+
+    let mut patch = ScriptsPatch {
+        text: package_json.to_string(),
+        ..Default::default()
+    };
+    let mut to_add: Vec<(&str, &str)> = Vec::new();
+    for (name, cmd) in wanted {
+        match existing.and_then(|m| m.get(*name)) {
+            Some(v) => patch
+                .kept
+                .push((name.to_string(), v.as_str().unwrap_or("").to_string())),
+            None => to_add.push((name, cmd)),
+        }
+    }
+    if to_add.is_empty() {
+        return Some(patch);
+    }
+
+    let nl = if package_json.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
+    let unit = package_json
+        .lines()
+        .find_map(|l| {
+            let ws: String = l.chars().take_while(|c| *c == ' ' || *c == '\t').collect();
+            (!ws.is_empty() && l.trim_start().starts_with('"')).then_some(ws)
+        })
+        .unwrap_or_else(|| "  ".to_string());
+    let entries = |indent: &str| -> String {
+        to_add
+            .iter()
+            .map(|(k, v)| {
+                format!(
+                    "{}{}: {}",
+                    indent,
+                    serde_json::to_string(k).unwrap_or_default(),
+                    serde_json::to_string(v).unwrap_or_default()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(&format!(",{}", nl))
+    };
+    let inner_indent = format!("{unit}{unit}");
+
+    let text = package_json;
+    let new_text = if existing.is_some() {
+        let key_pos = find_top_level_key(text, section)?;
+        let open = key_pos + text[key_pos..].find('{')?;
+        let close = matching_brace(text, open)?;
+        let body = text[open + 1..close].trim_end();
+        if body.trim().is_empty() {
+            format!(
+                "{}{{{nl}{}{nl}{}}}{}",
+                &text[..open],
+                entries(&inner_indent),
+                unit,
+                &text[close + 1..],
+                nl = nl
+            )
+        } else {
+            let keep_end = open + 1 + body.len();
+            format!(
+                "{},{nl}{}{}",
+                &text[..keep_end],
+                entries(&inner_indent),
+                &text[keep_end..],
+                nl = nl
+            )
+        }
+    } else {
+        let close = text.rfind('}')?;
+        let before = text[..close].trim_end();
+        let sep = if before.ends_with('{') { "" } else { "," };
+        format!(
+            "{}{sep}{nl}{unit}\"{section}\": {{{nl}{}{nl}{unit}}}{nl}{}",
+            before,
+            entries(&inner_indent),
+            &text[close..],
+            sep = sep,
+            nl = nl,
+            unit = unit,
+            section = section
+        )
+    };
+    patch.text = new_text;
+    patch.added = to_add.iter().map(|(k, _)| k.to_string()).collect();
+    Some(patch)
+}
+
+/// Byte offset of the `"key"` token for a depth-1 property of the root object.
+fn find_top_level_key(text: &str, key: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let needle = format!("\"{}\"", key);
+    let mut depth = 0i32;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                if depth == 1 && text[i..].starts_with(&needle) {
+                    let after = text[i + needle.len()..].trim_start();
+                    if after.starts_with(':') {
+                        return Some(i);
+                    }
+                }
+                i = string_end(bytes, i);
+            }
+            b'{' | b'[' => depth += 1,
+            b'}' | b']' => depth -= 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Index of the closing quote of the string starting at `start`.
+fn string_end(bytes: &[u8], start: usize) -> usize {
+    let mut i = start + 1;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 1,
+            b'"' => return i,
+            _ => {}
+        }
+        i += 1;
+    }
+    bytes.len().saturating_sub(1)
+}
+
+/// Index of the `}` matching the `{` at `open`.
+fn matching_brace(text: &str, open: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut depth = 0i32;
+    let mut i = open;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => i = string_end(bytes, i),
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+#[cfg(test)]
+mod scripts_tests {
+    use super::*;
+
+    const WANTED: &[(&str, &str)] = &[
+        ("dev", "pledgepack dev"),
+        ("build", "pledgepack build"),
+        ("preview", "pledgepack preview"),
+    ];
+
+    #[test]
+    fn adds_a_scripts_block_when_missing_and_stays_valid_json() {
+        let src = "{\n  \"name\": \"x\",\n  \"dependencies\": {\n    \"react\": \"18\"\n  }\n}\n";
+        let p = add_missing_scripts(src, WANTED).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&p.text).unwrap();
+        assert_eq!(v["scripts"]["dev"], "pledgepack dev");
+        assert_eq!(v["scripts"]["preview"], "pledgepack preview");
+        assert_eq!(v["dependencies"]["react"], "18");
+        assert_eq!(p.added, vec!["dev", "build", "preview"]);
+        // untouched key order
+        assert!(p.text.find("\"name\"").unwrap() < p.text.find("\"dependencies\"").unwrap());
+    }
+
+    #[test]
+    fn never_overwrites_existing_scripts() {
+        let src = "{\n  \"scripts\": {\n    \"dev\": \"vite\",\n    \"test\": \"vitest\"\n  }\n}";
+        let p = add_missing_scripts(src, WANTED).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&p.text).unwrap();
+        assert_eq!(v["scripts"]["dev"], "vite");
+        assert_eq!(v["scripts"]["test"], "vitest");
+        assert_eq!(v["scripts"]["build"], "pledgepack build");
+        assert_eq!(p.added, vec!["build", "preview"]);
+        assert_eq!(p.kept, vec![("dev".to_string(), "vite".to_string())]);
+    }
+
+    #[test]
+    fn handles_empty_scripts_and_no_changes() {
+        let p = add_missing_scripts("{\"scripts\": {}}", WANTED).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&p.text).unwrap();
+        assert_eq!(v["scripts"]["build"], "pledgepack build");
+        let all = "{\"scripts\":{\"dev\":\"a\",\"build\":\"b\",\"preview\":\"c\"}}";
+        let p = add_missing_scripts(all, WANTED).unwrap();
+        assert!(p.added.is_empty());
+        assert_eq!(p.text, all);
+        assert!(add_missing_scripts("[1]", WANTED).is_none());
+    }
+
+    #[test]
+    fn scripts_key_inside_dependencies_is_not_mistaken_for_the_block() {
+        let src = "{\"dependencies\":{\"scripts\":\"1.0.0\"},\"scripts\":{\"x\":\"y\"}}";
+        let p = add_missing_scripts(src, WANTED).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&p.text).unwrap();
+        assert_eq!(v["scripts"]["dev"], "pledgepack dev");
+        assert_eq!(v["dependencies"]["scripts"], "1.0.0");
+    }
 }

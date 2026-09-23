@@ -1,0 +1,10 @@
+Generate man pages for package managers (Homebrew, Scoop, etc.)
+
+Usage: pledgepack manpages [OPTIONS]
+
+Options:
+  -o, --output <OUTPUT>  Output directory for man page files
+      --root <ROOT>      Project root directory (default: current directory)
+      --config <CONFIG>  Config file path (default: auto-detect pledge.json)
+      --strict           Treat config-file problems (unknown / misspelled keys) as errors
+  -h, --help             Print help

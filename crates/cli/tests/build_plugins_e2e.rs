@@ -51,6 +51,9 @@ fn find_js(dist: &Path) -> Vec<PathBuf> {
         .flatten()
         .map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|e| e == "js"))
+        // __pp_manifest.js is runtime plumbing written directly by the
+        // emitter — not a renderChunk chunk, so plugin hooks don't apply.
+        .filter(|p| p.file_name().is_some_and(|n| n != "__pp_manifest.js"))
         .collect()
 }
 

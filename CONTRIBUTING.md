@@ -29,6 +29,17 @@ zig build bench              # Zig-side micro-benchmarks
 cargo bench -p pledgepack-core  # criterion benchmarks for the transform pipeline
 ```
 
+> **Windows + Git Bash:** `rust-toolchain.toml` pins `channel = "stable"`,
+> which resolves to the MSVC toolchain on Windows. In Git Bash, Git's
+> coreutils `link.exe` (`/usr/bin/link`) shadows the MSVC linker in PATH and
+> every build fails with `link: extra operand ...`. Either build with the
+> GNU toolchain explicitly (`cargo +stable-x86_64-pc-windows-gnu build`),
+> run cargo from PowerShell/cmd instead of Git Bash, or put MSVC's `link.exe`
+> ahead of `Git\usr\bin` in PATH. Do **not** pin a host-specific toolchain
+> string in `rust-toolchain.toml` — it applies on every OS and breaks
+> non-Windows contributors and CI. `pledgepack doctor` detects this
+> misconfiguration and prints the same guidance.
+
 ## Distribution & Publish Policy
 
 PledgePack is **distributed only as an npm package** (`pledgepack`), which

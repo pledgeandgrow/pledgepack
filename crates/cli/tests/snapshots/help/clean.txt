@@ -1,0 +1,10 @@
+Clean build artifacts and caches
+
+Usage: pledgepack clean [OPTIONS]
+
+Options:
+      --deep             Also remove node_modules/.cache
+      --root <ROOT>      Project root directory (default: current directory)
+      --config <CONFIG>  Config file path (default: auto-detect pledge.json)
+      --strict           Treat config-file problems (unknown / misspelled keys) as errors
+  -h, --help             Print help

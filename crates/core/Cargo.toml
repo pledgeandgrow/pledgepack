@@ -53,6 +53,10 @@ pledgepack-cache = { path = "../cache" }
 # via pledgepack_core::task_transform::PluginTransformResult)
 pledgepack-task-system = { workspace = true }
 
+# The single module-resolution implementation (aliases, relative/absolute
+# paths, node_modules incl. pnpm, exports/imports fields, workspaces).
+pledgepack-resolver = { workspace = true }
+
 # FFI to Zig native library
 pledgepack-native-sys = { path = "../../native-sys" }
 
@@ -112,6 +116,7 @@ scraper = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 criterion = { workspace = true }
+proptest = "1"
 
 [[bench]]
 name = "transform_bench"

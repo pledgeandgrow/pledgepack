@@ -249,6 +249,134 @@ impl Visit<'_> for SideEffectDetector {
     }
 }
 
+/// How one `import`/`export … from` statement binds the *target* module.
+#[derive(Debug, Clone, Default)]
+pub struct ParsedEdge {
+    /// The module specifier as written (`"./x"`, `"react"`).
+    pub specifier: String,
+    /// Named/default imports (`import { a }`, `import d` — `"default"` for
+    /// the latter). Bound names conservatively count as used.
+    pub import_names: Vec<String>,
+    /// Re-exports through this module: `(name imported from the target,
+    /// name this module exports it as)`. `export { a as b } from "m"` is
+    /// `("a", "b")`; demand flows only if `b` is itself imported downstream.
+    pub reexports: Vec<(String, String)>,
+    /// `import "x"` — no bindings; keeps the target only for side effects.
+    pub side_effect_only: bool,
+    /// `import * as ns` / `export *` — opaque to name-level analysis.
+    pub all: bool,
+}
+
+/// Per-module static analysis shared by the side-effect pass and the
+/// export-demand tree shaker: a single Oxc parse producing both.
+#[derive(Debug, Clone, Default)]
+pub struct ModuleAnalysis {
+    /// Top-level side effects (see [`has_side_effects_ast`]).
+    pub has_side_effects: bool,
+    /// Static `import` / `export … from` statements in source order.
+    pub edges: Vec<ParsedEdge>,
+}
+
+fn export_name_string(name: &ModuleExportName) -> String {
+    match name {
+        ModuleExportName::IdentifierName(n) => n.name.to_string(),
+        ModuleExportName::IdentifierReference(n) => n.name.to_string(),
+        ModuleExportName::StringLiteral(l) => l.value.to_string(),
+    }
+}
+
+/// Parse `source` once and classify both its top-level side effects and the
+/// shape of every static module edge. `has_side_effects` stays `true` when
+/// parsing fails — we never tree-shake what we cannot read.
+pub fn analyze_module(source: &str, source_type: SourceType) -> ModuleAnalysis {
+    let allocator = Allocator::default();
+    let ParserReturn {
+        program, panicked, ..
+    } = Parser::new(&allocator, source, source_type).parse();
+
+    if panicked {
+        return ModuleAnalysis {
+            has_side_effects: true,
+            edges: Vec::new(),
+        };
+    }
+
+    let mut detector = SideEffectDetector {
+        has_side_effects: false,
+    };
+    detector.visit_program(&program);
+
+    let mut edges: Vec<ParsedEdge> = Vec::new();
+    for stmt in &program.body {
+        match stmt {
+            Statement::ImportDeclaration(d) => {
+                if d.import_kind == ImportOrExportKind::Type {
+                    // `import type` is erased at compile time — it must not
+                    // keep the target alive (and isn't a real dep edge).
+                    continue;
+                }
+                let mut edge = ParsedEdge {
+                    specifier: d.source.value.to_string(),
+                    ..Default::default()
+                };
+                match &d.specifiers {
+                    None => edge.side_effect_only = true,
+                    Some(specs) if specs.is_empty() => edge.side_effect_only = true,
+                    Some(specs) => {
+                        for s in specs {
+                            match s {
+                                ImportDeclarationSpecifier::ImportSpecifier(sp) => {
+                                    edge.import_names.push(export_name_string(&sp.imported));
+                                }
+                                ImportDeclarationSpecifier::ImportDefaultSpecifier(_) => {
+                                    edge.import_names.push("default".to_string());
+                                }
+                                ImportDeclarationSpecifier::ImportNamespaceSpecifier(_) => {
+                                    edge.all = true;
+                                }
+                            }
+                        }
+                    }
+                }
+                edges.push(edge);
+            }
+            Statement::ExportAllDeclaration(d) => {
+                if d.export_kind == ImportOrExportKind::Type {
+                    continue;
+                }
+                edges.push(ParsedEdge {
+                    specifier: d.source.value.to_string(),
+                    all: true,
+                    ..Default::default()
+                });
+            }
+            Statement::ExportNamedDeclaration(d) => {
+                if d.export_kind == ImportOrExportKind::Type || d.source.is_none() {
+                    continue;
+                }
+                let src = d.source.as_ref().unwrap();
+                let mut edge = ParsedEdge {
+                    specifier: src.value.to_string(),
+                    ..Default::default()
+                };
+                for s in &d.specifiers {
+                    edge.reexports.push((
+                        export_name_string(&s.local),
+                        export_name_string(&s.exported),
+                    ));
+                }
+                edges.push(edge);
+            }
+            _ => {}
+        }
+    }
+
+    ModuleAnalysis {
+        has_side_effects: detector.has_side_effects,
+        edges,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
