@@ -182,7 +182,7 @@ criterion = "0.5"
 zstd = "0.13"
 
 # Digital signatures for cache integrity
-ed25519-dalek = { version = "2", features = ["rand_core"] }
+ed25519-dalek = { version = "3", features = ["rand_core"] }
 # Constant-time comparison of key/hash material (already in the lockfile as an
 # ed25519-dalek dependency).
 subtle = "2"
