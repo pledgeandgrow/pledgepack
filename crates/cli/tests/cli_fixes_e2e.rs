@@ -24,16 +24,36 @@ fn pledge(dir: &Path, args: &[&str]) -> Output {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn pledge");
+    // Drain the pipes on reader threads while polling — a child whose output
+    // exceeds the OS pipe buffer blocks on write and never exits, deadlocking
+    // the try_wait loop (`pledge completions bash` emits a >64KB script).
+    let mut out_pipe = child.stdout.take().unwrap();
+    let mut err_pipe = child.stderr.take().unwrap();
+    let out_t = std::thread::spawn(move || {
+        let mut v = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut out_pipe, &mut v);
+        v
+    });
+    let err_t = std::thread::spawn(move || {
+        let mut v = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut err_pipe, &mut v);
+        v
+    });
     let deadline = Instant::now() + Duration::from_secs(90);
-    loop {
-        if child.try_wait().unwrap().is_some() {
-            return child.wait_with_output().unwrap();
+    let status = loop {
+        if let Some(s) = child.try_wait().unwrap() {
+            break s;
         }
         if Instant::now() > deadline {
             let _ = child.kill();
             panic!("`pledge {}` hung (>90s)", args.join(" "));
         }
         std::thread::sleep(Duration::from_millis(50));
+    };
+    Output {
+        status,
+        stdout: out_t.join().unwrap(),
+        stderr: err_t.join().unwrap(),
     }
 }
 

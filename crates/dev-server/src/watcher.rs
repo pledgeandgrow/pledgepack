@@ -568,7 +568,7 @@ fn watch_linux(
 
     info!(
         "Native Linux inotify watcher started on {} ({} dirs)",
-        pledgepack_core::display_path(&root),
+        pledgepack_core::display_path(root),
         watch_map.len()
     );
 

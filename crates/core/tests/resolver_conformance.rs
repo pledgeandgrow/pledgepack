@@ -70,14 +70,18 @@ fn fixture() -> tempfile::TempDir {
 }
 
 fn config(root: &Path) -> PledgeConfig {
-    let mut cfg = PledgeConfig::default();
-    cfg.root = root.to_path_buf();
-    cfg.cache.enabled = false;
-    cfg.resolve_alias = vec![PathAlias {
-        from: "@".to_string(),
-        to: "./src".to_string(),
-    }];
-    cfg
+    PledgeConfig {
+        root: root.to_path_buf(),
+        cache: pledgepack_core::CacheConfig {
+            enabled: false,
+            ..Default::default()
+        },
+        resolve_alias: vec![PathAlias {
+            from: "@".to_string(),
+            to: "./src".to_string(),
+        }],
+        ..Default::default()
+    }
 }
 
 /// (specifier, importer) pairs where engine and resolver must agree exactly.

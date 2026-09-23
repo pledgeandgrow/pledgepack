@@ -184,7 +184,7 @@ fn pledgepack_invocations(text: &str) -> Vec<(usize, String)> {
             continue;
         }
         if in_fence {
-            let tokens: Vec<&str> = line.trim().split_whitespace().collect();
+            let tokens: Vec<&str> = line.split_whitespace().collect();
             if let Some(pos) = tokens.iter().position(|t| *t == "pledgepack")
                 && tokens[..pos].iter().all(|t| RUNNERS.contains(t))
             {
