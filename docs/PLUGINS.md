@@ -36,7 +36,7 @@ below).
 | `load` | `(id) -> code?` | Sequential, first non-null wins | JS host: string or `{ code, map }`. Runs before the file is read. |
 | `transform` | `(code, id) -> code?` | Sequential chain — each plugin sees the previous plugin's output | JS host (`pledgepack build`): runs on the loaded source **before** the built-in TS/JSX/CSS transform (see below). |
 | `transformIndexHtml` | `(html, path) -> html?` | Sequential chain | JS host: called as `(html, "index.html")`; may return a string, a tag array, or `{ html, tags }`. Runs before `index.html` is written. |
-| `renderChunk` | `(code, filename, chunkType) -> code?` | Sequential chain | Runs after code splitting, **before** content hashing and writing, so file-name hashes reflect the final code. `chunkType` is `"entry"` or `"chunk"` (`"module"` for per-module emit). Added to the WIT contract in v0.1.2. |
+| `renderChunk` | `(code, filename, chunkType) -> code?` | Sequential chain | Runs after code splitting, **before** content hashing and writing, so file-name hashes reflect the final code. `chunkType` is `"entry"` or `"chunk"`. Added to the WIT contract in v0.1.2. |
 | `handleHotUpdate` | `(file, timestamp) -> moduleIds?` | Sequential, first non-null wins | Dev mode only. Returning `none` defers to the next plugin (or the host's default HMR resolution if none handle it); returning an *empty* `moduleIds` list means "I handled this, suppress HMR for it" — those are different outcomes, pick deliberately. Added to the WIT contract in v0.1.3 — previously absent from both hosts. |
 | `buildStart` | `()` | All plugins called; order not guaranteed | |
 | `buildEnd` | `()` | All plugins called; order not guaranteed | |

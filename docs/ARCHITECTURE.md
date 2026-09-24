@@ -21,6 +21,14 @@
 > API — the crate now compiles and passes all tests (40 unit + 20 e2e) on
 > wasmtime 48.0.2, and is back in CI's workspace commands. Stray "wasmtime
 > 28.0.1" references below describe the pre-bump state.
+>
+> **0.4.0 update:** production emit was rewritten — modules are lowered
+> into `__pp.def`/`__pp.req` records wrapped in the `__pp` runtime
+> (`crates/core/src/bundle.rs`), chunks are content-hashed files keyed in
+> `manifest.json`, and emitted output is scanned for secrets. The
+> duplicated engine resolver was unified onto `pledgepack-resolver`, and
+> `dep_bundler`/`watcher`/`lazy_pipeline`/`middleware`/`hmr_diff` now live
+> in `dev-server`, `remote`/`git_cache` in `cache` (paths below updated).
 
 ## Overview
 
@@ -45,21 +53,22 @@ User source files (src/*.tsx, *.ts)
         │
         ▼
    Optimizer
-   ├── Tree shaking (reachability from entry)
-   ├── Chunk splitting (entry / vendor / shared)
-   └── Scope hoisting (ESM, no wrappers)
+   ├── Tree shaking (reachability + export-demand shake → stub registry)
+   ├── Chunk splitting (entry / vendor / async / shared)
+   └── Manual chunks + route splitting
         │
         ▼
-   Emitter ──► .pledge/ (JS files + index.html)
+   Emitter ──► out_dir (`__pp` runtime chunks, manifest.json, index.html)
 ```
 
 ## Crate Dependency Graph
 
 ```
 pledgepack-cli
-├── pledgepack-core (engine, config, transform, pipeline, env, html, compression, analyzer, edge, bundle, dep_bundler, polyfills, transform_optimizations, css_features, css_in_js, tailwind_v4, asset_pipeline, plugin_system, output_distribution, service_worker, lsp_server, migrate, module_graph, remote, git_cache, watcher, hmr_diff, lazy_pipeline, middleware, doctor, config_validate, diagnostics, export_check, js_config, telemetry, budgets, bench, webhooks, i18n, rtl, a11y, encrypt, advanced, ecosystem)
+├── pledgepack-core (engine, bundle, config, config_validate, transform/*, pipeline, env, html, compression, analyzer, edge, dep_bundler, polyfills, transform_optimizations, css_features, css_advanced, css_frameworks, css_in_js, tailwind_v4, postcss, asset_pipeline, image_pipeline, fonts, svg, favicons, plugin_system, plugin_hooks, plugin_registry, plugin_docs, plugin_schema, plugin_template, plugin_types, output_distribution, service_worker, lsp_server, migrate, module_graph, doctor, diagnostics, export_check, js_config, telemetry, budgets, bench, webhooks, i18n, rtl, a11y, encrypt, advanced, ecosystem, security, determinism, api, detect, drizzle, estree, examples_gallery, playground, prisma, router, sourcemap_compose, task_transform, type_check, visual_regression, module, paths, ast_pool, presets)
 │   ├── pledgepack-cache (function-level cache, memory + disk)
 │   ├── pledgepack-native-sys (FFI to Zig)
+│   ├── pledgepack-resolver (single resolution implementation — engine delegates to it)
 │   ├── oxc (parser, semantic, transformer, codegen)
 │   ├── lightningcss (CSS minification, CSS Modules)
 │   ├── blake3 (content hashing for CSS Modules + cache keys)
@@ -67,10 +76,11 @@ pledgepack-cli
 │   ├── brotli (Brotli compression)
 │   ├── rayon (parallel transforms, parallel plugin execution)
 │   └── dashmap (concurrent cache, concurrent plugin registry)
-├── pledgepack-dev-server (axum, notify, tokio-tungstenite, reqwest, rustls)
+├── pledgepack-dev-server (axum, notify, tokio-tungstenite, reqwest, rustls; fs_guard, origin_guard, watcher, hmr_diff, lazy_pipeline, middleware, plugin_hooks, shell_generator)
 │   ├── pledgepack-core
 │   ├── pledgepack-native-sys
 │   └── oxc
+├── pledgepack-cache (function-level cache, memory + disk; remote.rs S3/GCS/HTTP backends, git_cache.rs tree-hash invalidation)
 ├── pledgepack-optimizer (tree shaking, chunk splitting)
 │   └── pledgepack-core
 ├── pledgepack-resolver (tsconfig, exports, node_modules)
@@ -97,7 +107,7 @@ pledgepack-cli
 | 5 | `axum` | 0.8 | HTTP server | cli, dev-server |
 | 6 | `tower-http` | 0.6 (fs, cors) | HTTP middleware | cli, dev-server |
 | 7 | `tokio-tungstenite` | 0.26 | WebSocket (HMR) | dev-server |
-| 8 | `oxc` | 0.36 (full) | JS/TS/JSX compiler | core, dev-server, adapter-react |
+| 8 | `oxc` | 0.141 (full) | JS/TS/JSX compiler | core, dev-server, adapter-react |
 | 9 | `lightningcss` | 1.0.0-alpha.72 | CSS engine | core |
 | 10 | `blake3` | 1 | Hashing (cache keys) | core, cache |
 | 11 | `base64` | 0.22 | Base64 encoding | core |
@@ -149,7 +159,7 @@ pledgepack-cli
 | 52 | `dialoguer` | 0.11 | cli | Interactive dialogs |
 | 53 | `console` | 0.15 | cli | Terminal styling |
 | 54 | `atty` | 0.2 | cli | TTY detection |
-| 55 | `rquickjs` | 0.12.1 | js-plugin-host | QuickJS JS engine for plugins & tests |
+| 55 | `rquickjs` | 0.12.2 | js-plugin-host | QuickJS JS engine for plugins & tests |
 | 56 | `windows-sys` | 0.61 | dev-server (Windows only) | Win32 API |
 | 57 | `bytemuck` | 1.21 | dev-server (Windows only) | Byte casting |
 
@@ -168,7 +178,7 @@ opt-level = 0
 incremental = true
 ```
 
-**Summary:** 57 external crates + 12 internal crates = 69 total packages. All additions are pure replacements of manual code or new capabilities. No dependency conflicts or version mismatches. Workspace uses resolver v2 for feature unification.
+**Summary:** 57 external crates + 16 internal crates = 73 total packages. All additions are pure replacements of manual code or new capabilities. No dependency conflicts or version mismatches. Workspace uses resolver v2 for feature unification.
 
 ## Zig Native Layer (`native-sys/` + `native-sys/zig/*.zig`)
 
@@ -177,13 +187,13 @@ incremental = true
 - `read_file(path) → bytes` — Memory-mapped file I/O with thread pool fallback
 - `find_imports(source) → Vec<String>` — SIMD-accelerated import scanning
 - `hash_content(source) → u64` — Content hashing for cache keys
-- `___chkstk_ms` — Windows x86_64 stack probing (required for Zig stack frames)
+- `___chkstk_ms` — Windows x86_64 stack probing, MSVC builds only (MinGW's runtime provides its own; `#[cfg(target_env = "msvc")]`-gated since 2026-09-15 after the GNU-toolchain segfault fix)
 
 ### Key Design Decisions
 - **Arena allocation**: Module graph nodes have zero per-node allocation overhead
 - **SIMD scanning**: Import specifiers found via 32-byte SIMD pattern matching
 - **io_uring / IOCP**: Async file I/O on Linux (io_uring) and Windows (IOCP via thread pool)
-- **Stack probing**: Custom `___chkstk_ms` implementation for Windows compatibility
+- **Stack probing**: `___chkstk_ms` shim for MSVC builds only; MinGW toolchains use the runtime-provided symbol
 
 ## Rust Orchestration Layer
 
@@ -191,7 +201,7 @@ incremental = true
 - BFS module graph traversal from entry point
 - Per-module: resolve → read → transform → cache → enqueue dependencies
 - Two-tier cache: memory (`HashMap`) → disk (`FunctionCache` with bincode)
-- Emits transformed JS to `.pledge/` preserving directory structure
+- Emits content-hashed `__pp` runtime chunks + `manifest.json` + `index.html` to `config.out_dir` (dev mode serves transformed modules on demand instead)
 
 ### Transform Pipeline (`crates/core/src/transform/`)
 
@@ -312,8 +322,9 @@ Source string
 ### Optimizer (`crates/optimizer/src/lib.rs`)
 - **Reachability**: BFS from entry modules, mark all reachable
 - **Side effects**: Heuristic detection (top-level assignments, console.log, etc.)
-- **Chunk types**: Entry, Vendor (node_modules), Shared (2+ entries)
-- **Scope hoisting**: ESM imports preserved, no CommonJS wrappers
+- **Chunk types**: Entry, Vendor (node_modules), Async (dynamic `import()`), Shared (2+ entries)
+- **Export-demand shake**: reachable modules whose imports are all dead are recorded in a stub registry; emit writes `__pp.def` stubs for them so `__pp.req` never throws
+- **Module wrapping**: emit lowers each module into `__pp.def`/`__pp.req` records in the `__pp` runtime — no raw ESM specifiers survive into output
 
 ### Dev Server (`crates/dev-server/src/lib.rs`)
 - **Axum** router: `/` → index.html, `/__pledge_hmr` → WebSocket, `/__pledge_error` → error overlay, `/*` → module handler
@@ -339,7 +350,7 @@ Source string
 
 ### WASM Plugin Host (`crates/wasm-plugin-host/src/lib.rs`)
 - **Wasmtime 48.0.2** engine loads `.wasm` plugin files (WASM Component Model, WIT contract currently at v0.1.3)
-- 8 hooks: `resolve-id`, `load`, `transform`, `transform-index-html`, `build-start`, `build-end`, `generate-bundle`, `configure-server`
+- 10 hooks: `resolve-id`, `load`, `transform`, `transform-index-html`, `render-chunk`, `handle-hot-update`, `build-start`, `build-end`, `generate-bundle`, `configure-server`
 - WIT contract: 11 record types, `cache-key` in every output for task graph caching
 - Sandbox: restricted WASI context (no filesystem, no network, empty env)
 - `WasmPluginHostBridge` — thread-safe wrapper (Mutex) for build engine integration
@@ -397,6 +408,11 @@ Source string
 - **Dev + production**: Generated in both modes
 
 ### Dependency Pre-Bundling (`crates/core/src/dep_bundler.rs`)
+
+> Dev-server only — production builds resolve `node_modules` through the
+> normal resolver + optimizer pipeline. `DepBundler::pre_bundle` runs at
+> server startup.
+
 - **Scanning**: Recursively scans source files for bare (non-relative) imports
 - **CJS → ESM**: Generates ESM interop wrappers for CommonJS modules
 - **Resolution**: Reads `package.json` `module`/`main` fields, prefers ESM
@@ -540,19 +556,20 @@ Source string
 - **Content-hash change detection**: Only rebuild changed modules and transitive dependents
 - **Persistent serialization**: `SerializableModuleGraph` saves/loads via bincode to `module_graph.bin`
 
-### Remote Cache (`crates/core/src/remote.rs`)
+### Remote Cache (`crates/cache/src/remote.rs`)
 - **S3/GCS/HTTP backends**: `RemoteCache` with automatic fallback
 - **3-tier cache**: Memory → disk → remote, integrated in `BuildEngine`
 
-### Git Cache Invalidation (`crates/core/src/git_cache.rs`)
+### Git Cache Invalidation (`crates/cache/src/git_cache.rs`)
 - **Git tree hashes**: `GitCacheInvalidator` uses `git ls-files` and `git rev-parse HEAD^{tree}`
 - **Faster invalidation**: Tree hash comparison instead of per-file content hashing
 
-### Dev Server Optimizations
-- **Native file watcher** (`crates/core/src/watcher.rs`): Platform-specific inotify/FSEvents/ReadDirectoryChangesW
-- **HMR partial updates** (`crates/dev-server/src/hmr_diff.rs`): Line-level diff via `similar` crate (Myers algorithm) pushed through WebSocket
-- **Cold boot optimization** (`crates/core/src/lazy_pipeline.rs`): Deferred Oxc/Lightning CSS initialization
-- **Middleware chain** (`crates/core/src/middleware.rs`): Configurable request processing pipeline
+### Dev Server Optimizations (`crates/dev-server/src/`)
+- **Native file watcher** (`watcher.rs`): Platform-specific inotify/FSEvents/ReadDirectoryChangesW
+- **HMR partial updates** (`hmr_diff.rs`): Line-level diff via `similar` crate (Myers algorithm) pushed through WebSocket
+- **Cold boot optimization** (`lazy_pipeline.rs`): Deferred Oxc/Lightning CSS initialization
+- **Middleware chain** (`middleware.rs`): Configurable request processing pipeline
+- **fs_guard / origin_guard**: dev-server file-serving security — deny-lists, symlink and 8.3-shortname tricks, and Origin header checks against DNS-rebinding
 
 ### Observability & Monitoring (#101–#105)
 - **Build telemetry dashboard** (`crates/core/src/telemetry.rs`): `pledgepack dashboard` command serves interactive web UI at `localhost:4300` with build history chart, cache hit rate, module counts, and build durations. Build records persisted to `.pledge/history.json` (max 100 entries).
@@ -624,11 +641,12 @@ Source string
    ├── Write each chunk as a content-hashed .js file
    ├── Generate index.html (with hashed asset references)
    ├── Generate manifest.json (chunk-id keyed entry-to-file mapping)
-   └── Generate source maps (per-chunk indexed maps merged from module maps)
+   ├── Generate source maps (per-chunk indexed maps merged from module maps)
+   └── Scan emitted output for secrets (security.secretScan, on by default —
+       recognized credentials fail the build)
 6. Post-build steps:
    ├── Generate pledge-env.d.ts (if env_dts enabled)
    ├── Process HTML entry point
-   ├── Pre-bundle dependencies (scan node_modules, CJS→ESM)
    ├── Load JS plugins (buildStart hooks)
    ├── Generate edge bundle (if edge_target configured)
    ├── Generate service worker (if configured)
@@ -717,7 +735,7 @@ All assets       → AssetManifest with content-hashed output paths
 
 ## WIT Plugin Contract — Design Decisions
 
-> Contract frozen at v0.1.1 (additive from v0.1.0) · WASM validation complete
+> Contract at v0.1.3 (additive from v0.1.0: `render-chunk` in v0.1.2, `handle-hot-update` in v0.1.3) · WASM validation complete
 
 The plugin ABI is the **one-way door**. Once plugins are written against this contract, breaking it nukes the ecosystem.
 
@@ -981,24 +999,23 @@ CacheKey = blake3(content_hash || function_id || params)
 ### File Structure
 ```
 .pledge/
-├── index.html          # Generated HTML shell (with hashed asset references)
-├── manifest.json       # Source → output file mapping
-└── src/
-    ├── index.js        # Transformed from index.tsx
-    ├── index.js.map    # Source map (V3 with sourcesContent)
-    └── utils.js        # Transformed from utils.ts
+├── index.html            # Generated HTML shell (with hashed asset references)
+├── entry-0.<hash>.js     # Wrapped chunk: __pp runtime + __pp.def module records
+├── entry-0.<hash>.js.map # Per-chunk source map (module maps merged into sections)
+├── __pp_manifest.js      # Runtime manifest: module key → async chunk URL
+├── manifest.json         # Chunk-id → output file mapping
+└── ...                   # Vendor/shared/async chunks, CSS files, assets
 ```
 
 ### Compression Output
 When `compress_gzip` and/or `compress_brotli` are enabled in config:
 ```
 .pledge/
-├── index.html.gz       # Gzip compressed (flate2)
-├── index.html.br       # Brotli compressed (brotli crate)
-├── src/
-│   ├── index.js.gz     # Gzip compressed
-│   ├── index.js.br     # Brotli compressed
-│   └── ...
+├── index.html.gz           # Gzip compressed (flate2)
+├── index.html.br           # Brotli compressed (brotli crate)
+├── entry-0.<hash>.js.gz    # Gzip compressed chunk
+├── entry-0.<hash>.js.br    # Brotli compressed chunk
+└── ...
 ```
 Compressible file types: `.js`, `.mjs`, `.css`, `.html`, `.json`, `.svg`, `.wasm`
 
@@ -1045,8 +1062,8 @@ The HTML processor (`crates/core/src/html.rs`) parses `index.html` as an entry p
 - `.png`/`.jpg`/`.svg`/etc. → URL string export (or base64 if `?inline`)
 
 ### Asset Hashing
-- Content hash (blake3) appended to filenames: `logo-a1b2c3d4.png`
-- `manifest.json` generated mapping source paths to hashed output paths
+- Content hash (blake3) appended to filenames: `logo-a1b2c3d4.png`, `entry-0.4d2e7cdd.js`
+- `manifest.json` generated mapping chunk ids to hashed output paths
 - Enables long-term browser caching with cache busting
 
 ### Library Mode
@@ -1056,9 +1073,10 @@ The HTML processor (`crates/core/src/html.rs`) parses `index.html` as an entry p
 - Config: `library: { entry, formats, name, external, declarations }`
 
 ### Single-File Bundle
-- `emit_single_file()` concatenates all modules into one ESM file
-- Topological sort ensures dependency order
-- All imports inlined (no external chunk files)
+- `emit_single_file()` routes through the same wrapped-chunk emitter with a
+  single entry chunk containing every module
+- All imports inlined (no external chunk files) — `import()` targets resolve
+  locally via `__pp.req` instead of loading a chunk
 
 ## Optimizer
 
@@ -1078,10 +1096,15 @@ Route chunks:  Per-route modules (#71) — split_by_routes() extracts shared rou
 - **Route-based splitting (#71)**: `detect_routes()` scans app/pages directories, `split_by_routes()` creates per-route chunks with a shared chunk for modules used across routes
 - **Module prefetch (#72)**: `generate_prefetch_tags()` creates `<link rel="modulepreload">` and `<link rel="prefetch">` based on route chunks and prefetch strategy
 
-### Scope Hoisting
-- ESM `import`/`export` preserved (no CommonJS wrappers)
-- Modules in the same chunk share scope
-- No per-module function wrappers (unlike webpack's default)
+### Module Wrapping
+- Each module's ESM is lowered into a `__pp.def(key, fn)` factory record
+  (`crates/core/src/bundle.rs`) — imports become `__pp.req(key)` calls and
+  exports install getters on the module's exports object
+- Tree-shaken modules register empty factories so `__pp.req` resolves to
+  `{}` instead of throwing
+- `import()` of a same-chunk target lowers to
+  `Promise.resolve().then(() => __pp.req(key))`; cross-chunk targets go
+  through `__pp.dyn(key)` + `__pp_manifest.js`
 
 ## Parallel Transforms
 
@@ -1094,9 +1117,13 @@ engine.transform_modules_parallel(modules: Vec<(ModuleId, ResolvedModule)>)
 - Errors propagated (first error stops collection)
 - Falls back to sequential if single module
 
-## Dependency Pre-Bundling
+## Dependency Pre-Bundling (dev server)
 
-The dep bundler (`crates/core/src/dep_bundler.rs`) pre-bundles bare imports:
+The dep bundler (`crates/core/src/dep_bundler.rs`) is used by the **dev
+server** (bare imports resolve through an import map to `.pledge-deps`
+URLs) — it no longer runs in the production build path, which bundles
+`node_modules` deps through the normal chunk emit. It pre-bundles bare
+imports:
 1. Scans source files for bare (non-relative) import specifiers
 2. Resolves each from `node_modules` via `package.json` `module`/`main` fields
 3. Converts CJS modules to ESM with interop wrappers
@@ -1925,7 +1952,7 @@ pledgepack serve   # Serve .pledge/ on :4000
 
 ## Dev Server Optimizations (Features 9-15)
 
-### Native File Watcher (`crates/core/src/watcher.rs`)
+### Native File Watcher (`crates/dev-server/src/watcher.rs`)
 - Platform-specific native watchers for lower latency:
   - **Linux**: `inotify` via `notify` crate
   - **macOS**: `FSEvents` via `notify` crate
@@ -1941,7 +1968,7 @@ pledgepack serve   # Serve .pledge/ on :4000
 - **WebSocket transport**: Diff sent via WebSocket as JSON `{ type: "diff", path, additions, deletions }`
 - **Reduced bandwidth**: Only changed lines transmitted instead of full module
 
-### Cold Boot Optimization (`crates/core/src/lazy_pipeline.rs`)
+### Cold Boot Optimization (`crates/dev-server/src/lazy_pipeline.rs`)
 - **Deferred initialization**: Oxc parser and Lightning CSS only initialized on first request
 - **Dirty dependency tracking**: Only re-transforms modules whose dependencies changed
 - **Lazy pipeline**: Transform pipeline components loaded on-demand
@@ -1955,7 +1982,7 @@ pledgepack serve   # Serve .pledge/ on :4000
 - Each HTML entry gets independent HMR context
 - Per-entry routes registered dynamically
 
-### Middleware Chain (`crates/core/src/middleware.rs`)
+### Middleware Chain (`crates/dev-server/src/middleware.rs`)
 - Configurable middleware pipeline for request processing
 - `MiddlewareFn` parsed from config (auth, logging, headers, CORS, rewrites)
 - Middleware executed before module serving

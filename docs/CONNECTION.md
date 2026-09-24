@@ -5,15 +5,15 @@
 ### PledgePack (Bundler / Build Tool)
 - **Role:** Framework-agnostic bundler, dev server, and build tool (like Turbopack/esbuild/SWC)
 - **Repository:** `https://github.com/pledgeandgrow/pledgepack`
-- **npm package:** `pledgepack` (latest published: `0.3.3`; this repo is at `1.0.0-rc.1`, unpublished)
+- **npm package:** `pledgepack` (latest published: `0.4.0`, `latest` dist-tag — tagged `v0.4.0` in this repo)
 - **Binary:** Native Rust binary (`pledge.exe` / `pledge`) distributed via GitHub Releases + postinstall download
 - **Language:** Rust (Oxc parser, Lightning CSS, QuickJS JS runtime for plugin host and tests, wasmtime for WASM plugins)
-- **CLI:** `pledgepack dev`, `pledgepack build`, `pledgepack serve`, `pledgepack test`, `pledgepack analyze`, `pledgepack create`, `pledgepack migrate`, `pledgepack doctor`, `pledgepack bench`, `pledgepack cache`, `pledgepack generate-env-types`, `pledgepack completions`, `pledgepack config`
+- **CLI:** `pledgepack dev`, `pledgepack build`, `pledgepack serve`, `pledgepack preview`, `pledgepack test`, `pledgepack analyze`, `pledgepack create`, `pledgepack init`, `pledgepack migrate`, `pledgepack doctor`, `pledgepack bench`, `pledgepack cache`, `pledgepack clean`, `pledgepack config`, `pledgepack update`, `pledgepack why`, `pledgepack schema`, `pledgepack generate-env-types`, `pledgepack completions`, `pledgepack manpages`, `pledgepack dashboard`, `pledgepack playground`, `pledgepack plugin` (`create`/`docs`/`install`/`keygen`/`list`/`search`/`sign`)
 
 ### PledgeStack (React Framework)
 - **Role:** Opinionated React framework with SSR/SSG/RSC, file-based routing, API routes (like Next.js is to Turbopack)
 - **Repository:** `https://github.com/pledgeandgrow/pledgestack` (monorepo)
-- **npm package:** `pledgestack` (published, currently `1.0.0-rc.0`; all 34 public packages share one version via a Changesets fixed group)
+- **npm package:** `pledgestack` (repo version `0.2.0`; latest published on npm is `0.1.12` — all 34 public packages share one version via a Changesets fixed group)
 - **Language:** TypeScript/JavaScript (depends on pledgepack binary)
 - **CLI:** `pledge dev`, `pledge build`, `pledge start` (`dev`/`build` spawn the compiled `pledgepack` binary directly by resolved path, not via a shell command — see "CLI Command Mapping" below)
 
@@ -31,18 +31,15 @@ User installs pledgestack (framework)
 ```json
 {
   "dependencies": {
-    "pledgepack": "^0.3.3"
+    "pledgepack": "^0.4.0"
   }
 }
 ```
 
-> **Note (2026-09-21):** `^0.3.3` resolves to `>=0.3.3 <0.4.0`, so it does
-> **not** match this repo's `1.0.0-rc.1` — PledgeStack installs the latest
-> 0.3.x, not the RC. As of this date `1.0.0-rc.1` is also **not yet published
-> to npm** (`npm dist-tags`: `latest = 0.3.3`, no `rc` tag), so the range
-> stays at `^0.3.3` on purpose. Bump it (e.g. `^1.0.0-rc.1`, in all four
-> pledgejs `package.json`s plus the `minimumReleaseAgeExclude` pin in
-> `pnpm-workspace.yaml`) only after the RC is actually published.
+> **Note (2026-09-23):** PledgeStack's dependency range is `^0.4.0` in all
+> four pledgejs `package.json`s (plus the `minimumReleaseAgeExclude` pin in
+> `pnpm-workspace.yaml`), matching `pledgepack@0.4.0` — published to npm and
+> resolvable (`latest = 0.4.0`).
 
 ---
 
@@ -200,6 +197,20 @@ export default defineConfig({
 });
 ```
 
+#### Shared config file contract
+
+PledgeStack and PledgePack read the same `pledge.config.ts`. PledgePack
+validates the file against its generated schema and warns on unknown fields —
+to keep framework-level keys (e.g. `rsc`, `tailwind`, `ppr`, `rateLimit`,
+`cors`, `appDir`, `rootDir`, `output`) legal in the shared file, PledgePack
+treats them as a reserved extension namespace (`PLEDGESTACK_FIELDS` in
+`crates/core/src/config_validate.rs`) and never warns on them, whatever
+`framework` is set to ('pledge', 'react', 'vue', … or unset).
+
+When PledgeStack adds a new top-level config field, add the key to
+`PLEDGESTACK_FIELDS` (single source of truth for the contract) — do not add it
+to `PledgeConfig`.
+
 ### 3. PledgePack plugin hooks for PledgeStack
 
 PledgePack exposes these plugin hooks that PledgeStack plugins use:
@@ -275,7 +286,7 @@ pledgepack/
 │   └── postinstall.js     # Downloads binary from GitHub Releases
 ├── index.js               # JS entry — exports `defineConfig` (typed config helper only)
 ├── index.d.ts             # Generated config types (`pnpm gen:types`, from `pledgepack schema`)
-├── package.json           # name: "pledgepack", version: "1.0.0-rc.1"
+├── package.json           # name: "pledgepack", version: "0.4.0"
 ├── README.md
 └── LICENSE
 ```
@@ -291,7 +302,7 @@ pledgestack/
 │   │   │   ├── index.ts           # Re-exports all sub-packages
 │   │   │   └── ...
 │   │   ├── scripts/build.mjs      # esbuild bundler (bundles all sub-packages into dist/)
-│   │   ├── package.json           # name: "pledgestack", deps: { pledgepack: "^0.3.3" }
+│   │   ├── package.json           # name: "pledgestack", deps: { pledgepack: "^0.4.0" }
 │   │   └── README.md
 │   ├── shared/                    # Public (`pledgestack-shared`) — also bundled into CLI via esbuild
 │   ├── core/                      # Public (`pledgestack-core`) — bundled into CLI
@@ -462,7 +473,7 @@ Inside each archive: a single binary named `pledge` (Unix) or `pledge.exe` (Wind
 - `crates/core/src/edge.rs` — Edge bundle generation
 - `bin/pledge.js` — JS shim that resolves and spawns native binary
 - `bin/postinstall.js` — Downloads binary from GitHub Releases
-- `package.json` — npm package definition (repo version `1.0.0-rc.1`; latest published on npm is `0.3.3`)
+- `package.json` — npm package definition (version `0.4.0`, published on npm as `latest`)
 
 ### PledgeStack (pledgeandgrow/pledgestack repo)
 - `packages/cli/` — Main framework package (published as `pledgestack` on npm)
@@ -482,9 +493,9 @@ Inside each archive: a single binary named `pledge` (Unix) or `pledge.exe` (Wind
 ## Versioning Strategy
 
 - **PledgePack** and **PledgeStack** version independently
-- PledgeStack `package.json` specifies `pledgepack: "^0.3.3"` (caret range) — **this does not match `1.0.0-rc.1`** (`^0.3.3` = `>=0.3.3 <0.4.0`); PledgeStack currently resolves the latest 0.3.x release, which is also the newest version actually published on npm
+- PledgeStack `package.json` specifies `pledgepack: "^0.4.0"` (caret range, all four package.jsons + `pnpm-workspace.yaml`) — it matches this repo's `0.4.0`, which is published on npm (`latest` dist-tag) and resolves normally
 - Breaking changes in PledgePack require PledgeStack to update its dependency range
-- PledgeStack can pin PledgePack version for stability: `pledgepack: "1.0.0-rc.1"` (exact)
+- PledgeStack can pin PledgePack version for stability: `pledgepack: "0.4.0"` (exact)
 
 ---
 
@@ -500,7 +511,7 @@ independently verified compatibility.
 
 | PledgePack | `bundler-pledgepack` | PledgeStack (`pledgestack` CLI) | Manifest schema version | Date | Verified together? |
 |---|---|---|---|---|---|
-| 1.0.0-rc.1 | 1.0.0-rc.0 | 1.0.0-rc.0 | 1 (`RouteManifest::SCHEMA_VERSION`) | 2026-09-21 | No — versions recorded from each repo's package.json, not cross-tested. Note pledgejs's declared `^0.3.3` range does not resolve to 1.0.0-rc.1 yet. |
+| 0.4.0 | 0.2.0 | 0.2.0 | 1 (`RouteManifest::SCHEMA_VERSION`) | 2026-09-23 | No — versions recorded from each repo's package.json, not cross-tested. pledgejs's `^0.4.0` range resolves against published `pledgepack@0.4.0`. |
 | 0.3.3 | 0.1.4 | 0.1.12 | 1 (`RouteManifest::SCHEMA_VERSION`, added 2026-09-15) | 2026-09-17 | No — versions recorded, not cross-tested. See goal 87. |
 
 **How compatibility is actually checked at runtime** (goal 81, implemented
@@ -574,9 +585,9 @@ PRODUCTION-READINESS-100.md (Phase 3-4's verification notes).
 
 ```
 1. Build PledgePack binary:     cargo build --release
-2. Create GitHub Release:       gh release create v1.0.0-rc.1 pledge-x86_64-pc-windows-msvc.zip
+2. Create GitHub Release:       gh release create v0.4.0 pledge-x86_64-pc-windows-msvc.zip
 3. Publish PledgePack to npm:   npm publish (from pledgepack repo)
-4. Update PledgeStack dependency:  pledgestack package.json → pledgepack: "^1.0.0-rc.1" (currently "^0.3.3", which does not match the RC)
+4. Update PledgeStack dependency:  pledgestack package.json → pledgepack: "^0.4.0" (done — all four package.jsons + pnpm-workspace.yaml; resolves against published 0.4.0)
 5. Publish PledgeStack to npm:     npm publish (from packages/cli directory)
 ```
 

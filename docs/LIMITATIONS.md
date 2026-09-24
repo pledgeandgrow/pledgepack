@@ -94,7 +94,7 @@ The optimizer splits dynamic `import()` calls into separate lazy-loaded chunks. 
 
 ## JS Plugin System — Full API
 
-### Status: 🟡 Mostly resolved (updated 2026-09-20 for 1.0.0-rc.1)
+### Status: 🟡 Mostly resolved (updated 2026-09-23 for 0.4.0)
 
 The JS plugin host (QuickJS / rquickjs 0.12) executes the plugin's own JS for
 every hook it declares: `resolveId`, `load`, `transform`, `renderChunk`,

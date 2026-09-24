@@ -222,6 +222,11 @@ export default defineConfig({
     cert: './cert.pem',
     key: './key.pem',
   },
+  security: {
+    sri: false,          // emit integrity="sha256-…" on script/link tags
+    csp: 'off',          // 'auto' generates a _headers CSP from build output
+    secretScan: true,    // refuse to emit recognized credentials / non-public .env values
+  },
   server_entry: 'server/index.ts',
   node_polyfills: true,
   define: {
@@ -322,8 +327,8 @@ The transform pipeline lives in `crates/core/src/transform/` and is split into f
 ### Code Splitting
 
 - AST-based dynamic import detection via Oxc
-- Relative specifiers tracked for chunk splitting
-- Dynamic imports marked for separate chunk emission
+- Modules reachable only through `import()` are moved into one async chunk per dynamic-import root
+- Async chunks load on demand through the `__pp.dyn` runtime + `__pp_manifest.js`; static chunks load before the entry so `__pp.req` never hits an unregistered module
 
 ## Dev Server
 
@@ -365,13 +370,18 @@ The transform pipeline lives in `crates/core/src/transform/` and is split into f
 
 ## Resolver
 
+One shared implementation (`crates/resolver`) used by the build engine, dev server, and tooling — `BuildEngine::resolve` delegates to it (a conformance suite pins the contract).
+
 - Relative paths, bare specifiers, recursive `node_modules` lookup
-- `tsconfig.json` paths support
-- Package `exports` field with conditions (`import`, `require`, `browser`, `default`)
-- Subpath exports, scoped packages, pattern matching
+- `tsconfig.json`/`jsconfig.json` `paths`/`baseUrl`/`extends`
+- `resolve.alias` (including bare `@` aliases without a trailing slash)
+- Package `exports` field with conditions (`browser` > `import` > `module` > `require` > `default`), subpath patterns, unlisted-subpath rejection
+- Package `imports` (`#subpath`) with Node package-scope semantics
+- `browser` field remapping (object map and string forms) under the browser runtime
+- Workspace packages (`with_workspace`), pnpm-style layouts
 - Extension resolution: `.tsx` → `.ts` → `.jsx` → `.js` → `index.*`
 - `module`, `main`, `browser` field fallbacks
-- Per-(importer, specifier) DashMap caching
+- Per-(importer, specifier) DashMap caching; results canonicalized
 
 ## JS Plugin Host
 
@@ -382,11 +392,13 @@ The transform pipeline lives in `crates/core/src/transform/` and is split into f
 
 ## Production Output
 
-- Writes transformed modules to `.pledge/` (default; configurable via `out_dir` in `pledge.config.ts`) preserving directory structure
-- Extensions changed to `.js`
-- Generates `index.html` with `<script type="module">` entry
-- Content-hashed filenames for cache busting
-- `manifest.json` mapping source files to output files
+- Writes chunks to `.pledge/` (default; configurable via `out_dir` in `pledge.config.ts`) — each chunk wraps its modules as `__pp.def`/`__pp.req` records inside a small `__pp` module runtime, so specifiers are fully resolved at build time
+- Dynamic `import()` loads async chunks on demand via `__pp.dyn` + `__pp_manifest.js` (module key → chunk URL)
+- Content-hashed filenames for cache busting + per-chunk source maps merged from module maps
+- Generates `index.html` with the manifest + `<script type="module">` entry
+- `manifest.json` maps chunk ids to output files
+- Post-build secret scan (`security.secretScan`, on by default): recognized credential shapes and non-public `.env` values found in emitted output fail the build; high-entropy literals warn
+- Optional integrity checks (`build.verifyOutput`) and SRI attributes (`security.sri`)
 - Single-file bundle mode (`emit_single_file()`)
 - Gzip + Brotli compression output
 - Edge-ready output (Cloudflare Workers, Vercel Edge, Deno Deploy)
@@ -489,8 +501,8 @@ MIT License ([LICENSE](LICENSE)).
 
 ## Status
 
-Current version: **1.0.0-rc.1** in this repo (release candidate, **not yet
-published** — the latest version on npm is `0.3.3`, `latest` dist-tag). For the honest, source-verified picture of what
+Current version: **0.4.0** — published on npm as `pledgepack@0.4.0`
+(`latest` dist-tag, tagged `v0.4.0` in git). For the honest, source-verified picture of what
 works and what doesn't, see
 [docs/PRODUCTION-READINESS-100.md](docs/PRODUCTION-READINESS-100.md) — it is
 the authoritative status document (a goal only counts as done when backed by

@@ -75,7 +75,7 @@ contract first.
    without signing, tagging, creating a GitHub release or publishing.
 4. Push the tag `vX.Y.Z` to run the real release (signs artifacts with cosign,
    creates the GitHub Release, publishes to npm with provenance). Prerelease
-   versions (`1.0.0-rc.1`) are published under the matching npm dist-tag
+   versions (e.g. `0.5.0-rc.1`) are published under the matching npm dist-tag
    (`rc`), never `latest`.
 
 ## Development Workflow

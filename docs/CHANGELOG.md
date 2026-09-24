@@ -6,6 +6,19 @@ Development history of the Pledge build system enhancements.
 
 ## [Unreleased]
 
+### Fixed
+- **PledgeStack config-field warnings**: `PLEDGESTACK_FIELDS` (`rsc`,
+  `tailwind`, `ppr`, `rateLimit`, `cors`, …) are now a reserved extension
+  namespace — accepted in `pledge.config.ts` regardless of `framework`
+  (`'pledge'`, `'react'`, `'vue'`, … or unset). Previously only
+  `framework: 'pledge'` silenced the warnings, so Vue/Solid/Svelte scaffolds
+  and framework-less templates still got "Unknown config field" noise
+  (`crates/core/src/config_validate.rs`).
+- **`pledge doctor` on PledgeStack apps**: entry/`index.html`/`src/`
+  checks now skip any project with an `app/` route surface
+  (`app/page.*`, `app/layout.*`, `app/**/route.*`), not just
+  `framework: 'pledge'` configs (`crates/core/src/doctor.rs`).
+
 ## [0.4.0] - 2026-09-23 — Stable Release
 
 ### Added
@@ -82,6 +95,32 @@ Development history of the Pledge build system enhancements.
   `export_check`, and `migrate_config` join `resolve_specifier` and
   `package_json_exports` under `fuzz/`; the CI smoke job iterates
   `cargo fuzz list` so new targets are exercised automatically.
+- **Post-build secret scan** (`security.secretScan`, on by default): emitted
+  output is scanned for recognized credential shapes (GitHub/AWS/GCP/
+  Slack/Stripe tokens, PEM blocks) and non-public `.env` values — hard
+  findings refuse the build ("Build refused: N secret(s) detected");
+  high-entropy string literals warn without failing. Set
+  `security.secretScan: false` to override.
+- **Web/SharedWorker discovery**: `new Worker(new URL("./x"))` specifiers
+  are discovered as dependencies and emitted as standalone bundles at their
+  URL path.
+- **CJS `require()` scanning**: `require("x")` calls inside dependencies
+  (e.g. `node_modules` index files the SIMD import scan can't see) are now
+  discovered as dependencies.
+- **Node builtins stay external in builds**: `node:path`, `fs`, etc. are
+  kept as external specifiers so SSR/API-route output keeps working imports
+  instead of failing resolution.
+- **Specifiers that only appear inside strings/comments no longer fail the
+  build**: an unresolved specifier that only ever occurs in a string literal
+  or comment (e.g. React's lazy() error text containing
+  `import('./MyComponent')`) is skipped; real missing imports still error.
+- **Tree-shaken modules emit as `__pp.def` stubs**: modules eliminated by
+  tree shaking still register empty factories so `__pp.req` resolves to
+  `{}` instead of throwing at their (unused) import sites.
+- **Executed-output e2e suite** (`crates/cli/tests/build_output_e2e.rs`):
+  multi-module fixtures build through the real CLI and the emitted chunks
+  are *executed under Node* — covering ESM/CJS deps, circular imports,
+  worker bundles, SRI injection, and the secret-scan refusal.
 
 ### Changed
 - **Module resolution is unified.** `BuildEngine` no longer carries its own
@@ -144,14 +183,13 @@ Development history of the Pledge build system enhancements.
   point at each module's first body line (not the `__pp.def` wrapper line),
   and line accounting no longer drifts for CSS stub modules.
 
-## [1.0.0-rc.1] - 2026-09-20 — Release Candidate
+## [1.0.0-rc.1] - 2026-09-20 — Release Candidate (never published)
 
-> In development — the version bump is committed in the repo but
-> `pledgepack@1.0.0-rc.1` is **not yet published to npm** (registry `latest`
-> is still `0.3.3`; the RC will ship under the `rc` dist-tag). Latest
-> published release: **[0.3.3](#033---2026-09-17--production-readiness)**.
+> **Never shipped.** The version was bumped 0.3.3 → 1.0.0-rc.1 in the repo
+> but renamed to **0.4.0** before release — everything below shipped as part
+> of [0.4.0](#040---2026-09-23--stable-release). Kept for history.
 
-First release candidate for 1.0.0. Version bumped 0.3.3 → 1.0.0-rc.1 in
+Version bumped 0.3.3 → 1.0.0-rc.1 in
 `Cargo.toml`, `package.json`, `platforms.json` and `Cargo.lock`;
 `scripts/check-versions.sh` now also verifies `platforms.json` and the lockfile.
 
