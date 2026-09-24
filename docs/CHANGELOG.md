@@ -6,7 +6,15 @@ Development history of the Pledge build system enhancements.
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-09-24
+
 ### Fixed
+- **Dev-server CSP blocks its own esm.sh deps**: the dev server's generated
+  import map falls back to `https://esm.sh/*` for CJS-only packages (react,
+  react-dom, scheduler), but the dev CSP `script-src 'self' 'unsafe-inline'
+  'unsafe-eval'` blocked those module fetches — every page served by `pledge
+  dev` failed to load. `https://esm.sh` is now in the dev `script-src`
+  (`crates/dev-server/src/lib.rs`).
 - **PledgeStack config-field warnings**: `PLEDGESTACK_FIELDS` (`rsc`,
   `tailwind`, `ppr`, `rateLimit`, `cors`, …) are now a reserved extension
   namespace — accepted in `pledge.config.ts` regardless of `framework`

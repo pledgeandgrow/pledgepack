@@ -678,6 +678,10 @@ pub async fn serve(engine: BuildEngine, config: &PledgeConfig) -> Result<()> {
         let mut csp = pledgepack_core::security::CspGenerator::new();
         csp.add_script_src("'unsafe-inline'");
         csp.add_script_src("'unsafe-eval'");
+        // CJS-only deps (react, react-dom, …) fall back to the esm.sh CDN in
+        // the generated import map when no .pledge-deps pre-bundle exists —
+        // the policy must allow those module fetches or the page can't load.
+        csp.add_script_src("https://esm.sh");
         csp.add_style_src("'unsafe-inline'");
         csp.generate()
     };

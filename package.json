@@ -1,6 +1,6 @@
 {
   "name": "pledgepack",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "A Rust+Zig bundler with incremental computation, JS plugins, and Rollup-quality output. Like Vite, Webpack, or Turbopack — but faster.",
   "type": "module",
   "main": "./index.js",
