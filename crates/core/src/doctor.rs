@@ -154,9 +154,9 @@ fn check_config(root: &Path, config: &crate::config::PledgeConfig) -> Vec<Diagno
         });
     }
 
-    // PledgeStack apps (`framework: 'pledge'`) have no SPA `entry`/`index.html`
-    // — routes under app/ are the entry surface; skip both checks for them.
-    let is_pledgestack = config.framework == crate::config::Framework::Pledge;
+    // PledgeStack apps have no SPA `entry`/`index.html` — routes under app/
+    // are the entry surface; skip both checks for them.
+    let is_pledgestack = is_framework_app(root, config);
 
     // Check entry file exists
     if !is_pledgestack {
@@ -234,12 +234,15 @@ fn check_config(root: &Path, config: &crate::config::PledgeConfig) -> Vec<Diagno
     }
 
     // Validate config fields
-    checks.extend(validate_config_fields(config));
+    checks.extend(validate_config_fields(root, config));
 
     checks
 }
 
-fn validate_config_fields(config: &crate::config::PledgeConfig) -> Vec<DiagnosticCheck> {
+fn validate_config_fields(
+    root: &Path,
+    config: &crate::config::PledgeConfig,
+) -> Vec<DiagnosticCheck> {
     let mut checks = Vec::new();
     let valid_fields = [
         "entry",
@@ -268,8 +271,8 @@ fn validate_config_fields(config: &crate::config::PledgeConfig) -> Vec<Diagnosti
     ];
 
     // Check for known misconfigurations
-    // (`framework: 'pledge'` apps route via app/ and have no `entry`.)
-    if config.entry.is_empty() && config.framework != crate::config::Framework::Pledge {
+    // (PledgeStack apps route via app/ and have no `entry`.)
+    if config.entry.is_empty() && !is_framework_app(root, config) {
         checks.push(DiagnosticCheck {
             category: DiagnosticCategory::Config,
             status: DiagnosticStatus::Fail,
@@ -554,6 +557,44 @@ fn check_performance(root: &Path, config: &crate::config::PledgeConfig) -> Vec<D
     checks
 }
 
+/// True when the project is a PledgeStack (framework-layer) app rather than a
+/// bare PledgePack project: either the config opts in via
+/// `framework: 'pledge'`, or the `app/` route surface exists (`app/page.*`,
+/// `app/layout.*`, nested `app/**/route.*`, …). PledgeStack templates also set
+/// `framework` to a UI framework ('react', 'vue', …), so the filesystem signal
+/// catches what the config value alone misses.
+fn is_framework_app(root: &Path, config: &crate::config::PledgeConfig) -> bool {
+    if config.framework == crate::config::Framework::Pledge {
+        return true;
+    }
+    const ROUTE_STEMS: &[&str] = &["page", "layout", "route", "loading", "error", "not-found"];
+    let mut stack = vec![root.join("app")];
+    let mut visited = 0usize;
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            visited += 1;
+            if visited > 512 {
+                return false;
+            }
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(|stem| ROUTE_STEMS.contains(&stem))
+                .unwrap_or(false)
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn check_project_structure(
     root: &Path,
     config: &crate::config::PledgeConfig,
@@ -562,7 +603,7 @@ fn check_project_structure(
 
     // Check for src directory (PledgeStack apps keep sources under app/ and
     // server/, so a missing src/ is expected, not a warning).
-    let is_pledgestack = config.framework == crate::config::Framework::Pledge;
+    let is_pledgestack = is_framework_app(root, config);
     if root.join("src").exists() {
         checks.push(DiagnosticCheck {
             category: DiagnosticCategory::Project,

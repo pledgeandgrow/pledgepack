@@ -20,10 +20,11 @@ pub const VALID_WASM_SIMD_MODES: &[&str] = &["auto", "always", "never"];
 /// Valid RTL mode values.
 pub const VALID_RTL_MODES: &[&str] = &["auto", "manual", "off"];
 
-/// Top-level keys owned by PledgeStack (the `pledge` runtime), which shares
-/// `pledge.config.ts` with PledgePack when `framework: 'pledge'` — PledgePack
-/// parses the same file as the engine underneath and must accept these
-/// without warnings.
+/// Reserved extension namespace: top-level keys owned by the framework layer
+/// (PledgeStack), which shares `pledge.config.ts` with PledgePack. A
+/// PledgeStack app (`framework: 'pledge'` or a UI framework value like
+/// `'react'`/`'vue'`, or unset) must not get unknown-field warnings for them,
+/// regardless of how `framework` is set.
 pub const PLEDGESTACK_FIELDS: &[&str] = &[
     "rootDir",
     "publicDir",
@@ -198,19 +199,12 @@ pub fn find_unknown_fields(raw: &serde_json::Value) -> Vec<ValidationError> {
     };
     let mut out = Vec::new();
     walk_schema(raw, &schema, &schema, "", &mut out, 0);
-    // `framework: 'pledge'` configs are shared with the PledgeStack runtime —
-    // its framework-level keys are legal even though the bundler schema
-    // doesn't define them.
-    let is_pledgestack = raw
-        .get("framework")
-        .and_then(|f| f.as_str())
-        .map(|f| f == "pledge")
-        .unwrap_or(false);
-    if is_pledgestack {
-        out.retain(|e| {
-            !(e.field.split('.').count() == 1 && PLEDGESTACK_FIELDS.contains(&e.field.as_str()))
-        });
-    }
+    // `pledge.config.ts` is shared with the framework layer (PledgeStack):
+    // its framework-level keys are a reserved namespace — always legal even
+    // though the bundler schema doesn't define them.
+    out.retain(|e| {
+        !(e.field.split('.').count() == 1 && PLEDGESTACK_FIELDS.contains(&e.field.as_str()))
+    });
     out
 }
 
@@ -520,20 +514,23 @@ mod tests {
     }
 
     #[test]
-    fn pledgestack_fields_pass_only_for_pledge_framework() {
+    fn pledgestack_fields_are_a_reserved_namespace() {
+        // Framework-owned keys are legal regardless of `framework` (or none):
+        // PledgeStack apps set 'pledge', UI frameworks ('react', 'vue', …), or
+        // leave it unset — all share the same config file.
         let key = PLEDGESTACK_FIELDS[0];
-        let stack = json!({ "framework": "pledge", key: true });
-        assert!(
-            find_unknown_fields(&stack).is_empty(),
-            "PledgeStack key `{key}` must pass with framework: 'pledge'"
-        );
-        // Same key without the pledge framework is an ordinary unknown field.
-        let other = json!({ "framework": "react", key: true });
-        assert_eq!(
-            find_unknown_fields(&other).len(),
-            1,
-            "PledgeStack key `{key}` must warn without framework: 'pledge'"
-        );
+        for raw in [
+            json!({ "framework": "pledge", key: true }),
+            json!({ "framework": "react", key: true }),
+            json!({ key: true }),
+        ] {
+            assert!(
+                find_unknown_fields(&raw).is_empty(),
+                "PledgeStack key `{key}` must never warn: {raw}"
+            );
+        }
+        // Genuinely unknown keys still warn.
+        assert_eq!(find_unknown_fields(&json!({ "taillwind": true })).len(), 1);
     }
 
     #[test]
