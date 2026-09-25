@@ -48,7 +48,7 @@ comfy-table = { workspace = true }
 miette = { workspace = true, features = ["fancy"] }
 clap_mangen = { workspace = true }
 schemars = { workspace = true }
-dirs = "6"
+dirs = "7"
 
 [features]
 default = []
