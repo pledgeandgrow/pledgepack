@@ -6,6 +6,25 @@ Development history of the Pledge build system enhancements.
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-09-25
+
+### Fixed
+- **Generated client router passed route params as bare props**: `render()`
+  called `React.createElement(route.component, params)`, so pages destructuring
+  `({ params })` crashed with "Cannot destructure property 'slug' of 'params'"
+  on every dynamic route. Params now arrive under `props.params`, matching SSR
+  (`crates/core/src/router.rs`).
+- **Generated client router treated `loading.tsx` as a wrapper component**:
+  `React.createElement(loading, { children })` mounted the fallback and never
+  showed the page — an infinite "Loading…" on any route with a `loading.tsx`.
+  It now emits `React.Suspense` with the loading component as `fallback`.
+- **`matchRoute` dropped param values**: the generated matcher used
+  non-capturing groups (`[^/]+`, `.*`), so `match[i + 1]` was always `undefined`
+  and dynamic routes fell through to not-found. Both wildcards are now capture
+  groups. Dev and build router templates were merged into
+  `render_router_module` so they can no longer drift.
+
+
 ## [0.4.1] - 2026-09-24
 
 ### Fixed
